@@ -19,6 +19,16 @@ static MASTER_KEY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const ENC_V1_PREFIX: &str = "enc:v1:";
 const MASTER_KEY_LEN: usize = 32;
 
+/// Environment variable names for API keys supported by `Settings`.
+pub const API_KEY_ENV_NAMES: [&str; 6] = [
+    "TAILSCALE_API_KEY",
+    "VULTR_API_KEY",
+    "UPCLOUD_API_TOKEN",
+    "LINODE_API_TOKEN",
+    "CLOUDFLARE_API_TOKEN",
+    "GITHUB_TOKEN",
+];
+
 fn non_empty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
 }
@@ -113,11 +123,16 @@ impl StateFile {
         let file = File::open(&self.path)?;
         let lines: Vec<String> = BufReader::new(file)
             .lines()
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, _>>()?;
+        let orig_len = lines.len();
+        let filtered: Vec<String> = lines
             .into_iter()
             .filter(|l| !l.starts_with(&prefix))
             .collect();
-        self.write_lines_atomic(&lines)
+        if filtered.len() == orig_len {
+            return Ok(());
+        }
+        self.write_lines_atomic(&filtered)
     }
 
     fn write_lines_atomic(&self, lines: &[String]) -> Result<()> {
@@ -222,7 +237,9 @@ impl Settings {
 
     pub fn load_default() -> Result<Self> {
         let path = Self::default_path()?;
-        Ok(Self::new(path))
+        let settings = Self::new(path);
+        settings.auto_save_env_keys()?;
+        Ok(settings)
     }
 
     pub fn path(&self) -> &Path {
@@ -346,54 +363,43 @@ impl Settings {
         }
     }
 
-    /// Get a variable, preferring environment variable if set and non‑empty.
-    pub fn get(&self, key: &str) -> Result<Option<String>> {
-        if let Ok(val) = env::var(key) {
-            if !val.is_empty() {
-                return Ok(Some(val));
-            }
-        }
-        let Some(raw) = self.state.read_var(key)? else {
-            return Ok(None);
-        };
-        if let Some(b64) = raw.strip_prefix(ENC_V1_PREFIX) {
-            let bytes = BASE64_STANDARD.decode(b64).map_err(|e| {
-                anyhow!("Corrupt encrypted value for '{}': invalid base64: {}", key, e)
-            })?;
-            if bytes.len() < NONCE_LEN + CHACHA20_POLY1305.tag_len() {
-                return Err(anyhow!(
-                    "Corrupt encrypted value for '{}': ciphertext too short",
-                    key
-                ));
-            }
-            let (nonce_bytes, ciphertext) = bytes.split_at(NONCE_LEN);
-            let mut nonce_arr = [0u8; NONCE_LEN];
-            nonce_arr.copy_from_slice(nonce_bytes);
-            let nonce = Nonce::assume_unique_for_key(nonce_arr);
-            let key_bytes = self.load_master_key(false)?;
-            let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key_bytes)
-                .map_err(|_| anyhow!("Invalid encryption key for '{}'", key))?;
-            let opening_key = LessSafeKey::new(unbound);
-            let mut in_out = ciphertext.to_vec();
-            let plaintext = opening_key
-                .open_in_place(nonce, Aad::from(key.as_bytes()), &mut in_out)
-                .map_err(|_| {
-                    anyhow!(
-                        "Failed to decrypt setting '{}' (wrong key or tampered ciphertext)",
-                        key
-                    )
-                })?;
-            let s = String::from_utf8(plaintext.to_vec()).map_err(|e| {
-                anyhow!("Decrypted value for '{}' is not valid UTF-8: {}", key, e)
-            })?;
-            Ok(Some(s))
-        } else {
+    fn open(&self, key: &str, raw: &str) -> Result<String> {
+        let Some(b64) = raw.strip_prefix(ENC_V1_PREFIX) else {
             // Backward compatibility for unprefixed legacy plaintext entries
-            Ok(Some(raw))
+            return Ok(raw.to_string());
+        };
+        let bytes = BASE64_STANDARD.decode(b64).map_err(|e| {
+            anyhow!("Corrupt encrypted value for '{}': invalid base64: {}", key, e)
+        })?;
+        if bytes.len() < NONCE_LEN + CHACHA20_POLY1305.tag_len() {
+            return Err(anyhow!(
+                "Corrupt encrypted value for '{}': ciphertext too short",
+                key
+            ));
         }
+        let (nonce_bytes, ciphertext) = bytes.split_at(NONCE_LEN);
+        let mut nonce_arr = [0u8; NONCE_LEN];
+        nonce_arr.copy_from_slice(nonce_bytes);
+        let nonce = Nonce::assume_unique_for_key(nonce_arr);
+        let key_bytes = self.load_master_key(false)?;
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key_bytes)
+            .map_err(|_| anyhow!("Invalid encryption key for '{}'", key))?;
+        let opening_key = LessSafeKey::new(unbound);
+        let mut in_out = ciphertext.to_vec();
+        let plaintext = opening_key
+            .open_in_place(nonce, Aad::from(key.as_bytes()), &mut in_out)
+            .map_err(|_| {
+                anyhow!(
+                    "Failed to decrypt setting '{}' (wrong key or tampered ciphertext)",
+                    key
+                )
+            })?;
+        String::from_utf8(plaintext.to_vec()).map_err(|e| {
+            anyhow!("Decrypted value for '{}' is not valid UTF-8: {}", key, e)
+        })
     }
 
-    pub fn set(&self, key: &str, value: &str) -> Result<()> {
+    fn seal(&self, key: &str, value: &str) -> Result<String> {
         let key_bytes = self.load_master_key(true)?;
         let unbound = UnboundKey::new(&CHACHA20_POLY1305, &key_bytes)
             .map_err(|_| anyhow!("Invalid encryption key for '{}'", key))?;
@@ -413,8 +419,50 @@ impl Settings {
         let mut payload = Vec::with_capacity(NONCE_LEN + in_out.len());
         payload.extend_from_slice(&nonce_arr);
         payload.extend_from_slice(&in_out);
-        let encoded = format!("{}{}", ENC_V1_PREFIX, BASE64_STANDARD.encode(&payload));
+        Ok(format!("{}{}", ENC_V1_PREFIX, BASE64_STANDARD.encode(&payload)))
+    }
+
+    /// Get a variable, preferring environment variable if set and non‑empty.
+    pub fn get(&self, key: &str) -> Result<Option<String>> {
+        if let Some(val) = non_empty_env(key) {
+            return Ok(Some(val));
+        }
+        let Some(raw) = self.state.read_var(key)? else {
+            return Ok(None);
+        };
+        self.open(key, &raw).map(Some)
+    }
+
+    pub fn set(&self, key: &str, value: &str) -> Result<()> {
+        let encoded = self.seal(key, value)?;
         self.state.write_var(key, &encoded)
+    }
+
+    /// Remove a variable from `credentials.enc` atomically, preserving other keys.
+    pub fn remove(&self, key: &str) -> Result<()> {
+        self.state.remove_var(key)
+    }
+
+    /// Persist any non-empty API key environment variables into `credentials.enc`
+    /// using ChaCha20-Poly1305 encryption, returning the number of keys written.
+    pub fn auto_save_env_keys(&self) -> Result<usize> {
+        let mut saved = 0usize;
+        for key in API_KEY_ENV_NAMES {
+            let Some(env_val) = non_empty_env(key) else {
+                continue;
+            };
+            let already_encrypted_match = match self.state.read_var(key)? {
+                Some(raw) if raw.starts_with(ENC_V1_PREFIX) => {
+                    matches!(self.open(key, &raw), Ok(ref stored) if stored == &env_val)
+                }
+                _ => false,
+            };
+            if !already_encrypted_match {
+                self.set(key, &env_val)?;
+                saved += 1;
+            }
+        }
+        Ok(saved)
     }
 
     // Convenience methods for known keys
@@ -600,6 +648,12 @@ impl SessionState {
     pub fn set_cf_target(&self, v: &str) -> Result<()> {
         self.set_var("CF_TARGET", v)
     }
+    pub fn cf_enabled(&self) -> Result<Option<String>> {
+        self.get_var("CF_ENABLED")
+    }
+    pub fn set_cf_enabled(&self, v: &str) -> Result<()> {
+        self.set_var("CF_ENABLED", v)
+    }
     pub fn github_repo(&self) -> Result<Option<String>> {
         self.get_var("GITHUB_REPO")
     }
@@ -653,6 +707,7 @@ impl SessionState {
         set_opt!("CF_RECORD", data.cf_record);
         set_opt!("CF_PROXIED", data.cf_proxied);
         set_opt!("CF_TARGET", data.cf_target);
+        set_opt!("CF_ENABLED", data.cf_enabled);
         set_opt!("GITHUB_REPO", data.github_repo);
         set_opt!("GITHUB_BRANCH", data.github_branch);
         set_opt!("GITHUB_DEPLOY_PATH", data.github_deploy_path);
@@ -679,6 +734,7 @@ impl SessionState {
             cf_record: self.cf_record()?,
             cf_proxied: self.cf_proxied()?,
             cf_target: self.cf_target()?,
+            cf_enabled: self.cf_enabled()?,
             github_repo: self.github_repo()?,
             github_branch: self.github_branch()?,
             github_deploy_path: self.github_deploy_path()?,
@@ -706,6 +762,7 @@ pub struct SessionData {
     pub cf_record: Option<String>,
     pub cf_proxied: Option<String>,
     pub cf_target: Option<String>,
+    pub cf_enabled: Option<String>,
     pub github_repo: Option<String>,
     pub github_branch: Option<String>,
     pub github_deploy_path: Option<String>,
@@ -716,11 +773,8 @@ pub struct SessionData {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use tempfile::{tempdir, NamedTempFile};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
@@ -777,7 +831,7 @@ mod tests {
 
     #[test]
     fn env_override_priority() -> Result<()> {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = crate::env_lock();
         let _guard = EnvGuard::new(&["VPSKIT_TEST_ENV_KEY"]);
         env::set_var("VPSKIT_TEST_ENV_KEY", "envval");
 
@@ -803,7 +857,7 @@ mod tests {
 
     #[test]
     fn default_path_resolution() -> Result<()> {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = crate::env_lock();
         let _guard = EnvGuard::new(&[
             "BAB_SETTINGS_FILE",
             "VPSKIT_SETTINGS_FILE",
@@ -925,7 +979,7 @@ mod tests {
 
     #[test]
     fn settings_aead_encrypts_at_rest_and_enforces_permissions() -> Result<()> {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = crate::env_lock();
         let _guard = EnvGuard::new(&[
             "BAB_ENCRYPTION_KEY",
             "BAB_MASTER_KEY_FILE",
@@ -974,7 +1028,7 @@ mod tests {
 
     #[test]
     fn settings_rejects_tampered_ciphertext_and_wrong_key() -> Result<()> {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = crate::env_lock();
         let _guard = EnvGuard::new(&[
             "BAB_ENCRYPTION_KEY",
             "BAB_MASTER_KEY_FILE",
@@ -1012,7 +1066,7 @@ mod tests {
 
     #[test]
     fn settings_bab_encryption_key_is_deterministic_and_supports_legacy_plaintext() -> Result<()> {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = crate::env_lock();
         let _guard = EnvGuard::new(&[
             "BAB_ENCRYPTION_KEY",
             "BAB_MASTER_KEY_FILE",
@@ -1071,6 +1125,7 @@ mod tests {
             cf_record: Some("@".to_string()),
             cf_proxied: Some("true".to_string()),
             cf_target: Some("203.0.113.10".to_string()),
+            cf_enabled: Some("true".to_string()),
             github_repo: Some("owner/repo".to_string()),
             github_branch: Some("main".to_string()),
             github_deploy_path: Some("/home/deploy/apps/repo".to_string()),
@@ -1082,8 +1137,11 @@ mod tests {
         // Verify typed setters/getters and None removal
         ss.set_cf_record("api.example.com")?;
         assert_eq!(ss.cf_record()?, Some("api.example.com".to_string()));
+        ss.set_cf_enabled("false")?;
+        assert_eq!(ss.cf_enabled()?, Some("false".to_string()));
         let cleared = SessionData {
             cf_record: None,
+            cf_enabled: None,
             github_deploy_cmd: None,
             ..data
         };
@@ -1115,6 +1173,147 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "leftover tmp files: {:?}", leftovers);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_remove_deletes_key_preserving_others() -> Result<()> {
+        let _lock = crate::env_lock();
+        let mut guard_keys = vec!["BAB_ENCRYPTION_KEY", "BAB_MASTER_KEY_FILE"];
+        guard_keys.extend_from_slice(&API_KEY_ENV_NAMES);
+        let _guard = EnvGuard::new(&guard_keys);
+        for k in &guard_keys {
+            env::remove_var(k);
+        }
+
+        let dir = tempdir()?;
+        let creds_path = dir.path().join("credentials.enc");
+        let settings = Settings::new(&creds_path);
+
+        // Removing from a non-existent file is a no-op and does not create the file
+        settings.remove("TAILSCALE_API_KEY")?;
+        assert!(!creds_path.exists());
+
+        settings.set_tailscale_api_key("tskey-1")?;
+        settings.set_vultr_api_key("vultr-2")?;
+        settings.set_github_token("ghp-3")?;
+
+        // Removing an absent key is a no-op
+        settings.remove("LINODE_API_TOKEN")?;
+
+        // Removing an existing key deletes only that key
+        settings.remove("VULTR_API_KEY")?;
+        assert_eq!(settings.vultr_api_key()?, None);
+        assert_eq!(settings.state.read_var("VULTR_API_KEY")?, None);
+        assert_eq!(settings.tailscale_api_key()?, Some("tskey-1".to_string()));
+        assert_eq!(settings.github_token()?, Some("ghp-3".to_string()));
+
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&creds_path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn settings_auto_saves_env_keys_to_encrypted_file() -> Result<()> {
+        let _lock = crate::env_lock();
+        let mut guard_keys = vec![
+            "BAB_SETTINGS_FILE",
+            "VPSKIT_SETTINGS_FILE",
+            "SETTINGS_FILE",
+            "BAB_CONFIG_DIR",
+            "BAB_SSH_DIR",
+            "VPSKIT_SSH_DIR",
+            "SSH_DIR",
+            "BAB_MASTER_KEY_FILE",
+            "BAB_ENCRYPTION_KEY",
+            "HOME",
+        ];
+        guard_keys.extend_from_slice(&API_KEY_ENV_NAMES);
+        let _guard = EnvGuard::new(&guard_keys);
+        for k in &guard_keys {
+            env::remove_var(k);
+        }
+
+        let dir = tempdir()?;
+        let cfg_dir = dir.path().join("cfg");
+        env::set_var("BAB_CONFIG_DIR", &cfg_dir);
+
+        // No API key env vars (or only empty) must NOT create master.key or credentials.enc
+        env::set_var("TAILSCALE_API_KEY", "");
+        let settings = Settings::load_default()?;
+        let creds_path = cfg_dir.join("credentials.enc");
+        let key_path = cfg_dir.join("master.key");
+        assert!(!creds_path.exists());
+        assert!(!key_path.exists());
+        assert_eq!(settings.auto_save_env_keys()?, 0);
+        assert!(!creds_path.exists());
+        assert!(!key_path.exists());
+
+        // Set env keys and call Settings::load_default() -> auto-saves encrypted
+        env::remove_var("TAILSCALE_API_KEY");
+        env::set_var("CLOUDFLARE_API_TOKEN", "cf-auto-123");
+        env::set_var("GITHUB_TOKEN", "ghp-auto-456");
+
+        let settings = Settings::load_default()?;
+        assert!(creds_path.exists());
+        assert!(key_path.exists());
+
+        #[cfg(unix)]
+        {
+            assert_eq!(fs::metadata(&cfg_dir)?.permissions().mode() & 0o777, 0o700);
+            assert_eq!(fs::metadata(&creds_path)?.permissions().mode() & 0o777, 0o600);
+            assert_eq!(fs::metadata(&key_path)?.permissions().mode() & 0o777, 0o600);
+        }
+
+        let raw_first = fs::read_to_string(&creds_path)?;
+        assert!(raw_first.contains("CLOUDFLARE_API_TOKEN=\"enc:v1:"));
+        assert!(raw_first.contains("GITHUB_TOKEN=\"enc:v1:"));
+        assert!(!raw_first.contains("cf-auto-123"));
+        assert!(!raw_first.contains("ghp-auto-456"));
+
+        // Idempotent: repeated calls do not rewrite or churn nonces
+        assert_eq!(settings.auto_save_env_keys()?, 0);
+        let _ = Settings::load_default()?;
+        assert_eq!(fs::read_to_string(&creds_path)?, raw_first);
+
+        // Survives unsetting the environment variables
+        env::remove_var("CLOUDFLARE_API_TOKEN");
+        env::remove_var("GITHUB_TOKEN");
+        assert_eq!(
+            settings.cloudflare_api_token()?,
+            Some("cf-auto-123".to_string())
+        );
+        assert_eq!(settings.github_token()?, Some("ghp-auto-456".to_string()));
+
+        // Legacy plaintext matching env value is upgraded to ciphertext
+        settings.state.write_var("LINODE_API_TOKEN", "linode-plain")?;
+        env::set_var("LINODE_API_TOKEN", "linode-plain");
+        // Corrupt ciphertext is overwritten when env var is set
+        settings.state.write_var("VULTR_API_KEY", "enc:v1:not-valid-b64!")?;
+        env::set_var("VULTR_API_KEY", "vultr-recovered");
+        // Changed env var updates stored ciphertext
+        env::set_var("CLOUDFLARE_API_TOKEN", "cf-rotated-789");
+
+        assert_eq!(settings.auto_save_env_keys()?, 3);
+        env::remove_var("LINODE_API_TOKEN");
+        env::remove_var("VULTR_API_KEY");
+        env::remove_var("CLOUDFLARE_API_TOKEN");
+
+        let raw_updated = fs::read_to_string(&creds_path)?;
+        assert!(raw_updated.contains("LINODE_API_TOKEN=\"enc:v1:"));
+        assert!(!raw_updated.contains("linode-plain"));
+        assert_eq!(
+            settings.linode_api_token()?,
+            Some("linode-plain".to_string())
+        );
+        assert_eq!(
+            settings.vultr_api_key()?,
+            Some("vultr-recovered".to_string())
+        );
+        assert_eq!(
+            settings.cloudflare_api_token()?,
+            Some("cf-rotated-789".to_string())
+        );
         Ok(())
     }
 }

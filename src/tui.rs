@@ -18,11 +18,19 @@ use std::time::Duration;
 use crate::config::{default_config_dir, SessionData, SessionState, Settings};
 use crate::dns::{build_cloudflare_dns_stub_plan, CloudflareDnsConfig};
 use crate::providers::{
-    default_images_for, default_plans_for, default_regions_for, ProviderKind,
+    build_cloud_provider_with_key, clear_destroyed_session_if_matches, default_images_for,
+    default_plans_for, default_regions_for, destroy_provider_instance_with_key,
+    provision_full_flow, query_providers_with_keys, ProviderInstance, ProviderKind,
+    ProviderQueryStatus, ProvisionConfig,
 };
 use crate::roles::ServerRole;
-use crate::setup::{normalize_github_repo, SetupStepKind, StepReport};
-use crate::transport::default_ssh_key_path;
+use crate::setup::{
+    normalize_github_repo, GithubDeployConfig, SetupConfig, SetupRunner, SetupStepKind, StepReport,
+};
+use crate::tailscale::{generate_cloud_init, generate_ssh_cloud_init, TailscaleClient};
+use crate::transport::{
+    default_ssh_key_path, ensure_ssh_keypair, read_public_key, SshTransport, TransportMode,
+};
 
 const HEADER_TITLE: &str = "Build A Box (bab) - Multi-Provider VPS Provisioner";
 
@@ -34,13 +42,15 @@ const ALL_PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::ManualCloudInit,
 ];
 
-const HOME_MENU_ITEMS: [&str; 7] = [
+const HOME_MENU_ITEMS: [&str; 9] = [
     "Select Provider, Location & Size",
     "Select Server Role",
     "Access, User & Transport",
-    "Cloudflare DNS (Stub)",
+    "Cloudflare DNS",
     "GitHub Repo Deployment",
-    "API Key Settings (Encrypted)",
+    "API Key Settings",
+    "Build Box with Current Options",
+    "Running Systems & Destroy",
     "Quit",
 ];
 
@@ -60,11 +70,12 @@ const ACCESS_FIELD_LABELS: [&str; 4] = [
     "Hostname",
 ];
 
-const CF_DNS_FIELD_LABELS: [&str; 4] = [
+const CF_DNS_FIELD_LABELS: [&str; 5] = [
     "Zone",
     "Record Name",
     "Target IP",
     "Proxied",
+    "DNS Enabled",
 ];
 
 const GITHUB_FIELD_LABELS: [&str; 4] = [
@@ -97,6 +108,8 @@ pub enum Screen {
     CloudflareDns,
     GithubDeploy,
     ApiKeys,
+    BuildBox,
+    RunningInstances,
 }
 
 /// Editable form state for access transport, sudo admin user, SSH key path, and hostname.
@@ -191,13 +204,14 @@ impl AccessForm {
     }
 }
 
-/// Editable form state for Cloudflare DNS stub configuration.
+/// Editable form state for Cloudflare DNS configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CloudflareDnsForm {
     pub zone: String,
     pub record_name: String,
     pub target_mode: String,
     pub proxied: bool,
+    pub enabled: bool,
     pub active_field: usize,
     pub editing: bool,
 }
@@ -209,6 +223,7 @@ impl Default for CloudflareDnsForm {
             record_name: "@".to_string(),
             target_mode: "public".to_string(),
             proxied: false,
+            enabled: false,
             active_field: 0,
             editing: false,
         }
@@ -248,12 +263,21 @@ impl CloudflareDnsForm {
             .as_deref()
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
             .unwrap_or(false);
+        let enabled = match session.cf_enabled.as_deref() {
+            Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => true,
+                "false" | "0" | "no" | "off" => false,
+                _ => !zone.is_empty(),
+            },
+            None => !zone.is_empty(),
+        };
 
         Self {
             zone,
             record_name,
             target_mode,
             proxied,
+            enabled,
             active_field: 0,
             editing: false,
         }
@@ -420,25 +444,22 @@ impl ApiKeyForm {
         })
     }
 
-    /// Saves non-empty API keys back to `Settings`.
+    /// Saves non-empty API keys back to `Settings` and removes cleared keys.
     pub fn save_to_settings(&self, settings: &Settings) -> Result<()> {
-        if !self.tailscale.is_empty() {
-            settings.set_tailscale_api_key(&self.tailscale)?;
-        }
-        if !self.vultr.is_empty() {
-            settings.set_vultr_api_key(&self.vultr)?;
-        }
-        if !self.upcloud.is_empty() {
-            settings.set_upcloud_api_token(&self.upcloud)?;
-        }
-        if !self.linode.is_empty() {
-            settings.set_linode_api_token(&self.linode)?;
-        }
-        if !self.cloudflare.is_empty() {
-            settings.set_cloudflare_api_token(&self.cloudflare)?;
-        }
-        if !self.github.is_empty() {
-            settings.set_github_token(&self.github)?;
+        for (key, val) in [
+            ("TAILSCALE_API_KEY", &self.tailscale),
+            ("VULTR_API_KEY", &self.vultr),
+            ("UPCLOUD_API_TOKEN", &self.upcloud),
+            ("LINODE_API_TOKEN", &self.linode),
+            ("CLOUDFLARE_API_TOKEN", &self.cloudflare),
+            ("GITHUB_TOKEN", &self.github),
+        ] {
+            let trimmed = val.trim();
+            if trimmed.is_empty() {
+                settings.remove(key)?;
+            } else {
+                settings.set(key, trimmed)?;
+            }
         }
         Ok(())
     }
@@ -505,6 +526,11 @@ pub struct TuiApp {
     pub status_message: String,
     pub settings_path: Option<PathBuf>,
     pub state_path: Option<PathBuf>,
+    pub build_dry_run: bool,
+    pub running_instances: Vec<ProviderInstance>,
+    pub running_statuses: Vec<ProviderQueryStatus>,
+    pub running_index: usize,
+    pub running_confirm_destroy: bool,
 }
 
 impl TuiApp {
@@ -606,6 +632,11 @@ impl TuiApp {
             status_message: "Ready".to_string(),
             settings_path: None,
             state_path: None,
+            build_dry_run: false,
+            running_instances: Vec::new(),
+            running_statuses: Vec::new(),
+            running_index: 0,
+            running_confirm_destroy: false,
         }
     }
 
@@ -620,6 +651,7 @@ impl TuiApp {
             None => SessionState::default_path()?,
         };
         let settings = Settings::new(&resolved_settings_path);
+        settings.auto_save_env_keys()?;
         let state = SessionState::new(&resolved_state_path);
 
         let session = state.load_session()?;
@@ -692,8 +724,20 @@ impl TuiApp {
             return;
         }
 
+        if self.screen == Screen::RunningInstances && self.running_confirm_destroy {
+            self.handle_running_instances_key(key);
+            return;
+        }
+
         if matches!(key.code, KeyCode::Char('q')) {
-            self.should_quit = true;
+            if self.screen == Screen::Home {
+                self.should_quit = true;
+            } else {
+                if self.screen == Screen::ApiKeys {
+                    self.auto_save_api_keys();
+                }
+                self.screen = Screen::Home;
+            }
             return;
         }
 
@@ -705,6 +749,8 @@ impl TuiApp {
             Screen::CloudflareDns => self.handle_cf_dns_nav_key(key),
             Screen::GithubDeploy => self.handle_github_deploy_nav_key(key),
             Screen::ApiKeys => self.handle_api_keys_nav_key(key),
+            Screen::BuildBox => self.handle_build_box_key(key),
+            Screen::RunningInstances => self.handle_running_instances_key(key),
         }
     }
 
@@ -723,7 +769,12 @@ impl TuiApp {
                 3 => self.screen = Screen::CloudflareDns,
                 4 => self.screen = Screen::GithubDeploy,
                 5 => self.screen = Screen::ApiKeys,
-                6 => self.should_quit = true,
+                6 => self.screen = Screen::BuildBox,
+                7 => {
+                    self.screen = Screen::RunningInstances;
+                    self.refresh_running_instances();
+                }
+                8 => self.should_quit = true,
                 _ => {}
             },
             KeyCode::Char('1') => {
@@ -752,6 +803,15 @@ impl TuiApp {
             }
             KeyCode::Char('7') => {
                 self.home_index = 6;
+                self.screen = Screen::BuildBox;
+            }
+            KeyCode::Char('8') => {
+                self.home_index = 7;
+                self.screen = Screen::RunningInstances;
+                self.refresh_running_instances();
+            }
+            KeyCode::Char('9') => {
+                self.home_index = 8;
                 self.should_quit = true;
             }
             _ => {}
@@ -923,6 +983,22 @@ impl TuiApp {
                     self.cf_dns.proxied
                 );
             }
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                if self.cf_dns.active_field == 4 =>
+            {
+                self.cf_dns.enabled = !self.cf_dns.enabled;
+                self.status_message = format!(
+                    "Cloudflare DNS {} (press 's' to save)",
+                    if self.cf_dns.enabled { "ON" } else { "OFF" }
+                );
+            }
+            KeyCode::Char('t') => {
+                self.cf_dns.enabled = !self.cf_dns.enabled;
+                self.status_message = format!(
+                    "Cloudflare DNS {} (press 's' to save)",
+                    if self.cf_dns.enabled { "ON" } else { "OFF" }
+                );
+            }
             KeyCode::Enter => match self.cf_dns.active_field {
                 2 => {
                     self.cf_dns.toggle_target_mode();
@@ -936,6 +1012,13 @@ impl TuiApp {
                     self.status_message = format!(
                         "Cloudflare proxied set to {} (press 's' to save)",
                         self.cf_dns.proxied
+                    );
+                }
+                4 => {
+                    self.cf_dns.enabled = !self.cf_dns.enabled;
+                    self.status_message = format!(
+                        "Cloudflare DNS {} (press 's' to save)",
+                        if self.cf_dns.enabled { "ON" } else { "OFF" }
                     );
                 }
                 idx => {
@@ -963,6 +1046,12 @@ impl TuiApp {
         match key.code {
             KeyCode::Enter | KeyCode::Esc => {
                 self.cf_dns.editing = false;
+                if self.cf_dns.active_field == 0
+                    && !self.cf_dns.zone.trim().is_empty()
+                    && self.session.cf_enabled.is_none()
+                {
+                    self.cf_dns.enabled = true;
+                }
                 let label = CF_DNS_FIELD_LABELS[self.cf_dns.active_field];
                 self.status_message = format!("Updated {} (press 's' to save)", label);
             }
@@ -1044,12 +1133,13 @@ impl TuiApp {
                 self.api_keys.editing = true;
                 let label = API_KEY_LABELS[self.api_keys.active_field];
                 self.status_message =
-                    format!("Editing {} (Enter to finish, Esc to stop)", label);
+                    format!("Editing {} (auto-saves encrypted; Enter/Esc to finish)", label);
             }
             KeyCode::Char('s') => {
                 self.save_api_keys();
             }
             KeyCode::Esc | KeyCode::Char('b') => {
+                self.auto_save_api_keys();
                 self.screen = Screen::Home;
             }
             _ => {}
@@ -1060,11 +1150,13 @@ impl TuiApp {
         match key.code {
             KeyCode::Enter | KeyCode::Esc => {
                 self.api_keys.editing = false;
+                self.auto_save_api_keys();
                 let label = API_KEY_LABELS[self.api_keys.active_field];
-                self.status_message = format!("Updated {} (press 's' to save)", label);
+                self.status_message = format!("Saved {} (auto-encrypted)", label);
             }
             KeyCode::Backspace => {
                 self.api_keys.active_value_mut().pop();
+                self.auto_save_api_keys();
             }
             KeyCode::Char(c)
                 if !key
@@ -1072,6 +1164,151 @@ impl TuiApp {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.api_keys.active_value_mut().push(c);
+                self.auto_save_api_keys();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_build_box_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('d') | KeyCode::Char(' ') => {
+                self.cf_dns.enabled = !self.cf_dns.enabled;
+                self.save_cf_dns();
+                self.status_message = format!(
+                    "Cloudflare DNS toggled {}",
+                    if self.cf_dns.enabled { "ON" } else { "OFF" }
+                );
+            }
+            KeyCode::Char('n') => {
+                self.build_dry_run = !self.build_dry_run;
+                self.status_message = format!(
+                    "Dry-Run mode {}",
+                    if self.build_dry_run {
+                        "ON (simulated)"
+                    } else {
+                        "OFF (live)"
+                    }
+                );
+            }
+            KeyCode::Enter | KeyCode::Char('x') => {
+                self.execute_build();
+            }
+            KeyCode::Esc | KeyCode::Char('b') => {
+                self.screen = Screen::Home;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_running_instances_key(&mut self, key: KeyEvent) {
+        if self.running_confirm_destroy {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.running_confirm_destroy = false;
+                    let Some(inst) = self.running_instances.get(self.running_index).cloned() else {
+                        return;
+                    };
+                    let api_key = match inst.provider {
+                        ProviderKind::Vultr => self.resolve_api_key(&self.api_keys.vultr, "VULTR_API_KEY"),
+                        ProviderKind::UpCloud => {
+                            self.resolve_api_key(&self.api_keys.upcloud, "UPCLOUD_API_TOKEN")
+                        }
+                        ProviderKind::Linode => {
+                            self.resolve_api_key(&self.api_keys.linode, "LINODE_API_TOKEN")
+                        }
+                        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => None,
+                    };
+                    let Some(key_str) = api_key else {
+                        let msg = format!("API key for {} is not configured", inst.provider.label());
+                        self.logs.push(format!("[ERROR] {}", msg));
+                        self.status_message = msg;
+                        return;
+                    };
+                    match destroy_provider_instance_with_key(
+                        inst.provider,
+                        &key_str,
+                        &inst.id,
+                        None,
+                    ) {
+                        Ok(()) => {
+                            self.running_instances.remove(self.running_index);
+                            if self.running_index >= self.running_instances.len() {
+                                self.running_index = self.running_instances.len().saturating_sub(1);
+                            }
+                            if let Some(ref path) = self.state_path {
+                                let state = SessionState::new(path);
+                                if let Err(err) = clear_destroyed_session_if_matches(&state, &inst.id)
+                                {
+                                    self.logs.push(format!(
+                                        "[WARN] Failed to clear session state for {}: {}",
+                                        inst.id, err
+                                    ));
+                                }
+                            }
+                            if self
+                                .session
+                                .vps_instance_id
+                                .as_deref()
+                                .map(str::trim)
+                                == Some(inst.id.trim())
+                            {
+                                self.session.vps_provider = None;
+                                self.session.vps_instance_id = None;
+                                self.session.vps_ip = None;
+                                self.session.public_ip = None;
+                                self.session.tailscale_ip = None;
+                            }
+                            let msg = format!(
+                                "Destroyed {} instance {} ({})",
+                                inst.provider.label(),
+                                inst.name,
+                                inst.id
+                            );
+                            self.logs.push(format!("[DESTROY] {}", msg));
+                            self.status_message = msg;
+                        }
+                        Err(err) => {
+                            let msg = format!("Destroy failed for {}: {}", inst.id, err);
+                            self.logs.push(format!("[ERROR] {}", msg));
+                            self.status_message = msg;
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('q') => {
+                    self.running_confirm_destroy = false;
+                    self.status_message = "Destroy cancelled".to_string();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.running_index = prev_index(self.running_index, self.running_instances.len());
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.running_index = next_index(self.running_index, self.running_instances.len());
+            }
+            KeyCode::Char('r') => {
+                self.refresh_running_instances();
+            }
+            KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
+                if let Some(inst) = self.running_instances.get(self.running_index) {
+                    self.running_confirm_destroy = true;
+                    self.status_message = format!(
+                        "Confirm destroy of {} {} ({})? Press y/Enter or n/Esc",
+                        inst.provider.label(),
+                        inst.name,
+                        inst.id
+                    );
+                } else {
+                    self.status_message = "No instances available to destroy".to_string();
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('b') => {
+                self.screen = Screen::Home;
             }
             _ => {}
         }
@@ -1336,6 +1573,11 @@ impl TuiApp {
         } else {
             "false".to_string()
         };
+        let enabled = if self.cf_dns.enabled {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        };
 
         self.session.cf_zone = if zone.is_empty() {
             None
@@ -1345,6 +1587,7 @@ impl TuiApp {
         self.session.cf_record = Some(record.clone());
         self.session.cf_target = Some(target.clone());
         self.session.cf_proxied = Some(proxied.clone());
+        self.session.cf_enabled = Some(enabled);
 
         if let Some(ref path) = self.state_path {
             let state = SessionState::new(path);
@@ -1355,7 +1598,8 @@ impl TuiApp {
         }
 
         self.status_message = format!(
-            "Saved Cloudflare DNS (zone: {}, record: {}, target: {}, proxied: {})",
+            "Saved Cloudflare DNS (enabled: {}, zone: {}, record: {}, target: {}, proxied: {})",
+            if self.cf_dns.enabled { "ON" } else { "OFF" },
             if zone.is_empty() { "(none)" } else { &zone },
             record,
             target,
@@ -1430,6 +1674,513 @@ impl TuiApp {
         }
     }
 
+    fn auto_save_api_keys(&mut self) {
+        let Some(ref path) = self.settings_path else {
+            return;
+        };
+        let settings = Settings::new(path);
+        if let Err(err) = self.api_keys.save_to_settings(&settings) {
+            self.status_message = format!("Failed to auto-save API keys: {}", err);
+        }
+    }
+
+    fn resolve_api_key(&self, form_val: &str, env_name: &str) -> Option<String> {
+        let trimmed = form_val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+        if let Some(ref path) = self.settings_path {
+            if let Ok(Some(v)) = Settings::new(path).get(env_name) {
+                let t = v.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+            return None;
+        }
+        if let Ok(v) = std::env::var(env_name) {
+            let t = v.trim();
+            if !t.is_empty() {
+                return Some(t.to_string());
+            }
+        }
+        if let Ok(settings) = Settings::load_default() {
+            if let Ok(Some(v)) = settings.get(env_name) {
+                let t = v.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    fn resolve_ssh_pubkey(&self) -> Result<(PathBuf, String)> {
+        let trimmed = self.access.ssh_key_path.trim();
+        let key_path = if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("tailscale") {
+            PathBuf::from(trimmed)
+        } else {
+            default_ssh_key_path()?
+        };
+
+        match read_public_key(&key_path) {
+            Ok(pubkey) => Ok((key_path, pubkey)),
+            Err(_) if self.build_dry_run => Ok((
+                key_path,
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDryRunPlaceholderKey bab@dry-run"
+                    .to_string(),
+            )),
+            Err(_) => {
+                let comment = format!("bab@{}", self.access.hostname);
+                let pubkey = ensure_ssh_keypair(&key_path, &comment)?;
+                Ok((key_path, pubkey))
+            }
+        }
+    }
+
+    /// Queries running cloud VPS instances across Vultr, UpCloud, and Linode.
+    pub fn refresh_running_instances(&mut self) {
+        let vultr_key = Some(self.api_keys.vultr.as_str()).filter(|s| !s.trim().is_empty());
+        let upcloud_key = Some(self.api_keys.upcloud.as_str()).filter(|s| !s.trim().is_empty());
+        let linode_key = Some(self.api_keys.linode.as_str()).filter(|s| !s.trim().is_empty());
+        let result = query_providers_with_keys(vultr_key, upcloud_key, linode_key, None);
+        self.running_instances = result.instances;
+        self.running_statuses = result.provider_statuses;
+        self.running_confirm_destroy = false;
+        if self.running_instances.is_empty() {
+            self.running_index = 0;
+        } else if self.running_index >= self.running_instances.len() {
+            self.running_index = self.running_instances.len() - 1;
+        }
+        self.status_message = format!(
+            "Found {} running instance(s) across configured providers",
+            self.running_instances.len()
+        );
+    }
+
+    /// Executes the full provision + 6-step setup + optional Cloudflare DNS plan using current options.
+    pub fn execute_build(&mut self) {
+        self.save_provider_selection();
+        self.save_access_config();
+        self.save_cf_dns();
+        self.save_github_deploy();
+
+        self.progress_steps = SetupStepKind::all()
+            .iter()
+            .copied()
+            .map(|s| (s, None))
+            .collect();
+        let mode_tag = if self.build_dry_run { "DRY-RUN" } else { "LIVE" };
+        self.logs.push(format!(
+            "[BUILD] Starting {} build (provider={}, role={}, transport={}, dns={})",
+            mode_tag,
+            provider_display_label(self.selected_provider),
+            self.selected_role,
+            self.access.transport_mode_str(),
+            if self.cf_dns.enabled { "ON" } else { "OFF" }
+        ));
+
+        let tailscale_mode = self.is_tailscale_mode();
+        let ssh_cred = if !tailscale_mode {
+            match self.resolve_ssh_pubkey() {
+                Ok(cred) => Some(cred),
+                Err(err) => {
+                    let msg = format!("Failed to resolve SSH key: {}", err);
+                    self.logs.push(format!("[ERROR] {}", msg));
+                    self.status_message = msg;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        if self.selected_provider == ProviderKind::ManualCloudInit {
+            let script_res: Result<String> = if tailscale_mode {
+                let auth_key = if self.build_dry_run {
+                    "tskey-auth-DRYRUN".to_string()
+                } else {
+                    let Some(ts_key) = self.resolve_api_key(&self.api_keys.tailscale, "TAILSCALE_API_KEY")
+                    else {
+                        let msg = "TAILSCALE_API_KEY is not configured for Manual Cloud-Init".to_string();
+                        self.logs.push(format!("[ERROR] {}", msg));
+                        self.status_message = msg;
+                        return;
+                    };
+                    match TailscaleClient::new(ts_key).and_then(|c| {
+                        c.create_auth_key("bab-bootstrap", &["tag:bab".to_string()], false, true, 3600)
+                    }) {
+                        Ok(k) => k,
+                        Err(err) => {
+                            let msg = format!("Failed to create Tailscale auth key: {}", err);
+                            self.logs.push(format!("[ERROR] {}", msg));
+                            self.status_message = msg;
+                            return;
+                        }
+                    }
+                };
+                Ok(generate_cloud_init(
+                    &auth_key,
+                    &self.access.hostname,
+                    &self.access.username,
+                ))
+            } else {
+                let (_, ref pubkey) = ssh_cred.as_ref().expect("resolved above");
+                Ok(generate_ssh_cloud_init(
+                    pubkey,
+                    &self.access.hostname,
+                    &self.access.username,
+                ))
+            };
+
+            match script_res {
+                Ok(script) => {
+                    self.logs.push(format!(
+                        "[CLOUD-INIT] Generated cloud-init script ({} bytes)",
+                        script.len()
+                    ));
+                    for line in script.lines().take(20) {
+                        self.logs.push(format!("  {}", line));
+                    }
+                    self.status_message = if self.build_dry_run {
+                        "Dry-run cloud-init generated (see logs)".to_string()
+                    } else {
+                        "Cloud-init script generated (see logs)".to_string()
+                    };
+                }
+                Err(err) => {
+                    let msg = format!("Cloud-init generation failed: {}", err);
+                    self.logs.push(format!("[ERROR] {}", msg));
+                    self.status_message = msg;
+                }
+            }
+            return;
+        }
+
+        let target_ip = match self.selected_provider {
+            ProviderKind::Vultr | ProviderKind::UpCloud | ProviderKind::Linode => {
+                if self.build_dry_run {
+                    let sim_ip = self
+                        .session
+                        .vps_ip
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            if tailscale_mode {
+                                "100.64.0.1".to_string()
+                            } else {
+                                "203.0.113.10".to_string()
+                            }
+                        });
+                    self.logs.push(format!(
+                        "[DRY-RUN] Simulated {} provision -> {}",
+                        provider_display_label(self.selected_provider),
+                        sim_ip
+                    ));
+                    sim_ip
+                } else {
+                    let env_name = self
+                        .selected_provider
+                        .api_key_env_name()
+                        .expect("cloud provider has api key");
+                    let form_val = match self.selected_provider {
+                        ProviderKind::Vultr => &self.api_keys.vultr,
+                        ProviderKind::UpCloud => &self.api_keys.upcloud,
+                        ProviderKind::Linode => &self.api_keys.linode,
+                        _ => "",
+                    };
+                    let Some(provider_key) = self.resolve_api_key(form_val, env_name) else {
+                        let msg = format!("{} is not configured", env_name);
+                        self.logs.push(format!("[ERROR] {}", msg));
+                        self.status_message = msg;
+                        return;
+                    };
+                    let provider = match build_cloud_provider_with_key(
+                        self.selected_provider,
+                        &provider_key,
+                        None,
+                    ) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            let msg = format!("Failed to initialize provider: {}", err);
+                            self.logs.push(format!("[ERROR] {}", msg));
+                            self.status_message = msg;
+                            return;
+                        }
+                    };
+                    let ts_client = if tailscale_mode {
+                        let Some(ts_key) =
+                            self.resolve_api_key(&self.api_keys.tailscale, "TAILSCALE_API_KEY")
+                        else {
+                            let msg = "TAILSCALE_API_KEY is not configured".to_string();
+                            self.logs.push(format!("[ERROR] {}", msg));
+                            self.status_message = msg;
+                            return;
+                        };
+                        match TailscaleClient::new(ts_key) {
+                            Ok(c) => Some(c),
+                            Err(err) => {
+                                let msg = format!("Failed to initialize Tailscale client: {}", err);
+                                self.logs.push(format!("[ERROR] {}", msg));
+                                self.status_message = msg;
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let region = self
+                        .selected_region
+                        .clone()
+                        .or_else(|| {
+                            default_regions_for(self.selected_provider)
+                                .into_iter()
+                                .next()
+                                .map(|r| r.id)
+                        })
+                        .unwrap_or_default();
+                    let plan = self
+                        .selected_plan
+                        .clone()
+                        .or_else(|| {
+                            default_plans_for(self.selected_provider)
+                                .into_iter()
+                                .next()
+                                .map(|p| p.id)
+                        })
+                        .unwrap_or_default();
+                    let image_id = self
+                        .selected_image
+                        .clone()
+                        .or_else(|| {
+                            default_images_for(self.selected_provider)
+                                .into_iter()
+                                .next()
+                                .map(|i| i.id)
+                        })
+                        .unwrap_or_default();
+
+                    let prov_cfg = ProvisionConfig {
+                        provider: self.selected_provider,
+                        region,
+                        plan,
+                        image_id,
+                        hostname: self.access.hostname.clone(),
+                        username: self.access.username.clone(),
+                        role: self.selected_role.to_string(),
+                        tags: vec!["tag:bab".to_string()],
+                        provider_timeout: Duration::from_secs(300),
+                        tailscale_timeout: Duration::from_secs(300),
+                        poll_interval: Duration::from_secs(5),
+                        tailscale_mode,
+                        ssh_pubkey: ssh_cred.as_ref().map(|(_, pk)| pk.clone()),
+                        ssh_key_path: ssh_cred
+                            .as_ref()
+                            .map(|(p, _)| p.to_string_lossy().into_owned()),
+                    };
+                    let prov_state = self.state_path.as_ref().map(SessionState::new);
+                    match provision_full_flow(
+                        provider.as_ref(),
+                        ts_client.as_ref(),
+                        &prov_cfg,
+                        prov_state.as_ref(),
+                    ) {
+                        Ok(res) => {
+                            self.session.vps_instance_id = Some(res.instance_id.clone());
+                            self.session.public_ip = if res.public_ip.is_empty() {
+                                None
+                            } else {
+                                Some(res.public_ip.clone())
+                            };
+                            self.session.tailscale_ip = if res.tailscale_ip.is_empty() {
+                                None
+                            } else {
+                                Some(res.tailscale_ip.clone())
+                            };
+                            self.session.vps_ip = Some(res.ip.clone());
+                            self.logs.push(format!(
+                                "[PROVISION] {} ready: instance={}, ip={}",
+                                provider_display_label(self.selected_provider),
+                                res.instance_id,
+                                res.ip
+                            ));
+                            res.ip
+                        }
+                        Err(err) => {
+                            let msg = format!("Provision failed: {}", err);
+                            self.logs.push(format!("[ERROR] {}", msg));
+                            self.status_message = msg;
+                            return;
+                        }
+                    }
+                }
+            }
+            ProviderKind::ExistingTailscale => {
+                if let Some(ip) = self
+                    .session
+                    .vps_ip
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    ip.to_string()
+                } else if self.build_dry_run {
+                    let sim_ip = if tailscale_mode {
+                        "100.64.0.1".to_string()
+                    } else {
+                        "203.0.113.10".to_string()
+                    };
+                    self.logs.push(format!(
+                        "[DRY-RUN] Simulated Existing Tailscale target -> {}",
+                        sim_ip
+                    ));
+                    sim_ip
+                } else {
+                    let msg = "No target IP (VPS_IP) configured for Existing Tailscale".to_string();
+                    self.logs.push(format!("[ERROR] {}", msg));
+                    self.status_message = msg;
+                    return;
+                }
+            }
+            ProviderKind::ManualCloudInit => unreachable!("handled above"),
+        };
+
+        let github_deploy = {
+            let repo = self.github_deploy.repo.trim();
+            if repo.is_empty() {
+                None
+            } else {
+                let branch = {
+                    let b = self.github_deploy.branch.trim();
+                    if b.is_empty() {
+                        "main".to_string()
+                    } else {
+                        b.to_string()
+                    }
+                };
+                let deploy_path = {
+                    let p = self.github_deploy.deploy_path.trim();
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p.to_string())
+                    }
+                };
+                let deploy_cmd = {
+                    let c = self.github_deploy.deploy_cmd.trim();
+                    if c.is_empty() {
+                        None
+                    } else {
+                        Some(c.to_string())
+                    }
+                };
+                let github_token = self.resolve_api_key(&self.api_keys.github, "GITHUB_TOKEN");
+                Some(GithubDeployConfig {
+                    repo: repo.to_string(),
+                    branch,
+                    deploy_path,
+                    deploy_cmd,
+                    github_token,
+                    username: self.access.username.clone(),
+                })
+            }
+        };
+
+        let setup_cfg = SetupConfig {
+            host: target_ip.clone(),
+            ssh_user: "root".to_string(),
+            new_username: self.access.username.clone(),
+            hostname: self.access.hostname.clone(),
+            role: self.selected_role,
+            provider_name: self.selected_provider.to_string(),
+            tailscale_mode,
+            ssh_pubkey: ssh_cred.as_ref().map(|(_, pk)| pk.clone()),
+            dry_run: self.build_dry_run,
+            github_deploy,
+        };
+
+        let transport_mode = if tailscale_mode {
+            TransportMode::Tailscale
+        } else {
+            let key_path = ssh_cred
+                .as_ref()
+                .map(|(p, _)| p.clone())
+                .unwrap_or_else(|| PathBuf::from(&self.access.ssh_key_path));
+            TransportMode::SshKey(key_path)
+        };
+        let transport = SshTransport::from_env(transport_mode);
+        let state_opt = if self.build_dry_run {
+            None
+        } else {
+            self.state_path.as_ref().map(SessionState::new)
+        };
+
+        if let Err(err) = SetupRunner::new(&transport, state_opt.as_ref())
+            .run_all(&setup_cfg, |report| self.record_step(report))
+        {
+            let msg = format!("Build failed: {}", err);
+            self.logs.push(format!("[ERROR] {}", msg));
+            self.status_message = msg;
+            return;
+        }
+
+        if self.cf_dns.enabled {
+            let zone = self.cf_dns.zone.trim();
+            if !zone.is_empty() {
+                let resolved_ip = self
+                    .cf_dns
+                    .resolve_target_ip(&self.session)
+                    .unwrap_or(target_ip.as_str())
+                    .to_string();
+                let record_name = {
+                    let r = self.cf_dns.record_name.trim();
+                    if r.is_empty() {
+                        "@".to_string()
+                    } else {
+                        r.to_string()
+                    }
+                };
+                let dns_cfg = CloudflareDnsConfig {
+                    zone: zone.to_string(),
+                    record_name,
+                    target_ip: resolved_ip,
+                    proxied: self.cf_dns.proxied,
+                };
+                let has_token = self
+                    .resolve_api_key(&self.api_keys.cloudflare, "CLOUDFLARE_API_TOKEN")
+                    .is_some();
+                match build_cloudflare_dns_stub_plan(&dns_cfg, has_token) {
+                    Ok(plan) => self.logs.push(format!("[DNS] {}", plan)),
+                    Err(err) => self.logs.push(format!("[DNS] Error: {}", err)),
+                }
+            } else {
+                self.logs
+                    .push("[DNS] Warning: DNS is ON but CF_ZONE is empty".to_string());
+            }
+        } else {
+            self.logs
+                .push("[DNS] Cloudflare DNS is OFF (skipped)".to_string());
+        }
+
+        if !self.build_dry_run {
+            if let Some(ref st) = state_opt {
+                if let Err(err) = st.save_session(&self.session) {
+                    self.logs
+                        .push(format!("[WARN] Failed to save session state: {}", err));
+                }
+            }
+        }
+
+        self.status_message = if self.build_dry_run {
+            format!("Dry-run build complete (target: {})", target_ip)
+        } else {
+            format!("Build complete (target: {})", target_ip)
+        };
+    }
+
     /// Renders the active TUI screen into the given ratatui `Frame`.
     pub fn render_frame(&self, frame: &mut Frame) {
         let chunks = Layout::default()
@@ -1451,6 +2202,8 @@ impl TuiApp {
             Screen::CloudflareDns => self.render_cloudflare_dns(frame, chunks[1]),
             Screen::GithubDeploy => self.render_github_deploy(frame, chunks[1]),
             Screen::ApiKeys => self.render_api_keys(frame, chunks[1]),
+            Screen::BuildBox => self.render_build_box(frame, chunks[1]),
+            Screen::RunningInstances => self.render_running_instances(frame, chunks[1]),
         }
         self.render_bottom_pane(frame, chunks[2]);
         self.render_footer(frame, chunks[3]);
@@ -1462,9 +2215,11 @@ impl TuiApp {
             Screen::SelectProvider => "Provider, Location & Size",
             Screen::SelectRole => "Select Server Role",
             Screen::AccessConfig => "Access, User & Transport",
-            Screen::CloudflareDns => "Cloudflare DNS (Stub)",
+            Screen::CloudflareDns => "Cloudflare DNS",
             Screen::GithubDeploy => "GitHub Repo Deployment",
-            Screen::ApiKeys => "API Keys (Encrypted)",
+            Screen::ApiKeys => "API Key Settings",
+            Screen::BuildBox => "Build Box with Current Options",
+            Screen::RunningInstances => "Running Systems & Destroy",
         };
         let header = Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1482,36 +2237,45 @@ impl TuiApp {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let hints = match self.screen {
-            Screen::Home => "Up/Down or j/k: Navigate | 1-7/Enter: Open | q: Quit",
+            Screen::Home => "Up/Down or j/k: Navigate | 1-9/Enter: Open | q: Quit",
             Screen::SelectProvider => {
-                "Up/Down or j/k: Provider | r: Region | p: Plan | i: Image | 1-5/Enter/s: Save | Esc/b: Back | q: Quit"
+                "Up/Down or j/k: Provider | r: Region | p: Plan | i: Image | 1-5/Enter/s: Save | Esc/b/q: Back"
             }
             Screen::SelectRole => {
-                "Up/Down or j/k: Move | 1-4: Quick Select | Enter: Confirm | Esc/b: Back | q: Quit"
+                "Up/Down or j/k: Move | 1-4: Quick Select | Enter: Confirm | Esc/b/q: Back"
             }
             Screen::AccessConfig if self.access.editing => {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::AccessConfig => {
-                "Up/Down or j/k: Field | Space/Enter/Left/Right: Toggle/Edit | s: Save | Esc/b: Back | q: Quit"
+                "Up/Down or j/k: Field | Space/Enter/Left/Right: Toggle/Edit | s: Save | Esc/b/q: Back"
             }
             Screen::CloudflareDns if self.cf_dns.editing => {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::CloudflareDns => {
-                "Up/Down or j/k: Field | Space/Enter/Left/Right: Toggle/Edit | s: Save | Esc/b: Back | q: Quit"
+                "Up/Down or j/k: Field | Space/Enter/Left/Right/t: Toggle/Edit | s: Save | Esc/b/q: Back"
             }
             Screen::GithubDeploy if self.github_deploy.editing => {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::GithubDeploy => {
-                "Up/Down or j/k: Field | Enter/e: Edit | s: Save | Esc/b: Back | q: Quit"
+                "Up/Down or j/k: Field | Enter/e: Edit | s: Save | Esc/b/q: Back"
             }
             Screen::ApiKeys if self.api_keys.editing => {
-                "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
+                "Type characters | Backspace: Delete | Enter/Esc: Finish Editing (Auto-Saved)"
             }
             Screen::ApiKeys => {
-                "Up/Down or j/k: Field | Enter/e: Edit | s: Save | Esc/b: Back | q: Quit"
+                "Up/Down or j/k: Field | Enter/e: Edit (Auto-Saves) | s: Save | Esc/b/q: Back"
+            }
+            Screen::BuildBox => {
+                "Enter/x: Start Build | d/Space: Toggle DNS | n: Toggle Dry-Run | Esc/b/q: Back"
+            }
+            Screen::RunningInstances if self.running_confirm_destroy => {
+                "y/Enter: Confirm Destroy | n/Esc/b/q: Cancel"
+            }
+            Screen::RunningInstances => {
+                "Up/Down or j/k: Select | r: Refresh | d/x/Del: Destroy | Esc/b/q: Back"
             }
         };
         let footer = Paragraph::new(vec![
@@ -1669,8 +2433,12 @@ impl TuiApp {
                 vps_ip, public_ip, tailscale_ip
             )),
             Line::from(format!(
-                "Cloudflare DNS: {} / {} (target={}, proxied={})",
-                cf_zone, cf_record, self.cf_dns.target_mode, self.cf_dns.proxied
+                "Cloudflare DNS: {} / {} (enabled={}, target={}, proxied={})",
+                cf_zone,
+                cf_record,
+                if self.cf_dns.enabled { "ON" } else { "OFF" },
+                self.cf_dns.target_mode,
+                self.cf_dns.proxied
             )),
             Line::from(format!(
                 "GitHub Repo: {} (branch: {})",
@@ -2041,17 +2809,17 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
-                Constraint::Min(6),
+                Constraint::Min(7),
                 Constraint::Length(7),
             ])
             .split(area);
 
         let help = Paragraph::new(
-            "Configure Cloudflare DNS A-record stub settings (CF_ZONE, CF_RECORD, CF_TARGET, CF_PROXIED).",
+            "Configure Cloudflare DNS A-record settings (CF_ZONE, CF_RECORD, CF_TARGET, CF_PROXIED, CF_ENABLED).",
         )
         .block(
             Block::default()
-                .title("Cloudflare DNS (Stub) Help")
+                .title("Cloudflare DNS Help")
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: true });
@@ -2074,6 +2842,10 @@ impl TuiApp {
         let proxied_display = format!(
             "{} — Space/Enter/Left/Right to toggle",
             self.cf_dns.proxied
+        );
+        let enabled_display = format!(
+            "{} — Space/Enter/Left/Right or 't' to toggle",
+            if self.cf_dns.enabled { "ON" } else { "OFF" }
         );
 
         let items = vec![
@@ -2100,6 +2872,10 @@ impl TuiApp {
             ListItem::new(format!(
                 "{} (CF_PROXIED): {}",
                 CF_DNS_FIELD_LABELS[3], proxied_display
+            )),
+            ListItem::new(format!(
+                "{} (CF_ENABLED): {}",
+                CF_DNS_FIELD_LABELS[4], enabled_display
             )),
         ];
 
@@ -2133,7 +2909,21 @@ impl TuiApp {
         };
         let has_token = !self.api_keys.cloudflare.is_empty();
         let preview_line = match build_cloudflare_dns_stub_plan(&cfg, has_token) {
-            Ok(plan) => Line::from(Span::styled(plan, Style::default().fg(Color::Green))),
+            Ok(plan) => {
+                let prefix = if self.cf_dns.enabled {
+                    ""
+                } else {
+                    "[DNS OFF] "
+                };
+                Line::from(Span::styled(
+                    format!("{}{}", prefix, plan),
+                    Style::default().fg(if self.cf_dns.enabled {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
+                ))
+            }
             Err(err) => Line::from(Span::styled(
                 format!("Preview pending: {}", err),
                 Style::default().fg(Color::Yellow),
@@ -2142,7 +2932,8 @@ impl TuiApp {
 
         let details = Paragraph::new(vec![
             Line::from(format!(
-                "CF_ZONE={} | CF_RECORD={} | CF_TARGET={} | CF_PROXIED={}",
+                "CF_ENABLED={} | CF_ZONE={} | CF_RECORD={} | CF_TARGET={} | CF_PROXIED={}",
+                if self.cf_dns.enabled { "ON" } else { "OFF" },
                 if self.cf_dns.zone.trim().is_empty() {
                     "(not set)"
                 } else {
@@ -2161,7 +2952,7 @@ impl TuiApp {
         ])
         .block(
             Block::default()
-                .title("Live Stub Plan Preview (Saved on 's')")
+                .title("Live Plan Preview (Saved on 's')")
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: true });
@@ -2361,6 +3152,7 @@ impl TuiApp {
                 "Master Key (0600):    {} (or BAB_ENCRYPTION_KEY env)",
                 master_key_display
             )),
+            Line::from("Changes auto-save & encrypt immediately as you type (empty removes key)."),
         ])
         .block(
             Block::default()
@@ -2387,7 +3179,7 @@ impl TuiApp {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title("API Key Settings (Masked, ChaCha20-Poly1305 Encrypted)")
+                    .title("API Key Settings (Masked, Auto-Saved & ChaCha20-Poly1305 Encrypted)")
                     .borders(Borders::ALL),
             )
             .highlight_style(
@@ -2400,6 +3192,249 @@ impl TuiApp {
         let mut state = ListState::default();
         state.select(Some(self.api_keys.active_field));
         frame.render_stateful_widget(list, rows[1], &mut state);
+    }
+
+    fn render_build_box(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(10), Constraint::Length(3)])
+            .split(area);
+
+        let tailscale_mode = self.is_tailscale_mode();
+        let ports = self
+            .selected_role
+            .open_ports_for_mode(tailscale_mode)
+            .join(", ");
+        let provider_line = if self.selected_provider == ProviderKind::ExistingTailscale {
+            format!(
+                "Provider: {} | Target IP: {}",
+                provider_display_label(self.selected_provider),
+                self.session
+                    .vps_ip
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("(not set)")
+            )
+        } else {
+            format!(
+                "Provider: {} | Region: {} | Plan: {} | Image: {}",
+                provider_display_label(self.selected_provider),
+                self.selected_region.as_deref().unwrap_or("-"),
+                self.selected_plan.as_deref().unwrap_or("-"),
+                self.selected_image.as_deref().unwrap_or("-"),
+            )
+        };
+        let ssh_key_display = if tailscale_mode {
+            "tailscale".to_string()
+        } else {
+            self.access.ssh_key_path.clone()
+        };
+        let dns_state = if self.cf_dns.enabled { "ON" } else { "OFF" };
+        let dns_zone = if self.cf_dns.zone.trim().is_empty() {
+            "(not set)"
+        } else {
+            self.cf_dns.zone.trim()
+        };
+        let gh_repo = if self.github_deploy.repo.trim().is_empty() {
+            "(none)".to_string()
+        } else {
+            format!(
+                "{} (branch: {})",
+                self.github_deploy.repo.trim(),
+                if self.github_deploy.branch.trim().is_empty() {
+                    "main"
+                } else {
+                    self.github_deploy.branch.trim()
+                }
+            )
+        };
+        let exec_mode = if self.build_dry_run {
+            "Dry-Run: ON (simulated)"
+        } else {
+            "Dry-Run: OFF (live)"
+        };
+
+        let provider_key_ok = match self.selected_provider {
+            ProviderKind::Vultr => !self.api_keys.vultr.trim().is_empty(),
+            ProviderKind::UpCloud => !self.api_keys.upcloud.trim().is_empty(),
+            ProviderKind::Linode => !self.api_keys.linode.trim().is_empty(),
+            ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => true,
+        };
+        let ts_key_ok = !tailscale_mode || !self.api_keys.tailscale.trim().is_empty();
+        let cf_key_ok = !self.cf_dns.enabled || !self.api_keys.cloudflare.trim().is_empty();
+        let readiness = format!(
+            "Provider Key: {} | Tailscale Key: {} | Cloudflare Token: {} | GitHub Token: {}",
+            yes_no(provider_key_ok),
+            yes_no(ts_key_ok),
+            if self.cf_dns.enabled {
+                yes_no(cf_key_ok)
+            } else {
+                "skipped"
+            },
+            if self.github_deploy.repo.trim().is_empty() {
+                "optional"
+            } else {
+                yes_no(!self.api_keys.github.trim().is_empty())
+            }
+        );
+
+        let lines = vec![
+            Line::from(provider_line),
+            Line::from(format!(
+                "Server Role: {} | Open Ports: {}",
+                self.selected_role.label(),
+                ports
+            )),
+            Line::from(format!(
+                "Transport Mode: {} | Sudo Username: {} | Hostname: {}",
+                self.access.transport_mode_str(),
+                self.access.username,
+                self.access.hostname
+            )),
+            Line::from(format!("SSH Key Path: {}", ssh_key_display)),
+            Line::from(format!(
+                "Cloudflare DNS: {} ({} / {}, target={}, proxied={})  ['d' or Space: Toggle DNS ON/OFF]",
+                dns_state,
+                dns_zone,
+                self.cf_dns.record_name,
+                self.cf_dns.target_mode,
+                self.cf_dns.proxied
+            )),
+            Line::from(format!("GitHub Repo Deploy: {}", gh_repo)),
+            Line::from(Span::styled(
+                format!("Execution Mode: {}  ['n': Toggle Dry-Run]", exec_mode),
+                Style::default().fg(if self.build_dry_run {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
+            )),
+            Line::from(format!("Credentials: {}", readiness)),
+        ];
+
+        let overview = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Build Box with Current Options")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true });
+        frame.render_widget(overview, rows[0]);
+
+        let actions = Paragraph::new(Line::from(Span::styled(
+            "Enter / 'x': Start Build with Current Options | d/Space: Toggle DNS | n: Toggle Dry-Run | Esc/b/q: Back",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )))
+        .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(actions, rows[1]);
+    }
+
+    fn render_running_instances(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Min(6),
+                Constraint::Length(3),
+            ])
+            .split(area);
+
+        let status_lines: Vec<Line> = if self.running_statuses.is_empty() {
+            vec![Line::from("No provider query run yet (press 'r' to refresh).")]
+        } else {
+            self.running_statuses
+                .iter()
+                .map(|st| {
+                    if !st.configured {
+                        Line::from(format!("{}: not configured", st.provider.label()))
+                    } else if let Some(ref err) = st.error {
+                        Line::from(Span::styled(
+                            format!("{}: error ({})", st.provider.label(), err),
+                            Style::default().fg(Color::Red),
+                        ))
+                    } else {
+                        Line::from(Span::styled(
+                            format!("{}: {} instance(s)", st.provider.label(), st.instance_count),
+                            Style::default().fg(Color::Green),
+                        ))
+                    }
+                })
+                .collect()
+        };
+        let status_widget = Paragraph::new(status_lines)
+            .block(
+                Block::default()
+                    .title("Provider Query Status")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: true });
+        frame.render_widget(status_widget, rows[0]);
+
+        if self.running_instances.is_empty() {
+            let empty = Paragraph::new("(no running instances found; press 'r' to refresh)")
+                .block(
+                    Block::default()
+                        .title("Running Instances")
+                        .borders(Borders::ALL),
+                );
+            frame.render_widget(empty, rows[1]);
+        } else {
+            let items: Vec<ListItem> = self
+                .running_instances
+                .iter()
+                .map(|inst| {
+                    let ip = inst.public_ip.as_deref().unwrap_or("-");
+                    let region = inst.region.as_deref().unwrap_or("-");
+                    let plan = inst.plan.as_deref().unwrap_or("-");
+                    ListItem::new(format!(
+                        "[{}] {} ({}) | {} | ip={} | {} | {}",
+                        inst.provider.label(),
+                        inst.name,
+                        inst.id,
+                        inst.status,
+                        ip,
+                        region,
+                        plan
+                    ))
+                })
+                .collect();
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .title("Running Instances")
+                        .borders(Borders::ALL),
+                )
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("> ");
+            let mut state = ListState::default();
+            state.select(Some(self.running_index));
+            frame.render_stateful_widget(list, rows[1], &mut state);
+        }
+
+        let banner = if self.running_confirm_destroy {
+            if let Some(inst) = self.running_instances.get(self.running_index) {
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        "CONFIRM DESTROY: {} {} ({})? Press 'y'/Enter to confirm or 'n'/Esc/'b'/'q' to cancel",
+                        inst.provider.label(),
+                        inst.name,
+                        inst.id
+                    ),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )))
+            } else {
+                Paragraph::new("Confirm destroy? y/Enter: Yes | n/Esc/b/q: Cancel")
+            }
+        } else {
+            Paragraph::new("r: Refresh | d/x/Del: Destroy Selected | Esc/b/q: Back")
+        }
+        .block(Block::default().borders(Borders::ALL));
+        frame.render_widget(banner, rows[2]);
     }
 
     fn render_bottom_pane(&self, frame: &mut Frame, area: Rect) {
@@ -2545,7 +3580,12 @@ impl TuiApp {
             Line::from(format!("Target IP:     {}", target_ip)),
             Line::from(format!("Region/Plan:   {} / {} ({})", region, plan, provider)),
             Line::from(format!("Role/Mode/Usr: {} / {} / {}", role, transport, username)),
-            Line::from(format!("DNS / Repo:    {} / {}", dns_zone, repo)),
+            Line::from(format!(
+                "DNS / Repo:    {} (enabled={}) / {}",
+                dns_zone,
+                if self.cf_dns.enabled { "ON" } else { "OFF" },
+                repo
+            )),
             Line::from(format!("Keys: {} [ChaCha20-Poly1305, 0600]", key_filename)),
         ];
         let info = Paragraph::new(info_lines).block(
@@ -2711,16 +3751,21 @@ mod tests {
         assert!(text.contains("[1] Select Provider, Location & Size"));
         assert!(text.contains("[2] Select Server Role"));
         assert!(text.contains("[3] Access, User & Transport"));
-        assert!(text.contains("[4] Cloudflare DNS (Stub)"));
+        assert!(text.contains("[4] Cloudflare DNS"));
         assert!(text.contains("[5] GitHub Repo Deployment"));
-        assert!(text.contains("[6] API Key Settings (Encrypted)"));
-        assert!(text.contains("[7] Quit"));
+        assert!(text.contains("[6] API Key Settings"));
+        assert!(text.contains("[7] Build Box with Current Options"));
+        assert!(text.contains("[8] Running Systems & Destroy"));
+        assert!(text.contains("[9] Quit"));
+        assert!(!text.contains("Cloudflare DNS (Stub)"));
+        assert!(!text.contains("API Key Settings (Encrypted)"));
         assert!(text.contains("Setup Progress & Logs"));
         assert!(text.contains("Box & Final Connection Info"));
     }
 
     #[test]
     fn renders_select_provider_with_all_five_variants_and_catalog() {
+        let _lock = crate::env_lock();
         let mut app = TuiApp::new(SessionData::default(), ApiKeyForm::default());
         app.screen = Screen::SelectProvider;
         let text = render_to_string(&app);
@@ -2738,6 +3783,7 @@ mod tests {
 
     #[test]
     fn select_provider_cycles_region_plan_image_and_persists() -> Result<()> {
+        let _lock = crate::env_lock();
         let dir = tempdir()?;
         let settings_path = dir.path().join("credentials.enc");
         let state_path = dir.path().join("state.conf");
@@ -2819,6 +3865,7 @@ mod tests {
 
     #[test]
     fn select_provider_preserves_custom_non_preset_catalog_ids_on_save_same_provider() -> Result<()> {
+        let _lock = crate::env_lock();
         let dir = tempdir()?;
         let settings_path = dir.path().join("credentials.enc");
         let state_path = dir.path().join("state.conf");
@@ -2875,6 +3922,7 @@ mod tests {
 
     #[test]
     fn select_role_shows_all_roles_shortcuts_and_stub_status() {
+        let _lock = crate::env_lock();
         let mut app = TuiApp::new(SessionData::default(), ApiKeyForm::default());
         assert_eq!(app.selected_role, ServerRole::Vanilla);
         assert_eq!(app.role_index, 0);
@@ -2929,6 +3977,7 @@ mod tests {
 
     #[test]
     fn select_role_open_ports_reflect_transport_mode() {
+        let _lock = crate::env_lock();
         let ts_session = SessionData {
             transport_mode: Some("tailscale".to_string()),
             server_role: Some("vanilla".to_string()),
@@ -2964,6 +4013,7 @@ mod tests {
 
     #[test]
     fn access_config_defaults_toggle_edit_and_persist() -> Result<()> {
+        let _lock = crate::env_lock();
         let dir = tempdir()?;
         let settings_path = dir.path().join("credentials.enc");
         let state_path = dir.path().join("state.conf");
@@ -3088,6 +4138,7 @@ mod tests {
 
     #[test]
     fn cloudflare_dns_edit_toggle_preview_and_persist() -> Result<()> {
+        let _lock = crate::env_lock();
         let dir = tempdir()?;
         let settings_path = dir.path().join("credentials.enc");
         let state_path = dir.path().join("state.conf");
@@ -3166,6 +4217,7 @@ mod tests {
 
     #[test]
     fn github_deploy_edit_preview_and_persist() -> Result<()> {
+        let _lock = crate::env_lock();
         let dir = tempdir()?;
         let settings_path = dir.path().join("credentials.enc");
         let state_path = dir.path().join("state.conf");
@@ -3236,6 +4288,7 @@ mod tests {
 
     #[test]
     fn api_keys_masking_input_and_save() -> Result<()> {
+        let _lock = crate::env_lock();
         assert_eq!(ApiKeyForm::mask_key(""), "(not set)");
         assert_eq!(ApiKeyForm::mask_key("short"), "*****");
         assert_eq!(
@@ -3319,7 +4372,10 @@ mod tests {
             Some("ghp_secret98765432".to_string())
         );
 
-        // 'q' when not editing sets should_quit
+        // 'q' on ApiKeys returns to Home without quitting, then 'q' on Home quits
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(!app.should_quit);
+        assert_eq!(app.screen, Screen::Home);
         app.handle_key(key(KeyCode::Char('q')));
         assert!(app.should_quit);
         Ok(())
@@ -3327,6 +4383,7 @@ mod tests {
 
     #[test]
     fn persistent_bottom_pane_shows_progress_logs_and_connection_info_across_screens() {
+        let _lock = crate::env_lock();
         let session = SessionData {
             vps_ip: Some("100.64.2.20".to_string()),
             public_ip: Some("198.51.100.20".to_string()),
@@ -3363,6 +4420,8 @@ mod tests {
             Screen::CloudflareDns,
             Screen::GithubDeploy,
             Screen::ApiKeys,
+            Screen::BuildBox,
+            Screen::RunningInstances,
         ] {
             app.screen = screen;
             let text = render_to_string(&app);
@@ -3384,6 +4443,7 @@ mod tests {
 
     #[test]
     fn ignores_key_release_events_and_handles_navigation() {
+        let _lock = crate::env_lock();
         let mut app = TuiApp::new(SessionData::default(), ApiKeyForm::default());
         let mut release = key(KeyCode::Down);
         release.kind = KeyEventKind::Release;
@@ -3409,7 +4469,7 @@ mod tests {
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Home);
 
-        // Shortcuts '4', '5', '6' open CloudflareDns, GithubDeploy, ApiKeys
+        // Shortcuts '4', '5', '6', '7' open CloudflareDns, GithubDeploy, ApiKeys, BuildBox
         app.handle_key(key(KeyCode::Char('4')));
         assert_eq!(app.screen, Screen::CloudflareDns);
         app.handle_key(key(KeyCode::Char('b')));
@@ -3418,6 +4478,10 @@ mod tests {
         app.handle_key(key(KeyCode::Char('b')));
         app.handle_key(key(KeyCode::Char('6')));
         assert_eq!(app.screen, Screen::ApiKeys);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.screen, Screen::Home);
+        app.handle_key(key(KeyCode::Char('7')));
+        assert_eq!(app.screen, Screen::BuildBox);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.screen, Screen::Home);
 
@@ -3430,8 +4494,323 @@ mod tests {
         assert_eq!(app.selected_provider, ProviderKind::UpCloud);
         assert_eq!(app.screen, Screen::Home);
 
-        // Shortcut '7' quits
-        app.handle_key(key(KeyCode::Char('7')));
+        // Shortcut '9' quits
+        app.handle_key(key(KeyCode::Char('9')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn submenu_q_returns_to_home_without_quitting_while_home_q_quits() {
+        let _lock = crate::env_lock();
+        let mut app = TuiApp::new(SessionData::default(), ApiKeyForm::default());
+
+        for screen in [
+            Screen::SelectProvider,
+            Screen::SelectRole,
+            Screen::AccessConfig,
+            Screen::CloudflareDns,
+            Screen::GithubDeploy,
+            Screen::ApiKeys,
+            Screen::BuildBox,
+            Screen::RunningInstances,
+        ] {
+            app.screen = screen;
+            let rendered = render_to_string(&app);
+            assert!(
+                rendered.contains("Esc/b/q: Back"),
+                "Screen {:?} footer should advertise Esc/b/q: Back",
+                screen
+            );
+            assert!(
+                !rendered.contains("q: Quit"),
+                "Screen {:?} footer must not say q: Quit",
+                screen
+            );
+
+            app.handle_key(key(KeyCode::Char('q')));
+            assert_eq!(app.screen, Screen::Home);
+            assert!(!app.should_quit);
+        }
+
+        let home_rendered = render_to_string(&app);
+        assert!(home_rendered.contains("1-9/Enter: Open | q: Quit"));
+
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn cloudflare_dns_toggle_and_build_box_dry_run_execute_build() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert!(!app.cf_dns.enabled);
+
+        // Open CloudflareDns and set zone + toggle enabled field
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.screen, Screen::CloudflareDns);
+        app.handle_key(key(KeyCode::Enter));
+        for c in "example.com".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        // Finishing zone edit when cf_enabled is None enables DNS automatically
+        assert!(app.cf_dns.enabled);
+
+        // Navigate to field 4 (DNS Enabled) and toggle OFF then ON with Space and 't'
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.cf_dns.active_field, 4);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(!app.cf_dns.enabled);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(app.cf_dns.enabled);
+        app.handle_key(key(KeyCode::Char('s')));
+
+        let state = SessionState::new(&state_path);
+        assert_eq!(state.cf_enabled()?, Some("true".to_string()));
+
+        // Navigate to BuildBox via 'q' -> '7'
+        app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(app.screen, Screen::Home);
+        app.handle_key(key(KeyCode::Char('7')));
+        assert_eq!(app.screen, Screen::BuildBox);
+
+        let build_view = render_to_string(&app);
+        assert!(build_view.contains("Build Box with Current Options"));
+        assert!(build_view.contains("Cloudflare DNS: ON"));
+
+        // Toggle DNS OFF on BuildBox using 'd'
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(!app.cf_dns.enabled);
+        assert_eq!(state.cf_enabled()?, Some("false".to_string()));
+
+        // Enable Dry-Run using 'n' and execute build with DNS OFF
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(app.build_dry_run);
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[DNS] Cloudflare DNS is OFF (skipped)")));
+        // Dry-run must not persist fake VPS_IP into state.conf
+        assert_eq!(state.vps_ip()?, None);
+
+        // Toggle DNS back ON with Space and run again with 'x'
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.cf_dns.enabled);
+        app.handle_key(key(KeyCode::Char('x')));
+        assert!(app.logs.iter().any(|l| {
+            l.contains("[DNS] [STUB] Cloudflare DNS: would upsert A record '@' -> '100.64.0.1' in zone 'example.com'")
+        }));
+        assert_eq!(state.vps_ip()?, None);
+
+        // ManualCloudInit dry-run also generates cloud-init into logs
+        app.selected_provider = ProviderKind::ManualCloudInit;
+        app.provider_index = 4;
+        app.execute_build();
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[CLOUD-INIT] Generated cloud-init script")));
+        Ok(())
+    }
+
+    #[test]
+    fn api_keys_auto_save_without_s_and_removes_cleared_key() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.handle_key(key(KeyCode::Char('6')));
+        assert_eq!(app.screen, Screen::ApiKeys);
+
+        // Edit TAILSCALE_API_KEY without ever pressing 's'
+        app.handle_key(key(KeyCode::Enter));
+        for c in "tskey-auto-1234".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+
+        let settings = Settings::new(&settings_path);
+        assert_eq!(
+            settings.tailscale_api_key()?,
+            Some("tskey-auto-1234".to_string())
+        );
+
+        // Clear TAILSCALE_API_KEY and verify it is removed from credentials.enc automatically
+        app.handle_key(key(KeyCode::Enter));
+        for _ in 0.."tskey-auto-1234".len() {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(settings.tailscale_api_key()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn running_instances_query_cancel_and_destroy_flow() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        struct EnvGuard {
+            saved: Vec<(String, Option<String>)>,
+        }
+        impl EnvGuard {
+            fn new(keys: &[&str]) -> Self {
+                Self {
+                    saved: keys
+                        .iter()
+                        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+                        .collect(),
+                }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in self.saved.drain(..) {
+                    match v {
+                        Some(val) => std::env::set_var(&k, val),
+                        None => std::env::remove_var(&k),
+                    }
+                }
+            }
+        }
+
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard::new(&[
+            "VULTR_API_BASE_URL",
+            "UPCLOUD_API_BASE_URL",
+            "LINODE_API_BASE_URL",
+        ]);
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let destroyed_bg = Arc::clone(&destroyed);
+
+        let handle = thread::spawn(move || {
+            for stream_res in listener.incoming() {
+                if stop_bg.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream_res else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                let (status, body) = if method == "GET" && path.starts_with("/v2/instances") {
+                    (
+                        "200 OK",
+                        r#"{"instances":[{"id":"vultr-101","label":"edge-box","status":"active","power_status":"running","main_ip":"203.0.113.77","region":"ewr","plan":"vc2-1c-1gb"}],"meta":{"links":{"next":""}}}"#,
+                    )
+                } else if method == "DELETE" && path == "/v2/instances/vultr-101" {
+                    destroyed_bg.store(true, Ordering::SeqCst);
+                    ("204 No Content", "")
+                } else {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        std::env::set_var("VULTR_API_BASE_URL", format!("http://{}/v2", addr));
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let state = SessionState::new(&state_path);
+        state.save_session(&SessionData {
+            vps_provider: Some("vultr".to_string()),
+            vps_instance_id: Some("vultr-101".to_string()),
+            vps_ip: Some("203.0.113.77".to_string()),
+            public_ip: Some("203.0.113.77".to_string()),
+            username: Some("deploy".to_string()),
+            ..Default::default()
+        })?;
+
+        let settings = Settings::new(&settings_path);
+        settings.set_vultr_api_key("vultr-test-key")?;
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+
+        // Press '8' on Home to open RunningInstances and trigger refresh
+        app.handle_key(key(KeyCode::Char('8')));
+        assert_eq!(app.screen, Screen::RunningInstances);
+        assert_eq!(app.running_instances.len(), 1);
+        assert_eq!(app.running_instances[0].id, "vultr-101");
+
+        let list_view = render_to_string(&app);
+        assert!(list_view.contains("edge-box"));
+        assert!(list_view.contains("vultr-101"));
+        assert!(list_view.contains("203.0.113.77"));
+
+        // d -> n cancels confirmation without destroying or quitting
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.running_confirm_destroy);
+        let confirm_view = render_to_string(&app);
+        assert!(confirm_view.contains("CONFIRM DESTROY"));
+        app.handle_key(key(KeyCode::Char('n')));
+        assert!(!app.running_confirm_destroy);
+        assert_eq!(app.running_instances.len(), 1);
+        assert!(!destroyed.load(Ordering::SeqCst));
+
+        // d -> q cancels confirmation without leaving screen or quitting
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.running_confirm_destroy);
+        app.handle_key(key(KeyCode::Char('q')));
+        assert!(!app.running_confirm_destroy);
+        assert_eq!(app.screen, Screen::RunningInstances);
+        assert!(!app.should_quit);
+
+        // d -> y destroys instance, removes from list, and clears matching session
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(!app.running_confirm_destroy);
+        assert!(destroyed.load(Ordering::SeqCst));
+        assert!(app.running_instances.is_empty());
+        assert_eq!(app.session.vps_instance_id, None);
+        assert_eq!(app.session.vps_ip, None);
+        assert_eq!(app.session.public_ip, None);
+        assert_eq!(state.vps_instance_id()?, None);
+        assert_eq!(state.username()?, Some("deploy".to_string()));
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
+        handle.join().unwrap();
+        Ok(())
     }
 }

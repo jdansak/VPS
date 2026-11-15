@@ -12,8 +12,8 @@ use serde::Deserialize;
 use std::env;
 
 use super::{
-    ProviderKind, ProviderRegion, ProviderPlan, ProviderImage, CreateInstanceRequest, InstanceStatus,
-    VpsProvider,
+    non_empty_trimmed, validate_instance_id, CreateInstanceRequest, InstanceStatus, ProviderImage,
+    ProviderInstance, ProviderKind, ProviderPlan, ProviderRegion, VpsProvider,
 };
 
 /// Linode API client.
@@ -118,9 +118,66 @@ struct CreateInstanceResponse {
 
 #[derive(Deserialize)]
 struct InstanceDetailResponse {
+    #[serde(default)]
+    id: Option<serde_json::Value>,
     status: String,
     #[serde(default)]
     ipv4: Vec<String>,
+}
+
+fn default_one() -> u32 {
+    1
+}
+
+#[derive(Deserialize)]
+struct ListInstancesResponse {
+    #[serde(default)]
+    data: Vec<LinodeInstanceItem>,
+    #[serde(default = "default_one")]
+    pages: u32,
+}
+
+#[derive(Deserialize)]
+struct LinodeInstanceItem {
+    id: serde_json::Value,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    ipv4: Vec<String>,
+    #[serde(default)]
+    region: String,
+    #[serde(default, rename = "type")]
+    linode_type: String,
+    #[serde(default)]
+    created: String,
+}
+
+fn id_to_string(val: &serde_json::Value) -> Result<String> {
+    if let Some(s) = val.as_str() {
+        non_empty_trimmed(s).ok_or_else(|| anyhow!("Unexpected empty instance ID"))
+    } else if let Some(i) = val.as_i64() {
+        Ok(i.to_string())
+    } else if let Some(u) = val.as_u64() {
+        Ok(u.to_string())
+    } else {
+        Err(anyhow!("Unexpected instance ID format"))
+    }
+}
+
+fn first_public_ipv4(ips: &[String]) -> Option<String> {
+    ips.iter()
+        .map(|s| s.trim())
+        .find(|s| {
+            s.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| {
+                !ip.is_private()
+                    && !ip.is_loopback()
+                    && !ip.is_link_local()
+                    && !ip.is_unspecified()
+            })
+        })
+        .map(String::from)
 }
 
 impl VpsProvider for LinodeProvider {
@@ -260,17 +317,7 @@ impl VpsProvider for LinodeProvider {
             return Err(anyhow!("Failed to create instance ({}): {}", status, body));
         }
         let data: CreateInstanceResponse = resp.json()?;
-        // The `id` field may be numeric or string.
-        let id_str = if let Some(s) = data.id.as_str() {
-            s.to_string()
-        } else if let Some(i) = data.id.as_i64() {
-            i.to_string()
-        } else if let Some(u) = data.id.as_u64() {
-            u.to_string()
-        } else {
-            return Err(anyhow!("Unexpected instance ID format"));
-        };
-        Ok(id_str)
+        id_to_string(&data.id)
     }
 
     fn get_instance_status(&self, instance_id: &str) -> Result<InstanceStatus> {
@@ -282,13 +329,81 @@ impl VpsProvider for LinodeProvider {
             return Err(anyhow!("Failed to get instance status ({}): {}", status, body));
         }
         let data: InstanceDetailResponse = resp.json()?;
+        if let Some(ref id_val) = data.id {
+            let _ = id_to_string(id_val)?;
+        }
         let ready = data.status == "running";
-        let public_ipv4 = data.ipv4.into_iter().next();
+        let public_ipv4 = first_public_ipv4(&data.ipv4).or_else(|| data.ipv4.into_iter().next());
         Ok(InstanceStatus {
             state: data.status,
             public_ipv4,
             ready,
         })
+    }
+
+    fn list_instances(&self) -> Result<Vec<ProviderInstance>> {
+        const MAX_PAGES: u32 = 20;
+        let mut instances = Vec::new();
+        let mut page = 1u32;
+
+        loop {
+            let url = self.url("linode/instances");
+            let page_str = page.to_string();
+            let resp = self
+                .http
+                .get(&url)
+                .query(&[("page", page_str.as_str()), ("page_size", "500")])
+                .send()?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().unwrap_or_default();
+                return Err(anyhow!(
+                    "Failed to list Linode instances ({}): {}",
+                    status,
+                    body
+                ));
+            }
+            let data: ListInstancesResponse = resp.json()?;
+            for item in data.data {
+                let id = id_to_string(&item.id)?;
+                let name = non_empty_trimmed(&item.label).unwrap_or_else(|| id.clone());
+                let status_str =
+                    non_empty_trimmed(&item.status).unwrap_or_else(|| "unknown".to_string());
+                instances.push(ProviderInstance {
+                    provider: ProviderKind::Linode,
+                    id,
+                    name,
+                    status: status_str,
+                    public_ip: first_public_ipv4(&item.ipv4),
+                    region: non_empty_trimmed(&item.region),
+                    plan: non_empty_trimmed(&item.linode_type),
+                    created_at: non_empty_trimmed(&item.created),
+                });
+            }
+            if page >= data.pages.max(1) || page >= MAX_PAGES {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(instances)
+    }
+
+    fn destroy_instance(&self, instance_id: &str) -> Result<()> {
+        let id = validate_instance_id(instance_id)?;
+        let url = self.url(&format!("linode/instances/{}", id));
+        let resp = self.http.delete(&url).send()?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to destroy Linode instance {} ({}): {}",
+                id,
+                status,
+                body
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -317,5 +432,143 @@ mod tests {
         let types: TypesResponse = serde_json::from_str(types_raw).unwrap();
         assert_eq!(types.data[0].price.monthly, None);
         assert_eq!(types.data[1].price.monthly, None);
+    }
+
+    #[test]
+    fn id_to_string_handles_numeric_and_string_ids() {
+        assert_eq!(id_to_string(&serde_json::json!(12345)).unwrap(), "12345");
+        assert_eq!(id_to_string(&serde_json::json!(" 987 ")).unwrap(), "987");
+        assert!(id_to_string(&serde_json::json!("")).is_err());
+        assert!(id_to_string(&serde_json::json!(null)).is_err());
+    }
+
+    #[test]
+    fn list_instances_paginates_and_selects_first_public_ipv4() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let handle = thread::spawn(move || {
+            let mut seen_paths = Vec::new();
+            for page_idx in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("").to_string();
+                seen_paths.push(path);
+                let body = if page_idx == 0 {
+                    r#"{
+                        "data": [
+                            {
+                                "id": 1001,
+                                "label": "web-1",
+                                "status": "running",
+                                "ipv4": ["192.168.133.5", "203.0.113.10"],
+                                "region": "us-east",
+                                "type": "g6-nanode-1",
+                                "created": "2025-01-01T12:00:00"
+                            }
+                        ],
+                        "page": 1,
+                        "pages": 2
+                    }"#
+                } else {
+                    r#"{
+                        "data": [
+                            {
+                                "id": "1002",
+                                "label": "",
+                                "status": "offline",
+                                "ipv4": ["10.0.0.5"],
+                                "region": "eu-central",
+                                "type": "g6-standard-1",
+                                "created": "2025-01-02T12:00:00"
+                            }
+                        ],
+                        "page": 2,
+                        "pages": 2
+                    }"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            seen_paths
+        });
+
+        let provider = LinodeProvider::with_base_url("linode-tok", format!("http://{}/v4", addr))?;
+        let instances = provider.list_instances()?;
+        let seen_paths = handle.join().unwrap();
+
+        assert_eq!(seen_paths[0], "/v4/linode/instances?page=1&page_size=500");
+        assert_eq!(seen_paths[1], "/v4/linode/instances?page=2&page_size=500");
+        assert_eq!(instances.len(), 2);
+
+        assert_eq!(instances[0].id, "1001");
+        assert_eq!(instances[0].name, "web-1");
+        assert_eq!(instances[0].status, "running");
+        assert_eq!(instances[0].public_ip.as_deref(), Some("203.0.113.10"));
+        assert_eq!(instances[0].region.as_deref(), Some("us-east"));
+        assert_eq!(instances[0].plan.as_deref(), Some("g6-nanode-1"));
+        assert_eq!(
+            instances[0].created_at.as_deref(),
+            Some("2025-01-01T12:00:00")
+        );
+
+        assert_eq!(instances[1].id, "1002");
+        assert_eq!(instances[1].name, "1002");
+        assert_eq!(instances[1].public_ip, None);
+        Ok(())
+    }
+
+    #[test]
+    fn destroy_instance_validates_id_and_sends_delete() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            req_line
+        });
+
+        let provider = LinodeProvider::with_base_url("linode-tok", format!("http://{}/v4", addr))?;
+        assert!(provider.destroy_instance("123?foo=bar").is_err());
+        provider.destroy_instance(" 12345 ")?;
+
+        let req_line = handle.join().unwrap();
+        assert!(req_line.starts_with("DELETE /v4/linode/instances/12345 "));
+        Ok(())
     }
 }

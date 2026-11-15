@@ -2,7 +2,7 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -20,7 +20,8 @@ use bab::providers::linode::LinodeProvider;
 use bab::providers::upcloud::UpCloudProvider;
 use bab::providers::vultr::VultrProvider;
 use bab::providers::{
-    provision_full_flow, CreateInstanceRequest, ProvisionConfig, ProviderKind, VpsProvider,
+    clear_destroyed_session_if_matches, destroy_provider_instance_with_key, provision_full_flow,
+    query_providers_with_keys, CreateInstanceRequest, ProvisionConfig, ProviderKind, VpsProvider,
 };
 use bab::roles::ServerRole;
 use bab::setup::{GithubDeployConfig, SetupConfig, SetupRunner, SetupStepKind};
@@ -69,6 +70,7 @@ struct MockState {
     vultr_polls: HashMap<String, usize>,
     upcloud_servers: HashMap<String, String>,
     upcloud_polls: HashMap<String, usize>,
+    upcloud_stopped: HashSet<String>,
     linode_instances: HashMap<String, String>,
     linode_polls: HashMap<String, usize>,
     force_error_path: Option<String>,
@@ -90,6 +92,7 @@ impl MockState {
             vultr_polls: HashMap::new(),
             upcloud_servers: HashMap::new(),
             upcloud_polls: HashMap::new(),
+            upcloud_stopped: HashSet::new(),
             linode_instances: HashMap::new(),
             linode_polls: HashMap::new(),
             force_error_path: None,
@@ -206,6 +209,12 @@ fn send_json(stream: &mut TcpStream, status: u16, reason: &str, body: &Value) {
         payload.len(),
         payload
     );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+fn send_no_content(stream: &mut TcpStream) {
+    let resp = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
 }
@@ -385,6 +394,33 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
             st.vultr_polls.insert(inst_id.clone(), 0);
             send_json(&mut stream, 202, "Accepted", &json!({ "instance": { "id": inst_id } }));
         }
+        ("GET", "/v2/instances") => {
+            let st = state.lock().unwrap();
+            let mut entries: Vec<(&String, &String)> = st.vultr_instances.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let instances: Vec<Value> = entries
+                .into_iter()
+                .map(|(id, hostname)| {
+                    json!({
+                        "id": id,
+                        "label": hostname,
+                        "hostname": hostname,
+                        "status": "active",
+                        "power_status": "running",
+                        "main_ip": "203.0.113.10",
+                        "region": "ewr",
+                        "plan": "vc2-1c-1gb",
+                        "date_created": "2026-01-01T00:00:00Z"
+                    })
+                })
+                .collect();
+            send_json(
+                &mut stream,
+                200,
+                "OK",
+                &json!({ "instances": instances, "meta": { "links": { "next": "" } } }),
+            );
+        }
         ("GET", p) if p.starts_with("/v2/instances/") => {
             let inst_id = &p["/v2/instances/".len()..];
             let mut st = state.lock().unwrap();
@@ -423,6 +459,16 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                         }
                     }),
                 );
+            }
+        }
+        ("DELETE", p) if p.starts_with("/v2/instances/") => {
+            let inst_id = &p["/v2/instances/".len()..];
+            let mut st = state.lock().unwrap();
+            if st.vultr_instances.remove(inst_id).is_some() {
+                st.vultr_polls.remove(inst_id);
+                send_no_content(&mut stream);
+            } else {
+                send_json(&mut stream, 404, "Not Found", &json!({"error": "not found"}));
             }
         }
 
@@ -508,7 +554,43 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
             let mut st = state.lock().unwrap();
             st.upcloud_servers.insert(uuid.clone(), hostname.to_string());
             st.upcloud_polls.insert(uuid.clone(), 0);
+            st.upcloud_stopped.remove(&uuid);
             send_json(&mut stream, 201, "Created", &json!({ "server": { "uuid": uuid } }));
+        }
+        ("GET", "/1.3/server") => {
+            let st = state.lock().unwrap();
+            let mut entries: Vec<(&String, &String)> = st.upcloud_servers.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let servers: Vec<Value> = entries
+                .into_iter()
+                .map(|(uuid, hostname)| {
+                    let srv_state = if st.upcloud_stopped.contains(uuid) {
+                        "stopped"
+                    } else {
+                        "started"
+                    };
+                    json!({
+                        "uuid": uuid,
+                        "title": hostname,
+                        "hostname": hostname,
+                        "state": srv_state,
+                        "zone": "de-fra1",
+                        "plan": "1xCPU-1GB",
+                        "created": "2026-01-01T00:00:00Z",
+                        "ip_addresses": {
+                            "ip_address": [
+                                { "access": "public", "address": "203.0.113.11", "family": "IPv4" }
+                            ]
+                        }
+                    })
+                })
+                .collect();
+            send_json(
+                &mut stream,
+                200,
+                "OK",
+                &json!({ "servers": { "server": servers } }),
+            );
         }
         ("GET", p) if p.starts_with("/1.3/server/") => {
             let uuid = &p["/1.3/server/".len()..];
@@ -517,6 +599,25 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                 send_json(&mut stream, 404, "Not Found", &json!({"error": "not found"}));
                 return;
             };
+            if st.upcloud_stopped.contains(uuid) {
+                send_json(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &json!({
+                        "server": {
+                            "uuid": uuid,
+                            "state": "stopped",
+                            "ip_addresses": {
+                                "ip_address": [
+                                    { "access": "public", "address": "203.0.113.11", "family": "IPv4" }
+                                ]
+                            }
+                        }
+                    }),
+                );
+                return;
+            }
             let count = st.upcloud_polls.entry(uuid.to_string()).or_insert(0);
             *count += 1;
             if *count == 1 {
@@ -551,6 +652,45 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                         }
                     }),
                 );
+            }
+        }
+        ("POST", p) if p.starts_with("/1.3/server/") && p.ends_with("/stop") => {
+            let uuid = &p["/1.3/server/".len()..p.len() - "/stop".len()];
+            let mut st = state.lock().unwrap();
+            if st.upcloud_servers.contains_key(uuid) {
+                st.upcloud_stopped.insert(uuid.to_string());
+                send_json(
+                    &mut stream,
+                    200,
+                    "OK",
+                    &json!({ "server": { "uuid": uuid, "state": "stopped" } }),
+                );
+            } else {
+                send_json(&mut stream, 404, "Not Found", &json!({"error": "not found"}));
+            }
+        }
+        ("DELETE", p) if p.starts_with("/1.3/server/") => {
+            let uuid = &p["/1.3/server/".len()..];
+            let mut st = state.lock().unwrap();
+            if !st.upcloud_servers.contains_key(uuid) {
+                send_json(&mut stream, 404, "Not Found", &json!({"error": "not found"}));
+            } else if !st.upcloud_stopped.contains(uuid) {
+                send_json(
+                    &mut stream,
+                    409,
+                    "Conflict",
+                    &json!({
+                        "error": {
+                            "error_code": "SERVER_STATE_ILLEGAL",
+                            "error_message": "Server must be stopped before deletion"
+                        }
+                    }),
+                );
+            } else {
+                st.upcloud_servers.remove(uuid);
+                st.upcloud_polls.remove(uuid);
+                st.upcloud_stopped.remove(uuid);
+                send_no_content(&mut stream);
             }
         }
 
@@ -644,6 +784,30 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
             st.linode_polls.insert(inst_id.to_string(), 0);
             send_json(&mut stream, 200, "OK", &json!({ "id": inst_id, "label": hostname }));
         }
+        ("GET", "/v4/linode/instances") => {
+            let st = state.lock().unwrap();
+            let mut entries: Vec<(&String, &String)> = st.linode_instances.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            let data: Vec<Value> = entries
+                .into_iter()
+                .map(|(id, hostname)| {
+                    let id_json = id
+                        .parse::<u64>()
+                        .map(|n| json!(n))
+                        .unwrap_or_else(|_| json!(id));
+                    json!({
+                        "id": id_json,
+                        "label": hostname,
+                        "status": "running",
+                        "ipv4": ["203.0.113.12"],
+                        "region": "us-east",
+                        "type": "g6-nanode-1",
+                        "created": "2026-01-01T00:00:00Z"
+                    })
+                })
+                .collect();
+            send_json(&mut stream, 200, "OK", &json!({ "data": data, "pages": 1 }));
+        }
         ("GET", p) if p.starts_with("/v4/linode/instances/") => {
             let inst_id = &p["/v4/linode/instances/".len()..];
             let mut st = state.lock().unwrap();
@@ -668,6 +832,16 @@ fn handle_connection(mut stream: TcpStream, state: &Arc<Mutex<MockState>>) {
                     "OK",
                     &json!({ "id": 12345, "status": "running", "ipv4": ["203.0.113.12"] }),
                 );
+            }
+        }
+        ("DELETE", p) if p.starts_with("/v4/linode/instances/") => {
+            let inst_id = &p["/v4/linode/instances/".len()..];
+            let mut st = state.lock().unwrap();
+            if st.linode_instances.remove(inst_id).is_some() {
+                st.linode_polls.remove(inst_id);
+                send_json(&mut stream, 200, "OK", &json!({}));
+            } else {
+                send_json(&mut stream, 404, "Not Found", &json!({"errors": [{"reason": "not found"}]}));
             }
         }
 
@@ -1417,6 +1591,209 @@ fn provision_records_dual_ips_and_setup_runner_deploy_github_executes_via_mock_s
     assert!(script.contains("chmod 0700 \"${GIT_ASKPASS_SCRIPT}\""));
     assert!(script.contains("trap 'rm -f \"${GIT_ASKPASS_SCRIPT}\"' EXIT"));
     assert!(script.contains("docker compose up -d --build"));
+
+    Ok(())
+}
+
+#[test]
+fn query_all_providers_and_destroy_instances_lifecycle() -> Result<()> {
+    let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let _guard = EnvGuard::new(&[
+        "VULTR_API_BASE_URL",
+        "UPCLOUD_API_BASE_URL",
+        "LINODE_API_BASE_URL",
+        "VULTR_API_BASE",
+        "UPCLOUD_API_BASE",
+        "LINODE_API_BASE",
+    ]);
+
+    let server = MockApiServer::start();
+    env::set_var("VULTR_API_BASE_URL", server.base_url("v2"));
+    env::set_var("UPCLOUD_API_BASE_URL", server.base_url("1.3"));
+    env::set_var("LINODE_API_BASE_URL", server.base_url("v4"));
+
+    let ts = TailscaleClient::with_config("ts-valid-key", server.base_url("api/v2"), "-")?;
+    let vultr = VultrProvider::with_base_url("vultr-valid-key", server.base_url("v2"))?;
+    let upcloud = UpCloudProvider::with_base_url("upcloud-valid-tok", server.base_url("1.3"))?;
+    let linode = LinodeProvider::with_base_url("linode-valid-tok", server.base_url("v4"))?;
+
+    let dir = tempdir()?;
+    let session = SessionState::new(dir.path().join("state.conf"));
+
+    // Provision one instance on each provider; Vultr is recorded last as the active session.
+    let up_cfg = ProvisionConfig {
+        provider: ProviderKind::UpCloud,
+        region: "de-fra1".to_string(),
+        plan: "1xCPU-1GB".to_string(),
+        image_id: "01000000-0000-4000-8000-000030240200".to_string(),
+        hostname: "upcloud-box".to_string(),
+        username: "deploy".to_string(),
+        role: "vanilla".to_string(),
+        tags: vec![],
+        provider_timeout: Duration::from_secs(5),
+        tailscale_timeout: Duration::from_secs(5),
+        poll_interval: Duration::from_millis(10),
+        tailscale_mode: true,
+        ssh_pubkey: None,
+        ssh_key_path: None,
+    };
+    let up_res = provision_full_flow(&upcloud, Some(&ts), &up_cfg, None)?;
+    assert_eq!(up_res.instance_id, "upcloud-uuid-1");
+
+    let lin_cfg = ProvisionConfig {
+        provider: ProviderKind::Linode,
+        region: "us-east".to_string(),
+        plan: "g6-nanode-1".to_string(),
+        image_id: "linode/ubuntu24.04".to_string(),
+        hostname: "linode-box".to_string(),
+        username: "deploy".to_string(),
+        role: "vanilla".to_string(),
+        tags: vec![],
+        provider_timeout: Duration::from_secs(5),
+        tailscale_timeout: Duration::from_secs(5),
+        poll_interval: Duration::from_millis(10),
+        tailscale_mode: true,
+        ssh_pubkey: None,
+        ssh_key_path: None,
+    };
+    let lin_res = provision_full_flow(&linode, Some(&ts), &lin_cfg, None)?;
+    assert_eq!(lin_res.instance_id, "12345");
+
+    let vultr_cfg = ProvisionConfig {
+        provider: ProviderKind::Vultr,
+        region: "ewr".to_string(),
+        plan: "vc2-1c-1gb".to_string(),
+        image_id: "2284".to_string(),
+        hostname: "vultr-box".to_string(),
+        username: "deploy".to_string(),
+        role: "caddy".to_string(),
+        tags: vec![],
+        provider_timeout: Duration::from_secs(5),
+        tailscale_timeout: Duration::from_secs(5),
+        poll_interval: Duration::from_millis(10),
+        tailscale_mode: true,
+        ssh_pubkey: None,
+        ssh_key_path: None,
+    };
+    let vultr_res = provision_full_flow(&vultr, Some(&ts), &vultr_cfg, Some(&session))?;
+    assert_eq!(vultr_res.instance_id, "vultr-inst-1");
+
+    // Cross-provider query lists all 3 instances and reports per-provider status.
+    let all = query_providers_with_keys(
+        Some("vultr-valid-key"),
+        Some("upcloud-valid-tok"),
+        Some("linode-valid-tok"),
+        None,
+    );
+    assert_eq!(all.instances.len(), 3);
+    assert_eq!(all.provider_statuses.len(), 3);
+    assert!(all
+        .provider_statuses
+        .iter()
+        .all(|s| s.configured && s.instance_count == 1 && s.error.is_none()));
+    assert!(all
+        .instances
+        .iter()
+        .any(|i| i.provider == ProviderKind::Vultr && i.id == "vultr-inst-1" && i.name == "vultr-box"));
+    assert!(all
+        .instances
+        .iter()
+        .any(|i| i.provider == ProviderKind::UpCloud && i.id == "upcloud-uuid-1" && i.name == "upcloud-box"));
+    assert!(all
+        .instances
+        .iter()
+        .any(|i| i.provider == ProviderKind::Linode && i.id == "12345" && i.name == "linode-box"));
+
+    // Provider filter returns only the selected provider.
+    let only_linode = query_providers_with_keys(
+        Some("vultr-valid-key"),
+        Some("upcloud-valid-tok"),
+        Some("linode-valid-tok"),
+        Some(ProviderKind::Linode),
+    );
+    assert_eq!(only_linode.provider_statuses.len(), 1);
+    assert_eq!(only_linode.instances.len(), 1);
+    assert_eq!(only_linode.instances[0].id, "12345");
+
+    // Partial error isolation: failing UpCloud does not block Vultr or Linode results.
+    {
+        server.state.lock().unwrap().force_error_path = Some("/1.3/server".to_string());
+    }
+    let partial = query_providers_with_keys(
+        Some("vultr-valid-key"),
+        Some("upcloud-valid-tok"),
+        Some("linode-valid-tok"),
+        None,
+    );
+    {
+        server.state.lock().unwrap().force_error_path = None;
+    }
+    assert_eq!(partial.instances.len(), 2);
+    let up_status = partial
+        .provider_statuses
+        .iter()
+        .find(|s| s.provider == ProviderKind::UpCloud)
+        .unwrap();
+    assert!(up_status.configured);
+    assert_eq!(up_status.instance_count, 0);
+    assert!(up_status.error.is_some());
+
+    // Destroy Vultr instance and verify matching active session clearing.
+    destroy_provider_instance_with_key(
+        ProviderKind::Vultr,
+        "vultr-valid-key",
+        "vultr-inst-1",
+        None,
+    )?;
+    assert!(!clear_destroyed_session_if_matches(&session, "non-matching-id")?);
+    assert_eq!(session.vps_instance_id()?.as_deref(), Some("vultr-inst-1"));
+    assert!(clear_destroyed_session_if_matches(&session, "vultr-inst-1")?);
+    let cleared = session.load_session()?;
+    assert_eq!(cleared.vps_instance_id, None);
+    assert_eq!(cleared.vps_provider, None);
+    assert_eq!(cleared.vps_ip, None);
+    assert_eq!(cleared.public_ip, None);
+    assert_eq!(cleared.tailscale_ip, None);
+    assert_eq!(cleared.username.as_deref(), Some("deploy"));
+    assert_eq!(cleared.server_role.as_deref(), Some("caddy"));
+
+    // Destroy UpCloud (running -> 409 -> POST /stop -> 204 DELETE) and Linode instances.
+    destroy_provider_instance_with_key(
+        ProviderKind::UpCloud,
+        "upcloud-valid-tok",
+        "upcloud-uuid-1",
+        None,
+    )?;
+    destroy_provider_instance_with_key(ProviderKind::Linode, "linode-valid-tok", "12345", None)?;
+
+    let reqs = server.requests();
+    assert!(reqs
+        .iter()
+        .any(|r| r.method == "DELETE" && r.path == "/v2/instances/vultr-inst-1"));
+    assert!(reqs
+        .iter()
+        .any(|r| r.method == "POST" && r.path == "/1.3/server/upcloud-uuid-1/stop"));
+    assert_eq!(
+        reqs.iter()
+            .filter(|r| r.method == "DELETE" && r.path == "/1.3/server/upcloud-uuid-1")
+            .count(),
+        2
+    );
+    assert!(reqs
+        .iter()
+        .any(|r| r.method == "DELETE" && r.path == "/v4/linode/instances/12345"));
+
+    let after_destroy = query_providers_with_keys(
+        Some("vultr-valid-key"),
+        Some("upcloud-valid-tok"),
+        Some("linode-valid-tok"),
+        None,
+    );
+    assert!(after_destroy.instances.is_empty());
+    assert!(after_destroy
+        .provider_statuses
+        .iter()
+        .all(|s| s.instance_count == 0 && s.error.is_none()));
 
     Ok(())
 }

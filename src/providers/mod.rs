@@ -7,13 +7,17 @@ use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::config::{SessionData, SessionState};
+use crate::config::{SessionData, SessionState, Settings};
 use crate::tailscale::{generate_cloud_init, generate_ssh_cloud_init, TailscaleClient};
 
 // Public sub-modules for concrete provider implementations.
 pub mod vultr;
 pub mod upcloud;
 pub mod linode;
+
+use self::linode::LinodeProvider;
+use self::upcloud::UpCloudProvider;
+use self::vultr::VultrProvider;
 
 /// Enumerates supported providers and special modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,6 +249,71 @@ pub struct InstanceStatus {
     pub ready: bool,
 }
 
+/// Summary of a cloud VPS instance returned by provider instance listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderInstance {
+    pub provider: ProviderKind,
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub public_ip: Option<String>,
+    pub region: Option<String>,
+    pub plan: Option<String>,
+    pub created_at: Option<String>,
+}
+
+/// Per-provider status recorded while querying across cloud providers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderQueryStatus {
+    pub provider: ProviderKind,
+    pub configured: bool,
+    pub instance_count: usize,
+    pub error: Option<String>,
+}
+
+/// Combined result of querying one or more cloud providers for instances.
+#[derive(Debug, Clone, Default)]
+pub struct MultiProviderQueryResult {
+    pub instances: Vec<ProviderInstance>,
+    pub provider_statuses: Vec<ProviderQueryStatus>,
+}
+
+/// Validate and trim a cloud instance ID to prevent URL path or query injection.
+pub fn validate_instance_id(id: &str) -> Result<&str> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("Instance ID must not be empty"));
+    }
+    if trimmed.contains("..") {
+        return Err(anyhow!("Instance ID must not contain '..'"));
+    }
+    if trimmed.chars().any(|c| {
+        c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '?' | '#' | '&')
+    }) {
+        return Err(anyhow!(
+            "Instance ID '{}' contains invalid characters",
+            trimmed
+        ));
+    }
+    Ok(trimmed)
+}
+
+pub(crate) fn non_empty_trimmed(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .as_deref()
+        .and_then(non_empty_trimmed)
+}
+
 /// Request payload for creating a new instance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateInstanceRequest {
@@ -297,6 +366,8 @@ pub trait VpsProvider {
     fn list_images(&self) -> Result<Vec<ProviderImage>>;
     fn create_instance(&self, req: &CreateInstanceRequest) -> Result<String>;
     fn get_instance_status(&self, instance_id: &str) -> Result<InstanceStatus>;
+    fn list_instances(&self) -> Result<Vec<ProviderInstance>>;
+    fn destroy_instance(&self, instance_id: &str) -> Result<()>;
     fn wait_active(
         &self,
         instance_id: &str,
@@ -425,6 +496,228 @@ pub fn provision_full_flow(
     })
 }
 
+const CLOUD_PROVIDERS: [ProviderKind; 3] = [
+    ProviderKind::Vultr,
+    ProviderKind::UpCloud,
+    ProviderKind::Linode,
+];
+
+/// Build a concrete cloud `VpsProvider` from an API key and optional base URL override.
+/// When `base_url` is `None`, checks `VULTR_API_BASE_URL` / `UPCLOUD_API_BASE_URL` /
+/// `LINODE_API_BASE_URL` before falling back to each provider's default constructor.
+pub fn build_cloud_provider_with_key(
+    kind: ProviderKind,
+    api_key: &str,
+    base_url: Option<&str>,
+) -> Result<Box<dyn VpsProvider>> {
+    let explicit_base = base_url.and_then(non_empty_trimmed);
+    match kind {
+        ProviderKind::Vultr => {
+            let base = explicit_base.or_else(|| non_empty_env("VULTR_API_BASE_URL"));
+            let provider = match base {
+                Some(url) => VultrProvider::with_base_url(api_key, url)?,
+                None => VultrProvider::new(api_key)?,
+            };
+            Ok(Box::new(provider))
+        }
+        ProviderKind::UpCloud => {
+            let base = explicit_base.or_else(|| non_empty_env("UPCLOUD_API_BASE_URL"));
+            let provider = match base {
+                Some(url) => UpCloudProvider::with_base_url(api_key, url)?,
+                None => UpCloudProvider::new(api_key)?,
+            };
+            Ok(Box::new(provider))
+        }
+        ProviderKind::Linode => {
+            let base = explicit_base.or_else(|| non_empty_env("LINODE_API_BASE_URL"));
+            let provider = match base {
+                Some(url) => LinodeProvider::with_base_url(api_key, url)?,
+                None => LinodeProvider::new(api_key)?,
+            };
+            Ok(Box::new(provider))
+        }
+        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => Err(anyhow!(
+            "{} does not use a cloud provider API client",
+            kind.label()
+        )),
+    }
+}
+
+fn query_providers_with_resolver<F>(
+    filter: Option<ProviderKind>,
+    mut resolve_key: F,
+) -> MultiProviderQueryResult
+where
+    F: FnMut(ProviderKind) -> Result<Option<String>>,
+{
+    let mut result = MultiProviderQueryResult::default();
+    for kind in CLOUD_PROVIDERS {
+        if let Some(target) = filter {
+            if kind != target {
+                continue;
+            }
+        }
+
+        let key = match resolve_key(kind) {
+            Ok(opt) => match opt.as_deref().and_then(non_empty_trimmed) {
+                Some(k) => k,
+                None => {
+                    result.provider_statuses.push(ProviderQueryStatus {
+                        provider: kind,
+                        configured: false,
+                        instance_count: 0,
+                        error: None,
+                    });
+                    continue;
+                }
+            },
+            Err(err) => {
+                result.provider_statuses.push(ProviderQueryStatus {
+                    provider: kind,
+                    configured: true,
+                    instance_count: 0,
+                    error: Some(err.to_string()),
+                });
+                continue;
+            }
+        };
+
+        let listed = build_cloud_provider_with_key(kind, &key, None)
+            .and_then(|provider| provider.list_instances());
+
+        match listed {
+            Ok(mut items) => {
+                let count = items.len();
+                result.instances.append(&mut items);
+                result.provider_statuses.push(ProviderQueryStatus {
+                    provider: kind,
+                    configured: true,
+                    instance_count: count,
+                    error: None,
+                });
+            }
+            Err(err) => {
+                result.provider_statuses.push(ProviderQueryStatus {
+                    provider: kind,
+                    configured: true,
+                    instance_count: 0,
+                    error: Some(err.to_string()),
+                });
+            }
+        }
+    }
+
+    result.instances.sort_by(|a, b| {
+        a.provider
+            .label()
+            .cmp(b.provider.label())
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    result
+}
+
+/// Query running/provisioned instances across Vultr, UpCloud, and Linode using explicit API keys.
+/// Provider errors are isolated into `provider_statuses` so remaining providers still return results.
+pub fn query_providers_with_keys(
+    vultr_key: Option<&str>,
+    upcloud_key: Option<&str>,
+    linode_key: Option<&str>,
+    filter: Option<ProviderKind>,
+) -> MultiProviderQueryResult {
+    query_providers_with_resolver(filter, |kind| {
+        let key = match kind {
+            ProviderKind::Vultr => vultr_key,
+            ProviderKind::UpCloud => upcloud_key,
+            ProviderKind::Linode => linode_key,
+            ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => None,
+        };
+        Ok(key.map(String::from))
+    })
+}
+
+/// Query running/provisioned instances across configured cloud providers in `Settings`.
+pub fn query_all_providers(
+    settings: &Settings,
+    filter: Option<ProviderKind>,
+) -> MultiProviderQueryResult {
+    query_providers_with_resolver(filter, |kind| match kind {
+        ProviderKind::Vultr => settings.vultr_api_key(),
+        ProviderKind::UpCloud => settings.upcloud_api_token(),
+        ProviderKind::Linode => settings.linode_api_token(),
+        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => Ok(None),
+    })
+}
+
+/// Destroy an instance on the given cloud provider using an explicit API key and optional base URL.
+pub fn destroy_provider_instance_with_key(
+    kind: ProviderKind,
+    api_key: &str,
+    instance_id: &str,
+    base_url: Option<&str>,
+) -> Result<()> {
+    let key = non_empty_trimmed(api_key)
+        .ok_or_else(|| anyhow!("API key for {} is not configured", kind.label()))?;
+    let validated_id = validate_instance_id(instance_id)?;
+    let provider = build_cloud_provider_with_key(kind, &key, base_url)?;
+    provider.destroy_instance(validated_id)
+}
+
+/// Destroy an instance on the given cloud provider using credentials from `Settings`.
+pub fn destroy_provider_instance(
+    settings: &Settings,
+    kind: ProviderKind,
+    instance_id: &str,
+) -> Result<()> {
+    let validated_id = validate_instance_id(instance_id)?;
+    let key = match kind {
+        ProviderKind::Vultr => settings
+            .vultr_api_key()?
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            .ok_or_else(|| anyhow!("VULTR_API_KEY is not configured"))?,
+        ProviderKind::UpCloud => settings
+            .upcloud_api_token()?
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            .ok_or_else(|| anyhow!("UPCLOUD_API_TOKEN is not configured"))?,
+        ProviderKind::Linode => settings
+            .linode_api_token()?
+            .as_deref()
+            .and_then(non_empty_trimmed)
+            .ok_or_else(|| anyhow!("LINODE_API_TOKEN is not configured"))?,
+        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => {
+            return Err(anyhow!(
+                "{} does not support destroying cloud instances",
+                kind.label()
+            ))
+        }
+    };
+    destroy_provider_instance_with_key(kind, &key, validated_id, None)
+}
+
+/// Clear active VPS instance session fields if `SessionData.vps_instance_id` matches `instance_id`.
+/// Returns `Ok(true)` when matching session state was cleared and saved, or `Ok(false)` otherwise.
+pub fn clear_destroyed_session_if_matches(
+    session: &SessionState,
+    instance_id: &str,
+) -> Result<bool> {
+    let Some(target) = non_empty_trimmed(instance_id) else {
+        return Ok(false);
+    };
+    let mut data = session.load_session()?;
+    if data.vps_instance_id.as_deref().map(str::trim) != Some(target.as_str()) {
+        return Ok(false);
+    }
+    data.vps_provider = None;
+    data.vps_instance_id = None;
+    data.vps_ip = None;
+    data.public_ip = None;
+    data.tailscale_ip = None;
+    session.save_session(&data)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +757,8 @@ mod tests {
     struct MockProvider {
         public_ipv4: Option<String>,
         captured_user_data: std::sync::Mutex<Option<String>>,
+        instances: std::sync::Mutex<Vec<ProviderInstance>>,
+        destroyed_ids: std::sync::Mutex<Vec<String>>,
     }
 
     impl MockProvider {
@@ -471,6 +766,17 @@ mod tests {
             Self {
                 public_ipv4: public_ipv4.map(String::from),
                 captured_user_data: std::sync::Mutex::new(None),
+                instances: std::sync::Mutex::new(vec![ProviderInstance {
+                    provider: ProviderKind::Vultr,
+                    id: "inst-123".to_string(),
+                    name: "bab-vps".to_string(),
+                    status: "active".to_string(),
+                    public_ip: public_ipv4.map(String::from),
+                    region: Some("ewr".to_string()),
+                    plan: Some("vc2-1c-1gb".to_string()),
+                    created_at: None,
+                }]),
+                destroyed_ids: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -501,6 +807,15 @@ mod tests {
                 public_ipv4: self.public_ipv4.clone(),
                 ready: true,
             })
+        }
+        fn list_instances(&self) -> Result<Vec<ProviderInstance>> {
+            Ok(self.instances.lock().unwrap().clone())
+        }
+        fn destroy_instance(&self, instance_id: &str) -> Result<()> {
+            let id = validate_instance_id(instance_id)?.to_string();
+            self.instances.lock().unwrap().retain(|i| i.id != id);
+            self.destroyed_ids.lock().unwrap().push(id);
+            Ok(())
         }
     }
 
@@ -688,6 +1003,314 @@ mod tests {
         assert_eq!(loaded.vps_region.as_deref(), Some("ewr"));
         assert_eq!(loaded.vps_plan.as_deref(), Some("vc2-1c-1gb"));
         assert_eq!(loaded.vps_image.as_deref(), Some("2284"));
+        Ok(())
+    }
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(keys: &[&str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+                .collect();
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validate_instance_id_accepts_safe_ids_and_rejects_injection() {
+        assert_eq!(validate_instance_id("abc-123_XYZ.1").unwrap(), "abc-123_XYZ.1");
+        assert_eq!(validate_instance_id("  12345  ").unwrap(), "12345");
+        assert_eq!(
+            validate_instance_id("00798b85-efdc-41ca-8021-f6ef457b8531").unwrap(),
+            "00798b85-efdc-41ca-8021-f6ef457b8531"
+        );
+
+        for bad in [
+            "",
+            "   ",
+            "id with space",
+            "id\twith\ttab",
+            "id\nnewline",
+            "id\x00null",
+            "foo/bar",
+            "foo\\bar",
+            "foo?bar=1",
+            "foo#frag",
+            "foo&bar=2",
+            "../other",
+            "a..b",
+        ] {
+            assert!(
+                validate_instance_id(bad).is_err(),
+                "expected {:?} to be rejected",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn mock_provider_lists_and_destroys_instances() -> Result<()> {
+        let provider = MockProvider::new(Some("203.0.113.10"));
+        assert_eq!(provider.list_instances()?.len(), 1);
+        assert!(provider.destroy_instance("../bad").is_err());
+        provider.destroy_instance("  inst-123 ")?;
+        assert!(provider.list_instances()?.is_empty());
+        assert_eq!(
+            *provider.destroyed_ids.lock().unwrap(),
+            vec!["inst-123".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn query_providers_with_keys_isolates_failures_and_sorts_deterministically() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard::new(&[
+            "VULTR_API_BASE_URL",
+            "UPCLOUD_API_BASE_URL",
+            "LINODE_API_BASE_URL",
+        ]);
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            for stream_res in listener.incoming() {
+                if stop_bg.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream_res else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("");
+                let (status, body) = if path.starts_with("/vultr/instances") {
+                    (
+                        "200 OK",
+                        r#"{"instances":[
+                            {"id":"v-2","label":"zeta","status":"active","power_status":"running","main_ip":"203.0.113.2","region":"ewr","plan":"vc2-1c-1gb","date_created":"2025-01-02T00:00:00Z"},
+                            {"id":"v-1","label":"alpha","status":"active","power_status":"running","main_ip":"203.0.113.1","region":"ord","plan":"vc2-1c-2gb","date_created":"2025-01-01T00:00:00Z"}
+                        ],"meta":{"links":{"next":""}}}"#,
+                    )
+                } else if path.starts_with("/linode/linode/instances") {
+                    ("500 Internal Server Error", r#"{"errors":[{"reason":"boom"}]}"#)
+                } else {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        std::env::set_var("VULTR_API_BASE_URL", format!("http://{}/vultr", addr));
+        std::env::remove_var("UPCLOUD_API_BASE_URL");
+        std::env::set_var("LINODE_API_BASE_URL", format!("http://{}/linode", addr));
+
+        let res = query_providers_with_keys(Some("vultr-key"), None, Some("linode-key"), None);
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
+        handle.join().unwrap();
+
+        assert_eq!(res.instances.len(), 2);
+        assert_eq!(res.instances[0].id, "v-1");
+        assert_eq!(res.instances[0].name, "alpha");
+        assert_eq!(res.instances[1].id, "v-2");
+        assert_eq!(res.instances[1].name, "zeta");
+
+        assert_eq!(res.provider_statuses.len(), 3);
+        let vultr_st = res
+            .provider_statuses
+            .iter()
+            .find(|s| s.provider == ProviderKind::Vultr)
+            .unwrap();
+        assert_eq!(
+            *vultr_st,
+            ProviderQueryStatus {
+                provider: ProviderKind::Vultr,
+                configured: true,
+                instance_count: 2,
+                error: None,
+            }
+        );
+        let upcloud_st = res
+            .provider_statuses
+            .iter()
+            .find(|s| s.provider == ProviderKind::UpCloud)
+            .unwrap();
+        assert_eq!(
+            *upcloud_st,
+            ProviderQueryStatus {
+                provider: ProviderKind::UpCloud,
+                configured: false,
+                instance_count: 0,
+                error: None,
+            }
+        );
+        let linode_st = res
+            .provider_statuses
+            .iter()
+            .find(|s| s.provider == ProviderKind::Linode)
+            .unwrap();
+        assert!(linode_st.configured);
+        assert_eq!(linode_st.instance_count, 0);
+        assert!(linode_st.error.as_deref().unwrap().contains("500"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn clear_destroyed_session_if_matches_clears_only_matching_instance() -> Result<()> {
+        let tmp = tempfile::NamedTempFile::new()?;
+        let session = SessionState::new(tmp.path());
+        let seed = SessionData {
+            vps_provider: Some("vultr".to_string()),
+            vps_instance_id: Some("inst-42".to_string()),
+            vps_ip: Some("100.64.0.42".to_string()),
+            public_ip: Some("203.0.113.42".to_string()),
+            tailscale_ip: Some("100.64.0.42".to_string()),
+            username: Some("deploy".to_string()),
+            server_role: Some("caddy".to_string()),
+            ..SessionData::default()
+        };
+        session.save_session(&seed)?;
+
+        assert!(!clear_destroyed_session_if_matches(&session, "")?);
+        assert!(!clear_destroyed_session_if_matches(&session, "inst-other")?);
+        let unchanged = session.load_session()?;
+        assert_eq!(unchanged.vps_instance_id.as_deref(), Some("inst-42"));
+
+        assert!(clear_destroyed_session_if_matches(&session, " inst-42 ")?);
+        let cleared = session.load_session()?;
+        assert_eq!(cleared.vps_provider, None);
+        assert_eq!(cleared.vps_instance_id, None);
+        assert_eq!(cleared.vps_ip, None);
+        assert_eq!(cleared.public_ip, None);
+        assert_eq!(cleared.tailscale_ip, None);
+        // Unrelated fields remain intact.
+        assert_eq!(cleared.username.as_deref(), Some("deploy"));
+        assert_eq!(cleared.server_role.as_deref(), Some("caddy"));
+        Ok(())
+    }
+
+    #[test]
+    fn query_all_providers_and_destroy_via_settings() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard::new(&[
+            "VULTR_API_KEY",
+            "UPCLOUD_API_TOKEN",
+            "LINODE_API_TOKEN",
+            "VULTR_API_BASE_URL",
+        ]);
+        std::env::remove_var("VULTR_API_KEY");
+        std::env::remove_var("UPCLOUD_API_TOKEN");
+        std::env::remove_var("LINODE_API_TOKEN");
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let handle = thread::spawn(move || {
+            let mut seen = Vec::new();
+            for step in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                seen.push(req_line.trim().to_string());
+                let (status, body) = if step == 0 {
+                    (
+                        "200 OK",
+                        r#"{"instances":[{"id":"v-99","label":"prod-box","status":"active","power_status":"running","main_ip":"203.0.113.99","region":"ewr","plan":"vc2-1c-1gb"}],"meta":{"links":{"next":""}}}"#,
+                    )
+                } else {
+                    ("204 No Content", "")
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            seen
+        });
+
+        let dir = tempfile::tempdir()?;
+        let settings = Settings::new(dir.path().join("credentials.enc"));
+        settings.set_vultr_api_key("vultr-secret")?;
+        std::env::set_var("VULTR_API_BASE_URL", format!("http://{}/v2", addr));
+
+        let queried = query_all_providers(&settings, Some(ProviderKind::Vultr));
+        assert_eq!(queried.provider_statuses.len(), 1);
+        assert!(queried.provider_statuses[0].configured);
+        assert_eq!(queried.provider_statuses[0].instance_count, 1);
+        assert_eq!(queried.instances.len(), 1);
+        assert_eq!(queried.instances[0].id, "v-99");
+
+        destroy_provider_instance(&settings, ProviderKind::Vultr, "v-99")?;
+
+        let seen = handle.join().unwrap();
+        assert!(seen[0].starts_with("GET /v2/instances?per_page=500 "));
+        assert!(seen[1].starts_with("DELETE /v2/instances/v-99 "));
+
+        assert!(build_cloud_provider_with_key(ProviderKind::ExistingTailscale, "k", None).is_err());
+        assert!(destroy_provider_instance_with_key(ProviderKind::Vultr, "   ", "v-99", None).is_err());
+        assert!(destroy_provider_instance(&settings, ProviderKind::Linode, "123").is_err());
         Ok(())
     }
 }

@@ -325,10 +325,7 @@ mod tests {
     use std::fs::{self, File};
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
@@ -524,7 +521,7 @@ mod tests {
 
     #[test]
     fn env_var_overrides_binaries() {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = crate::env_lock();
         let _guard = EnvGuard::new(&[
             "BAB_SSH_BIN",
             "BAB_SCP_BIN",
@@ -558,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_default_ssh_key_path_precedence() -> Result<()> {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = crate::env_lock();
         let _guard = EnvGuard::new(&["BAB_SSH_DIR", "VPSKIT_SSH_DIR", "SSH_DIR", "HOME"]);
         for k in ["BAB_SSH_DIR", "VPSKIT_SSH_DIR", "SSH_DIR"] {
             env::remove_var(k);
@@ -626,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_ensure_ssh_keypair_generates_and_is_idempotent() -> Result<()> {
-        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _lock = crate::env_lock();
         let _guard = EnvGuard::new(&["BAB_SSH_KEYGEN_BIN"]);
         env::remove_var("BAB_SSH_KEYGEN_BIN");
 

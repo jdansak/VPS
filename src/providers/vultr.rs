@@ -10,8 +10,8 @@ use std::env;
 use std::str::FromStr;
 
 use super::{
-    ProviderKind, ProviderRegion, ProviderPlan, ProviderImage, CreateInstanceRequest, InstanceStatus,
-    VpsProvider,
+    non_empty_trimmed, validate_instance_id, CreateInstanceRequest, InstanceStatus, ProviderImage,
+    ProviderInstance, ProviderKind, ProviderPlan, ProviderRegion, VpsProvider,
 };
 
 /// Vultr API client.
@@ -200,6 +200,47 @@ struct InstanceDetail {
     main_ip: String,
 }
 
+#[derive(Deserialize)]
+struct ListInstancesResponse {
+    #[serde(default)]
+    instances: Vec<VultrInstanceItem>,
+    #[serde(default)]
+    meta: VultrMeta,
+}
+
+#[derive(Deserialize, Default)]
+struct VultrMeta {
+    #[serde(default)]
+    links: VultrLinks,
+}
+
+#[derive(Deserialize, Default)]
+struct VultrLinks {
+    #[serde(default)]
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VultrInstanceItem {
+    id: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    hostname: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    power_status: String,
+    #[serde(default)]
+    main_ip: String,
+    #[serde(default)]
+    region: String,
+    #[serde(default)]
+    plan: String,
+    #[serde(default)]
+    date_created: String,
+}
+
 impl VpsProvider for VultrProvider {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Vultr
@@ -363,6 +404,87 @@ impl VpsProvider for VultrProvider {
             ready,
         })
     }
+
+    fn list_instances(&self) -> Result<Vec<ProviderInstance>> {
+        const MAX_PAGES: usize = 20;
+        let mut instances = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+
+        for _ in 0..MAX_PAGES {
+            let url = self.url("instances");
+            let mut req = self.http.get(&url).query(&[("per_page", "500")]);
+            if let Some(ref c) = cursor {
+                req = req.query(&[("cursor", c.as_str())]);
+            }
+            let resp = req.send()?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().unwrap_or_default();
+                return Err(anyhow!(
+                    "Failed to list Vultr instances ({}): {}",
+                    status,
+                    body
+                ));
+            }
+            let data: ListInstancesResponse = resp.json()?;
+            for item in data.instances {
+                let name = non_empty_trimmed(&item.label)
+                    .or_else(|| non_empty_trimmed(&item.hostname))
+                    .unwrap_or_else(|| item.id.clone());
+                let status_str = match (
+                    non_empty_trimmed(&item.status),
+                    non_empty_trimmed(&item.power_status),
+                ) {
+                    (Some(s), Some(p)) if s != p => format!("{} ({})", s, p),
+                    (Some(s), _) => s,
+                    (None, Some(p)) => p,
+                    (None, None) => "unknown".to_string(),
+                };
+                let public_ip = non_empty_trimmed(&item.main_ip).filter(|ip| ip != "0.0.0.0");
+                instances.push(ProviderInstance {
+                    provider: ProviderKind::Vultr,
+                    id: item.id,
+                    name,
+                    status: status_str,
+                    public_ip,
+                    region: non_empty_trimmed(&item.region),
+                    plan: non_empty_trimmed(&item.plan),
+                    created_at: non_empty_trimmed(&item.date_created),
+                });
+            }
+
+            let next = data
+                .meta
+                .links
+                .next
+                .as_deref()
+                .and_then(non_empty_trimmed);
+            match next {
+                Some(c) if seen_cursors.insert(c.clone()) => cursor = Some(c),
+                _ => break,
+            }
+        }
+
+        Ok(instances)
+    }
+
+    fn destroy_instance(&self, instance_id: &str) -> Result<()> {
+        let id = validate_instance_id(instance_id)?;
+        let url = self.url(&format!("instances/{}", id));
+        let resp = self.http.delete(&url).send()?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to destroy Vultr instance {} ({}): {}",
+                id,
+                status,
+                body
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -397,5 +519,117 @@ mod tests {
         assert_eq!(parsed.plans[1].disk, 55);
         assert_eq!(parsed.plans[1].monthly_cost, 10.5);
         assert_eq!(parsed.plans[2].monthly_cost, 0.0);
+    }
+
+    #[test]
+    fn list_instances_paginates_and_skips_zero_ip() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let handle = thread::spawn(move || {
+            let mut seen_paths = Vec::new();
+            for page_idx in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("").to_string();
+                seen_paths.push(path);
+                let body = if page_idx == 0 {
+                    r#"{
+                        "instances": [
+                            {"id":"v-1","label":"box-1","status":"active","power_status":"running","main_ip":"0.0.0.0","region":"ewr","plan":"vc2-1c-1gb","date_created":"2025-01-01T00:00:00Z"}
+                        ],
+                        "meta": {"links": {"next": "cursor-2"}}
+                    }"#
+                } else {
+                    r#"{
+                        "instances": [
+                            {"id":"v-2","label":"","hostname":"box-2","status":"active","power_status":"stopped","main_ip":"203.0.113.20","region":"ord","plan":"vc2-1c-2gb","date_created":"2025-01-02T00:00:00Z"}
+                        ],
+                        "meta": {"links": {"next": ""}}
+                    }"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            seen_paths
+        });
+
+        let provider = VultrProvider::with_base_url("test-key", format!("http://{}/v2", addr))?;
+        let instances = provider.list_instances()?;
+        let seen_paths = handle.join().unwrap();
+
+        assert_eq!(seen_paths[0], "/v2/instances?per_page=500");
+        assert_eq!(seen_paths[1], "/v2/instances?per_page=500&cursor=cursor-2");
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].id, "v-1");
+        assert_eq!(instances[0].name, "box-1");
+        assert_eq!(instances[0].status, "active (running)");
+        assert_eq!(instances[0].public_ip, None);
+        assert_eq!(instances[0].region.as_deref(), Some("ewr"));
+        assert_eq!(instances[0].plan.as_deref(), Some("vc2-1c-1gb"));
+        assert_eq!(
+            instances[0].created_at.as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
+
+        assert_eq!(instances[1].id, "v-2");
+        assert_eq!(instances[1].name, "box-2");
+        assert_eq!(instances[1].status, "active (stopped)");
+        assert_eq!(instances[1].public_ip.as_deref(), Some("203.0.113.20"));
+        Ok(())
+    }
+
+    #[test]
+    fn destroy_instance_validates_id_and_sends_delete() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let resp = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            req_line
+        });
+
+        let provider = VultrProvider::with_base_url("test-key", format!("http://{}/v2", addr))?;
+        assert!(provider.destroy_instance("../bad").is_err());
+        provider.destroy_instance("  vultr-123  ")?;
+
+        let req_line = handle.join().unwrap();
+        assert!(req_line.starts_with("DELETE /v2/instances/vultr-123 "));
+        Ok(())
     }
 }

@@ -13,8 +13,14 @@ fn strip_bab_env(cmd: &mut Command) {
         "TAILSCALE_API_BASE",
         "TAILSCALE_TAILNET",
         "VULTR_API_KEY",
+        "VULTR_API_BASE",
+        "VULTR_API_BASE_URL",
         "UPCLOUD_API_TOKEN",
+        "UPCLOUD_API_BASE",
+        "UPCLOUD_API_BASE_URL",
         "LINODE_API_TOKEN",
+        "LINODE_API_BASE",
+        "LINODE_API_BASE_URL",
         "CLOUDFLARE_API_TOKEN",
         "GITHUB_TOKEN",
         "BAB_CONFIG_DIR",
@@ -654,4 +660,420 @@ fn cli_setup_with_github_cf_and_final_box_info_dry_run() {
     assert!(stdout.contains("GitHub Repo:           owner/app"));
     assert!(stdout.contains("Encrypted Credentials:"));
     assert!(stdout.contains("Master Key:"));
+}
+
+#[test]
+fn cli_instances_and_destroy_help_and_dry_run() {
+    let dir = tempdir().unwrap();
+    let settings = dir.path().join("credentials.enc");
+    let state = dir.path().join("state.conf");
+    let ssh_dir = dir.path().join("ssh");
+
+    let top_help = bab_cmd(&settings, &state, &ssh_dir)
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(top_help.status.success());
+    let top_help_out = String::from_utf8_lossy(&top_help.stdout);
+    assert!(top_help_out.contains("instances"));
+    assert!(top_help_out.contains("ps"));
+    assert!(top_help_out.contains("list"));
+    assert!(top_help_out.contains("destroy"));
+    assert!(top_help_out.contains("rm"));
+    assert!(top_help_out.contains("delete"));
+
+    let inst_help = bab_cmd(&settings, &state, &ssh_dir)
+        .args(["instances", "--help"])
+        .output()
+        .unwrap();
+    assert!(inst_help.status.success());
+    let inst_help_out = String::from_utf8_lossy(&inst_help.stdout);
+    assert!(inst_help_out.contains("--provider"));
+    assert!(inst_help_out.contains("--all"));
+    assert!(inst_help_out.contains("--destroy"));
+    assert!(inst_help_out.contains("--yes"));
+
+    let destroy_help = bab_cmd(&settings, &state, &ssh_dir)
+        .args(["destroy", "--help"])
+        .output()
+        .unwrap();
+    assert!(destroy_help.status.success());
+    let destroy_help_out = String::from_utf8_lossy(&destroy_help.stdout);
+    assert!(destroy_help_out.contains("--id"));
+    assert!(destroy_help_out.contains("--provider"));
+    assert!(destroy_help_out.contains("--yes"));
+    assert!(destroy_help_out.contains("--dry-run"));
+
+    let dry_ok = bab_cmd(&settings, &state, &ssh_dir)
+        .args([
+            "destroy",
+            "--id",
+            "vultr-123",
+            "--provider",
+            "vultr",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        dry_ok.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&dry_ok.stderr)
+    );
+    let dry_stdout = String::from_utf8_lossy(&dry_ok.stdout);
+    assert!(dry_stdout.contains("[DRY-RUN] Would destroy Vultr instance 'vultr-123'"));
+    assert!(!settings.exists());
+    assert!(!state.exists());
+
+    let bad_id = bab_cmd(&settings, &state, &ssh_dir)
+        .args([
+            "destroy",
+            "--id",
+            "../bad",
+            "--provider",
+            "vultr",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(!bad_id.status.success());
+
+    let missing_provider = bab_cmd(&settings, &state, &ssh_dir)
+        .args(["destroy", "--id", "unknown-id", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!missing_provider.status.success());
+    assert!(String::from_utf8_lossy(&missing_provider.stderr).contains("--provider"));
+}
+
+#[test]
+fn cli_instances_and_destroy_with_mock_provider_server() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct MockCliState {
+        vultr_alive: bool,
+        upcloud_alive: bool,
+        upcloud_stopped: bool,
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let state_arc = Arc::new(Mutex::new(MockCliState {
+        vultr_alive: true,
+        upcloud_alive: true,
+        upcloud_stopped: false,
+    }));
+
+    let stop_bg = Arc::clone(&stop);
+    let state_bg = Arc::clone(&state_arc);
+    let handle = thread::spawn(move || {
+        for stream_res in listener.incoming() {
+            if stop_bg.load(Ordering::SeqCst) {
+                break;
+            }
+            let Ok(mut stream) = stream_res else {
+                continue;
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = trimmed.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("content-length") {
+                        content_length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+            if content_length > 0 {
+                let mut sink = vec![0u8; content_length];
+                let _ = std::io::Read::read_exact(&mut reader, &mut sink);
+            }
+
+            let mut parts = req_line.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let target = parts.next().unwrap_or("");
+            let path = target.split('?').next().unwrap_or(target);
+
+            let mut st = state_bg.lock().unwrap();
+            let (status, reason, body) = match (method, path) {
+                ("GET", "/v2/instances") => {
+                    let body = if st.vultr_alive {
+                        r#"{"instances":[{"id":"vultr-cli-1","label":"web-edge","status":"active","power_status":"running","main_ip":"203.0.113.50","region":"ewr","plan":"vc2-1c-1gb"}],"meta":{"links":{"next":""}}}"#
+                    } else {
+                        r#"{"instances":[],"meta":{"links":{"next":""}}}"#
+                    };
+                    (200, "OK", body.to_string())
+                }
+                ("DELETE", "/v2/instances/vultr-cli-1") => {
+                    if st.vultr_alive {
+                        st.vultr_alive = false;
+                        (204, "No Content", String::new())
+                    } else {
+                        (404, "Not Found", r#"{"error":"not found"}"#.to_string())
+                    }
+                }
+                ("GET", "/1.3/server") => {
+                    let body = if st.upcloud_alive {
+                        let srv_state = if st.upcloud_stopped { "stopped" } else { "started" };
+                        format!(
+                            r#"{{"servers":{{"server":[{{"uuid":"upcloud-cli-1","title":"vpn-core","state":"{}","zone":"de-fra1","plan":"1xCPU-1GB","ip_addresses":{{"ip_address":[{{"access":"public","address":"203.0.113.60","family":"IPv4"}}]}}}}]}}}}"#,
+                            srv_state
+                        )
+                    } else {
+                        r#"{"servers":{"server":[]}}"#.to_string()
+                    };
+                    (200, "OK", body)
+                }
+                ("POST", "/1.3/server/upcloud-cli-1/stop") => {
+                    if st.upcloud_alive {
+                        st.upcloud_stopped = true;
+                        (
+                            200,
+                            "OK",
+                            r#"{"server":{"uuid":"upcloud-cli-1","state":"stopped"}}"#.to_string(),
+                        )
+                    } else {
+                        (404, "Not Found", r#"{"error":"not found"}"#.to_string())
+                    }
+                }
+                ("DELETE", "/1.3/server/upcloud-cli-1") => {
+                    if !st.upcloud_alive {
+                        (404, "Not Found", r#"{"error":"not found"}"#.to_string())
+                    } else if !st.upcloud_stopped {
+                        (
+                            409,
+                            "Conflict",
+                            r#"{"error":{"error_code":"SERVER_STATE_ILLEGAL"}}"#.to_string(),
+                        )
+                    } else {
+                        st.upcloud_alive = false;
+                        (204, "No Content", String::new())
+                    }
+                }
+                _ => (404, "Not Found", r#"{"error":"unknown"}"#.to_string()),
+            };
+
+            let resp = format!(
+                "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status,
+                reason,
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let dir = tempdir().unwrap();
+    let settings = dir.path().join("credentials.enc");
+    let state_path = dir.path().join("state.conf");
+    let ssh_dir = dir.path().join("ssh");
+    fs::write(
+        &state_path,
+        "VPS_PROVIDER=\"vultr\"\nVPS_INSTANCE_ID=\"vultr-cli-1\"\nVPS_IP=\"203.0.113.50\"\nUSERNAME=\"deploy\"\n",
+    )
+    .unwrap();
+
+    let vultr_base = format!("http://{}/v2", addr);
+    let upcloud_base = format!("http://{}/1.3", addr);
+
+    let list_out = bab_cmd(&settings, &state_path, &ssh_dir)
+        .env("VULTR_API_KEY", "vultr-cli-key")
+        .env("UPCLOUD_API_TOKEN", "upcloud-cli-tok")
+        .env("VULTR_API_BASE_URL", &vultr_base)
+        .env("UPCLOUD_API_BASE_URL", &upcloud_base)
+        .args(["instances", "--all"])
+        .output()
+        .unwrap();
+    assert!(
+        list_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    assert!(list_stdout.contains("Vultr    1 instance(s)"));
+    assert!(list_stdout.contains("UpCloud  1 instance(s)"));
+    assert!(list_stdout.contains("Linode   not configured"));
+    assert!(list_stdout.contains("vultr-cli-1"));
+    assert!(list_stdout.contains("web-edge"));
+    assert!(list_stdout.contains("upcloud-cli-1"));
+    assert!(list_stdout.contains("vpn-core"));
+
+    // Destroy Vultr instance via `rm` alias without --provider (auto-resolved) and verify session clearing.
+    let rm_out = bab_cmd(&settings, &state_path, &ssh_dir)
+        .env("VULTR_API_BASE_URL", &vultr_base)
+        .env("UPCLOUD_API_BASE_URL", &upcloud_base)
+        .args(["rm", "--id", "vultr-cli-1", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        rm_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&rm_out.stderr)
+    );
+    let rm_stdout = String::from_utf8_lossy(&rm_out.stdout);
+    assert!(rm_stdout.contains("Destroyed Vultr instance 'vultr-cli-1'"));
+    assert!(rm_stdout.contains("Cleared matching active session state"));
+
+    let state_after = fs::read_to_string(&state_path).unwrap();
+    assert!(!state_after.contains("VPS_INSTANCE_ID="));
+    assert!(!state_after.contains("VPS_IP="));
+    assert!(state_after.contains("USERNAME=\"deploy\""));
+
+    // Destroy UpCloud instance via `ps --destroy -y` (triggers stop + retry delete).
+    let ps_destroy_out = bab_cmd(&settings, &state_path, &ssh_dir)
+        .env("VULTR_API_BASE_URL", &vultr_base)
+        .env("UPCLOUD_API_BASE_URL", &upcloud_base)
+        .args(["ps", "--destroy", "upcloud-cli-1", "-y"])
+        .output()
+        .unwrap();
+    assert!(
+        ps_destroy_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ps_destroy_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&ps_destroy_out.stdout)
+            .contains("Destroyed UpCloud instance 'upcloud-cli-1'")
+    );
+
+    // Verify `list` alias reports no remaining instances.
+    let final_list = bab_cmd(&settings, &state_path, &ssh_dir)
+        .env("VULTR_API_BASE_URL", &vultr_base)
+        .env("UPCLOUD_API_BASE_URL", &upcloud_base)
+        .arg("list")
+        .output()
+        .unwrap();
+    assert!(final_list.status.success());
+    assert!(String::from_utf8_lossy(&final_list.stdout).contains("No instances found."));
+
+    stop.store(true, Ordering::SeqCst);
+    let _ = std::net::TcpStream::connect(addr);
+    handle.join().unwrap();
+}
+
+#[test]
+fn cli_settings_auto_saves_env_api_keys_encrypted() {
+    let dir = tempdir().unwrap();
+    let settings = dir.path().join("credentials.enc");
+    let state = dir.path().join("state.conf");
+    let ssh_dir = dir.path().join("ssh");
+    let master_key = dir.path().join("master.key");
+
+    let env_secret = "vultr-env-secret-9876";
+    let first = bab_cmd(&settings, &state, &ssh_dir)
+        .env("VULTR_API_KEY", env_secret)
+        .args(["settings", "--show"])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first_stdout = String::from_utf8_lossy(&first.stdout);
+    assert!(first_stdout.contains("VULTR_API_KEY: vult****9876"));
+    assert!(!first_stdout.contains(env_secret));
+
+    let creds_raw = fs::read_to_string(&settings).unwrap();
+    assert!(creds_raw.contains("VULTR_API_KEY=\"enc:v1:"));
+    assert!(!creds_raw.contains(env_secret));
+    assert_eq!(
+        fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(&master_key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // Run again with VULTR_API_KEY removed from env and verify persisted encrypted key remains.
+    let second = bab_cmd(&settings, &state, &ssh_dir)
+        .args(["settings", "--show"])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(second_stdout.contains("VULTR_API_KEY: vult****9876"));
+    assert!(!second_stdout.contains(env_secret));
+}
+
+#[test]
+fn cli_setup_cf_dns_and_no_cf_dns_dry_run() {
+    let dir = tempdir().unwrap();
+    let settings = dir.path().join("credentials.enc");
+    let state = dir.path().join("state.conf");
+    let ssh_dir = dir.path().join("ssh");
+
+    fs::write(
+        &state,
+        "CF_ENABLED=\"true\"\nCF_ZONE=\"example.com\"\nCF_RECORD=\"app\"\nCF_TARGET=\"public\"\nCF_PROXIED=\"true\"\n",
+    )
+    .unwrap();
+
+    // Saved CF_ENABLED="true" triggers Cloudflare DNS stub plan automatically.
+    let with_saved = bab_cmd(&settings, &state, &ssh_dir)
+        .args(["setup", "--provider", "vultr", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        with_saved.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_saved.stderr)
+    );
+    let saved_stdout = String::from_utf8_lossy(&with_saved.stdout);
+    assert!(saved_stdout.contains("[STUB] Cloudflare DNS: would upsert A record 'app'"));
+    assert!(saved_stdout.contains("Cloudflare DNS:        app ->"));
+
+    // --no-cf-dns skips Cloudflare DNS stub plan even when CF_ENABLED="true" in state.
+    let skipped = bab_cmd(&settings, &state, &ssh_dir)
+        .args(["setup", "--provider", "vultr", "--no-cf-dns", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        skipped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&skipped.stderr)
+    );
+    let skipped_stdout = String::from_utf8_lossy(&skipped.stdout);
+    assert!(!skipped_stdout.contains("[STUB] Cloudflare DNS:"));
+    assert!(!skipped_stdout.contains("Cloudflare DNS:"));
+
+    // --cf-dns forces Cloudflare DNS using saved CF_* values even when CF_ENABLED="false".
+    fs::write(
+        &state,
+        "CF_ENABLED=\"false\"\nCF_ZONE=\"example.com\"\nCF_RECORD=\"web\"\nCF_TARGET=\"203.0.113.77\"\nCF_PROXIED=\"false\"\n",
+    )
+    .unwrap();
+    let forced = bab_cmd(&settings, &state, &ssh_dir)
+        .args(["setup", "--provider", "vultr", "--cf-dns", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        forced.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let forced_stdout = String::from_utf8_lossy(&forced.stdout);
+    assert!(forced_stdout.contains(
+        "[STUB] Cloudflare DNS: would upsert A record 'web' -> '203.0.113.77' in zone 'example.com' (proxied=false"
+    ));
 }

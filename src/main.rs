@@ -10,8 +10,10 @@ use bab::providers::linode::LinodeProvider;
 use bab::providers::upcloud::UpCloudProvider;
 use bab::providers::vultr::VultrProvider;
 use bab::providers::{
-    default_images_for, default_plans_for, default_regions_for, provision_full_flow,
-    ProvisionConfig, ProviderKind, VpsProvider,
+    clear_destroyed_session_if_matches, default_images_for, default_plans_for,
+    default_regions_for, destroy_provider_instance, provision_full_flow, query_all_providers,
+    validate_instance_id, ProvisionConfig, ProviderInstance, ProviderKind, ProviderQueryStatus,
+    VpsProvider,
 };
 use bab::roles::ServerRole;
 use bab::setup::{GithubDeployConfig, SetupConfig, SetupRunner};
@@ -71,6 +73,12 @@ enum Commands {
     Settings(SettingsArgs),
     /// Check remote status of the configured VPS node
     Status,
+    /// List running instances across configured cloud providers
+    #[command(visible_aliases = ["ps", "list"])]
+    Instances(InstancesArgs),
+    /// Destroy a cloud VPS instance by ID
+    #[command(visible_aliases = ["rm", "delete"])]
+    Destroy(DestroyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +211,12 @@ struct SetupArgs {
     /// Enable Cloudflare proxy (orange cloud) for the DNS record
     #[arg(long)]
     cf_proxied: bool,
+    /// Enable Cloudflare DNS stub plan using saved session settings
+    #[arg(long, conflicts_with = "no_cf_dns")]
+    cf_dns: bool,
+    /// Skip Cloudflare DNS stub plan even if enabled in saved session state
+    #[arg(long)]
+    no_cf_dns: bool,
     /// GitHub repository to deploy (owner/repo, https://..., or git@...)
     #[arg(long, value_name = "REPO")]
     github_repo: Option<String>,
@@ -270,6 +284,38 @@ struct SettingsArgs {
     github_token: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct InstancesArgs {
+    /// Cloud provider filter (vultr, upcloud, linode)
+    #[arg(long, value_parser = parse_provider)]
+    provider: Option<ProviderKind>,
+    /// Include status details for all providers (including unconfigured)
+    #[arg(long)]
+    all: bool,
+    /// Destroy the specified instance ID directly
+    #[arg(long, value_name = "ID")]
+    destroy: Option<String>,
+    /// Skip interactive confirmation when --destroy is used
+    #[arg(short = 'y', long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct DestroyArgs {
+    /// Cloud instance ID to destroy
+    #[arg(long, value_name = "ID")]
+    id: String,
+    /// Cloud provider (vultr, upcloud, linode); optional if ID uniquely matches across configured providers
+    #[arg(long, value_parser = parse_provider)]
+    provider: Option<ProviderKind>,
+    /// Skip interactive confirmation
+    #[arg(short = 'y', long)]
+    yes: bool,
+    /// Validate ID and print destroy plan without API calls or state modification
+    #[arg(long)]
+    dry_run: bool,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     dispatch(cli)
@@ -291,6 +337,8 @@ fn dispatch(cli: Cli) -> Result<()> {
         Some(Commands::CloudInit(args)) => cmd_cloud_init(args),
         Some(Commands::Settings(args)) => cmd_settings(args),
         Some(Commands::Status) => cmd_status(),
+        Some(Commands::Instances(args)) => cmd_instances(args),
+        Some(Commands::Destroy(args)) => cmd_destroy(args),
     }
 }
 
@@ -745,11 +793,28 @@ fn persist_github_session(session: &SessionState, gh: &GithubDeployConfig) -> Re
     Ok(())
 }
 
+fn parse_truthy(val: Option<&str>) -> bool {
+    val.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        )
+    })
+}
+
+struct PlannedCloudflareDns {
+    zone: String,
+    record_name: String,
+    target_pref: Option<String>,
+    proxied: bool,
+}
+
 fn persist_cf_session(session: &SessionState, dns: &CloudflareDnsConfig) -> Result<()> {
     session.set_cf_zone(&dns.zone)?;
     session.set_cf_record(&dns.record_name)?;
     session.set_cf_target(&dns.target_ip)?;
     session.set_cf_proxied(if dns.proxied { "true" } else { "false" })?;
+    session.set_cf_enabled("true")?;
     Ok(())
 }
 
@@ -776,13 +841,69 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
             "Both --cf-zone and --cf-record must be provided together"
         ));
     }
-    if let (Some(ref zone), Some(ref record)) = (&cf_zone_clean, &cf_record_clean) {
+
+    let planned_cf_dns = if args.no_cf_dns {
+        None
+    } else if let (Some(zone), Some(record_name)) = (cf_zone_clean, cf_record_clean) {
+        Some(PlannedCloudflareDns {
+            zone,
+            record_name,
+            target_pref: None,
+            proxied: args.cf_proxied,
+        })
+    } else if args.cf_dns || parse_truthy(session.cf_enabled()?.as_deref()) {
+        let saved_zone = session
+            .cf_zone()?
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        match saved_zone {
+            Some(zone) => {
+                let record_name = session
+                    .cf_record()?
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("@")
+                    .to_string();
+                let target_pref = session
+                    .cf_target()?
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
+                let proxied = args.cf_proxied || parse_truthy(session.cf_proxied()?.as_deref());
+                Some(PlannedCloudflareDns {
+                    zone,
+                    record_name,
+                    target_pref,
+                    proxied,
+                })
+            }
+            None if args.cf_dns => {
+                return Err(anyhow!(
+                    "--cf-dns requires CF_ZONE in session state (pass --cf-zone and --cf-record or run `bab dns` first)"
+                ));
+            }
+            None => {
+                eprintln!(
+                    "Note: CF_ENABLED is enabled in session state, but CF_ZONE is empty; skipping Cloudflare DNS stub plan."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref planned) = planned_cf_dns {
         build_cloudflare_dns_stub_plan(
             &CloudflareDnsConfig {
-                zone: zone.clone(),
-                record_name: record.clone(),
+                zone: planned.zone.clone(),
+                record_name: planned.record_name.clone(),
                 target_ip: "203.0.113.10".to_string(),
-                proxied: args.cf_proxied,
+                proxied: planned.proxied,
             },
             false,
         )?;
@@ -1152,19 +1273,30 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         }
     })?;
 
-    let cf_dns_cfg = if let (Some(zone), Some(record_name)) = (cf_zone_clean, cf_record_clean) {
-        let dns_target = resolved_public_ip
-            .clone()
-            .or_else(|| resolved_tailscale_ip.clone())
-            .unwrap_or_else(|| target.clone());
+    let cf_dns_cfg = if let Some(planned) = planned_cf_dns {
+        let fallback_target = || {
+            resolved_public_ip
+                .clone()
+                .or_else(|| resolved_tailscale_ip.clone())
+                .unwrap_or_else(|| target.clone())
+        };
+        let dns_target = match planned.target_pref {
+            Some(ref pref) if pref.eq_ignore_ascii_case("tailscale") => resolved_tailscale_ip
+                .clone()
+                .or_else(|| resolved_public_ip.clone())
+                .unwrap_or_else(|| target.clone()),
+            Some(ref pref) if pref.eq_ignore_ascii_case("public") => fallback_target(),
+            Some(explicit_saved) => explicit_saved,
+            None => fallback_target(),
+        };
         let has_cf_token = settings
             .cloudflare_api_token()?
             .is_some_and(|t| !t.trim().is_empty());
         let dns_cfg = CloudflareDnsConfig {
-            zone,
-            record_name,
+            zone: planned.zone,
+            record_name: planned.record_name,
             target_ip: dns_target,
-            proxied: args.cf_proxied,
+            proxied: planned.proxied,
         };
         let stub_plan = build_cloudflare_dns_stub_plan(&dns_cfg, has_cf_token)?;
         println!("{}", stub_plan);
@@ -1630,6 +1762,257 @@ fn cmd_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn ensure_cloud_provider(kind: ProviderKind, action: &str) -> Result<()> {
+    if matches!(
+        kind,
+        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit
+    ) {
+        return Err(anyhow!("{} does not support {}", kind.label(), action));
+    }
+    Ok(())
+}
+
+fn print_instances_table(instances: &[ProviderInstance]) {
+    if instances.is_empty() {
+        println!("No instances found.");
+        return;
+    }
+
+    let mut w_prov = "PROVIDER".len();
+    let mut w_id = "ID".len();
+    let mut w_name = "NAME".len();
+    let mut w_status = "STATUS".len();
+    let mut w_ip = "PUBLIC IP".len();
+    let mut w_region = "REGION".len();
+    let mut w_plan = "PLAN".len();
+
+    for inst in instances {
+        w_prov = w_prov.max(inst.provider.label().len());
+        w_id = w_id.max(inst.id.len());
+        w_name = w_name.max(inst.name.len());
+        w_status = w_status.max(inst.status.len());
+        w_ip = w_ip.max(inst.public_ip.as_deref().unwrap_or("-").len());
+        w_region = w_region.max(inst.region.as_deref().unwrap_or("-").len());
+        w_plan = w_plan.max(inst.plan.as_deref().unwrap_or("-").len());
+    }
+
+    println!(
+        "{:<w_prov$}  {:<w_id$}  {:<w_name$}  {:<w_status$}  {:<w_ip$}  {:<w_region$}  {:<w_plan$}",
+        "PROVIDER", "ID", "NAME", "STATUS", "PUBLIC IP", "REGION", "PLAN"
+    );
+    for inst in instances {
+        println!(
+            "{:<w_prov$}  {:<w_id$}  {:<w_name$}  {:<w_status$}  {:<w_ip$}  {:<w_region$}  {:<w_plan$}",
+            inst.provider.label(),
+            inst.id,
+            inst.name,
+            inst.status,
+            inst.public_ip.as_deref().unwrap_or("-"),
+            inst.region.as_deref().unwrap_or("-"),
+            inst.plan.as_deref().unwrap_or("-"),
+        );
+    }
+}
+
+fn resolve_provider_for_instance(
+    instances: &[ProviderInstance],
+    statuses: &[ProviderQueryStatus],
+    explicit: Option<ProviderKind>,
+    id: &str,
+) -> Result<(ProviderKind, Option<String>)> {
+    if let Some(kind) = explicit {
+        ensure_cloud_provider(kind, "destroying cloud instances")?;
+        let name = instances
+            .iter()
+            .find(|inst| inst.provider == kind && inst.id == id)
+            .map(|inst| inst.name.clone());
+        return Ok((kind, name));
+    }
+
+    let matches: Vec<&ProviderInstance> = instances.iter().filter(|inst| inst.id == id).collect();
+    match matches.len() {
+        1 => Ok((matches[0].provider, Some(matches[0].name.clone()))),
+        0 => {
+            let errors: Vec<String> = statuses
+                .iter()
+                .filter_map(|st| {
+                    st.error
+                        .as_ref()
+                        .map(|e| format!("{}: {}", st.provider.label(), e))
+                })
+                .collect();
+            if errors.is_empty() {
+                Err(anyhow!(
+                    "Instance '{}' was not found across configured providers; pass --provider <vultr|upcloud|linode>.",
+                    id
+                ))
+            } else {
+                Err(anyhow!(
+                    "Instance '{}' was not found across configured providers (query errors: {}); pass --provider <vultr|upcloud|linode>.",
+                    id,
+                    errors.join("; ")
+                ))
+            }
+        }
+        _ => {
+            let labels: Vec<&str> = matches.iter().map(|m| m.provider.label()).collect();
+            Err(anyhow!(
+                "Instance '{}' matches multiple providers ({}); specify --provider.",
+                id,
+                labels.join(", ")
+            ))
+        }
+    }
+}
+
+fn confirm_destroy(provider: ProviderKind, id: &str, name: Option<&str>) -> Result<bool> {
+    use std::io::{self, BufRead, Write};
+    let target_desc = match name.filter(|n| !n.is_empty() && *n != id) {
+        Some(n) => format!("{} instance '{}' ({})", provider.label(), id, n),
+        None => format!("{} instance '{}'", provider.label(), id),
+    };
+    print!("Destroy {}? [y/N]: ", target_desc);
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().lock().read_line(&mut answer)?;
+    let trimmed = answer.trim().to_ascii_lowercase();
+    Ok(matches!(trimmed.as_str(), "y" | "yes"))
+}
+
+fn execute_destroy(
+    settings: &Settings,
+    kind: ProviderKind,
+    id: &str,
+    name: Option<&str>,
+    skip_confirm: bool,
+) -> Result<()> {
+    if !skip_confirm && !confirm_destroy(kind, id, name)? {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    destroy_provider_instance(settings, kind, id)?;
+    let cleared = clear_destroyed_session_if_matches(&SessionState::load_default()?, id)?;
+    println!("Destroyed {} instance '{}'.", kind.label(), id);
+    if cleared {
+        println!("Cleared matching active session state.");
+    }
+    Ok(())
+}
+
+fn cmd_instances(args: InstancesArgs) -> Result<()> {
+    let settings = Settings::load_default()?;
+    if let Some(p) = args.provider {
+        ensure_cloud_provider(p, "querying cloud instances")?;
+    }
+    let destroy_id = args
+        .destroy
+        .as_deref()
+        .map(validate_instance_id)
+        .transpose()?
+        .map(String::from);
+
+    let result = query_all_providers(&settings, args.provider);
+
+    println!("Providers:");
+    let mut printed_status = false;
+    for st in &result.provider_statuses {
+        if args.all || st.configured || st.error.is_some() {
+            printed_status = true;
+            if let Some(ref err) = st.error {
+                println!("  {:<8} ERROR: {}", st.provider.label(), err);
+            } else if !st.configured {
+                println!("  {:<8} not configured", st.provider.label());
+            } else {
+                println!(
+                    "  {:<8} {} instance(s)",
+                    st.provider.label(),
+                    st.instance_count
+                );
+            }
+        }
+    }
+    if !printed_status {
+        println!(
+            "  No cloud providers configured (set VULTR_API_KEY, UPCLOUD_API_TOKEN, or LINODE_API_TOKEN)."
+        );
+    }
+
+    print_instances_table(&result.instances);
+
+    if let Some(id) = destroy_id {
+        let (kind, name) = resolve_provider_for_instance(
+            &result.instances,
+            &result.provider_statuses,
+            args.provider,
+            &id,
+        )?;
+        execute_destroy(&settings, kind, &id, name.as_deref(), args.yes)?;
+    }
+
+    Ok(())
+}
+
+fn cmd_destroy(args: DestroyArgs) -> Result<()> {
+    let settings = Settings::load_default()?;
+    let id = validate_instance_id(&args.id)?.to_string();
+    if let Some(p) = args.provider {
+        ensure_cloud_provider(p, "destroying cloud instances")?;
+    }
+
+    if args.dry_run {
+        let session_data = SessionState::load_default()?.load_session()?;
+        let session_matches =
+            session_data.vps_instance_id.as_deref().map(str::trim) == Some(id.as_str());
+        let kind = match args.provider {
+            Some(p) => p,
+            None => {
+                let session_provider = if session_matches {
+                    session_data
+                        .vps_provider
+                        .as_deref()
+                        .and_then(|s| s.parse::<ProviderKind>().ok())
+                        .filter(|p| {
+                            !matches!(
+                                p,
+                                ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit
+                            )
+                        })
+                } else {
+                    None
+                };
+                session_provider.ok_or_else(|| {
+                    anyhow!(
+                        "--provider is required in --dry-run mode when instance '{}' does not match the active session",
+                        id
+                    )
+                })?
+            }
+        };
+        println!(
+            "[DRY-RUN] Would destroy {} instance '{}'.",
+            kind.label(),
+            id
+        );
+        if session_matches {
+            println!(
+                "[DRY-RUN] Would clear matching active session state for '{}'.",
+                id
+            );
+        }
+        return Ok(());
+    }
+
+    let (kind, name) = if let Some(p) = args.provider {
+        (p, None)
+    } else {
+        let result = query_all_providers(&settings, None);
+        resolve_provider_for_instance(&result.instances, &result.provider_statuses, None, &id)?
+    };
+
+    execute_destroy(&settings, kind, &id, name.as_deref(), args.yes)
 }
 
 #[cfg(test)]
@@ -2395,5 +2778,104 @@ mod tests {
         assert_eq!(state.public_ip()?.as_deref(), Some("203.0.113.42"));
         assert_eq!(state.tailscale_ip()?.as_deref(), Some("100.64.1.2"));
         Ok(())
+    }
+
+    #[test]
+    fn parse_instances_and_aliases() {
+        for sub in ["instances", "ps", "list"] {
+            let def = Cli::try_parse_from(["bab", sub]).unwrap();
+            match def.command {
+                Some(Commands::Instances(args)) => {
+                    assert_eq!(args.provider, None);
+                    assert!(!args.all);
+                    assert_eq!(args.destroy, None);
+                    assert!(!args.yes);
+                }
+                other => panic!("unexpected command for {}: {:?}", sub, other),
+            }
+
+            let full = Cli::try_parse_from([
+                "bab",
+                sub,
+                "--provider",
+                "upcloud",
+                "--all",
+                "--destroy",
+                "upcloud-uuid-1",
+                "-y",
+            ])
+            .unwrap();
+            match full.command {
+                Some(Commands::Instances(args)) => {
+                    assert_eq!(args.provider, Some(ProviderKind::UpCloud));
+                    assert!(args.all);
+                    assert_eq!(args.destroy.as_deref(), Some("upcloud-uuid-1"));
+                    assert!(args.yes);
+                }
+                other => panic!("unexpected command for {}: {:?}", sub, other),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_destroy_and_aliases() {
+        for sub in ["destroy", "rm", "delete"] {
+            let min = Cli::try_parse_from(["bab", sub, "--id", "vultr-123"]).unwrap();
+            match min.command {
+                Some(Commands::Destroy(args)) => {
+                    assert_eq!(args.id, "vultr-123");
+                    assert_eq!(args.provider, None);
+                    assert!(!args.yes);
+                    assert!(!args.dry_run);
+                }
+                other => panic!("unexpected command for {}: {:?}", sub, other),
+            }
+
+            let full = Cli::try_parse_from([
+                "bab",
+                sub,
+                "--id",
+                "12345",
+                "--provider",
+                "linode",
+                "--yes",
+                "--dry-run",
+            ])
+            .unwrap();
+            match full.command {
+                Some(Commands::Destroy(args)) => {
+                    assert_eq!(args.id, "12345");
+                    assert_eq!(args.provider, Some(ProviderKind::Linode));
+                    assert!(args.yes);
+                    assert!(args.dry_run);
+                }
+                other => panic!("unexpected command for {}: {:?}", sub, other),
+            }
+        }
+
+        assert!(Cli::try_parse_from(["bab", "destroy"]).is_err());
+    }
+
+    #[test]
+    fn parse_setup_cf_dns_flags() {
+        let cf_on = Cli::try_parse_from(["bab", "setup", "--cf-dns"]).unwrap();
+        match cf_on.command {
+            Some(Commands::Setup(args)) => {
+                assert!(args.cf_dns);
+                assert!(!args.no_cf_dns);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let cf_off = Cli::try_parse_from(["bab", "setup", "--no-cf-dns"]).unwrap();
+        match cf_off.command {
+            Some(Commands::Setup(args)) => {
+                assert!(!args.cf_dns);
+                assert!(args.no_cf_dns);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        assert!(Cli::try_parse_from(["bab", "setup", "--cf-dns", "--no-cf-dns"]).is_err());
     }
 }
