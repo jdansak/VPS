@@ -27,7 +27,7 @@ use crate::providers::{
     build_cloud_provider_with_key, clear_destroyed_session_if_matches, default_images_for,
     default_plans_for, default_regions_for, destroy_provider_instance_with_key,
     provision_full_flow_with_progress, query_providers_with_keys, ProviderInstance, ProviderKind,
-    ProviderQueryStatus, ProvisionConfig,
+    ProviderQueryStatus, ProvisionConfig, VpsProvider,
 };
 use crate::roles::ServerRole;
 use crate::setup::{
@@ -132,6 +132,12 @@ pub enum Screen {
     BuildBox,
     RunningInstances,
     ViewLog,
+}
+
+enum ExistingInstanceOutcome {
+    Reuse(String),
+    Recreate,
+    Abort,
 }
 
 /// Editable form state for access transport, sudo admin user, SSH key path, hostname, and passwordless sudo.
@@ -2252,6 +2258,127 @@ impl TuiApp {
         self.status_message = msg;
     }
 
+    /// Resolves an already-active provider VM matching `desired_hostname`:
+    /// in Tailscale mode, reuses it if registered on Tailscale or destroys it so a fresh build can proceed.
+    fn resolve_existing_instance_for_build<F>(
+        &mut self,
+        provider: &dyn VpsProvider,
+        ts_client: Option<&TailscaleClient>,
+        existing: ProviderInstance,
+        tailscale_mode: bool,
+        desired_hostname: &str,
+        on_update: &mut F,
+    ) -> ExistingInstanceOutcome
+    where
+        F: FnMut(&Self),
+    {
+        let existing_pub_ip = existing
+            .public_ip
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let resolved_ip = if tailscale_mode {
+            match ts_client
+                .expect("tailscale client")
+                .find_device_ip(desired_hostname)
+            {
+                Ok(Some(ts_ip)) => {
+                    self.session.tailscale_ip = Some(ts_ip.clone());
+                    ts_ip
+                }
+                Ok(None) => {
+                    self.push_log(format!(
+                        "[PROVISION] Existing {} instance '{}' (id={}) is not on Tailscale; destroying stale instance before creating a fresh one...",
+                        provider_display_label(self.selected_provider),
+                        desired_hostname,
+                        existing.id
+                    ));
+                    self.status_message = format!(
+                        "Destroying stale instance '{}' ({})...",
+                        desired_hostname, existing.id
+                    );
+                    on_update(self);
+
+                    if let Err(err) = provider.destroy_instance(&existing.id) {
+                        let msg = format!(
+                            "Failed to destroy stale {} instance '{}' (id={}): {}",
+                            provider_display_label(self.selected_provider),
+                            desired_hostname,
+                            existing.id,
+                            err
+                        );
+                        self.push_log(format!("[ERROR] {}", msg));
+                        self.status_message = msg;
+                        on_update(self);
+                        return ExistingInstanceOutcome::Abort;
+                    }
+
+                    if self
+                        .session
+                        .vps_instance_id
+                        .as_deref()
+                        .map(str::trim)
+                        == Some(existing.id.trim())
+                    {
+                        self.session.vps_instance_id = None;
+                        self.session.vps_ip = None;
+                        self.session.public_ip = None;
+                        self.session.tailscale_ip = None;
+                        if let Some(ref path) = self.state_path {
+                            let _ = SessionState::new(path).save_session(&self.session);
+                        }
+                    }
+                    return ExistingInstanceOutcome::Recreate;
+                }
+                Err(err) => {
+                    let msg = format!(
+                        "Failed to check Tailscale for existing instance '{}': {}",
+                        desired_hostname, err
+                    );
+                    self.push_log(format!("[ERROR] {}", msg));
+                    self.status_message = msg;
+                    on_update(self);
+                    return ExistingInstanceOutcome::Abort;
+                }
+            }
+        } else if let Some(pub_ip) = existing_pub_ip.clone() {
+            pub_ip
+        } else {
+            let msg = format!(
+                "Existing {} instance '{}' has no public IP",
+                provider_display_label(self.selected_provider),
+                desired_hostname
+            );
+            self.push_log(format!("[ERROR] {}", msg));
+            self.status_message = msg;
+            on_update(self);
+            return ExistingInstanceOutcome::Abort;
+        };
+
+        self.session.vps_instance_id = Some(existing.id.clone());
+        self.session.public_ip = existing_pub_ip.clone();
+        self.session.vps_ip = Some(resolved_ip.clone());
+        if let Some(ref path) = self.state_path {
+            let _ = SessionState::new(path).save_session(&self.session);
+        }
+        self.record_current_instance_password(
+            Some(&existing.id),
+            self.session.public_ip.as_deref(),
+        );
+        self.push_log(format!(
+            "[PROVISION] Reusing existing {} instance '{}' (id={}, public_ip={})",
+            provider_display_label(self.selected_provider),
+            desired_hostname,
+            existing.id,
+            existing_pub_ip.as_deref().unwrap_or("(none)")
+        ));
+        self.status_message = format!("Reusing existing instance '{}'...", desired_hostname);
+        on_update(self);
+        ExistingInstanceOutcome::Reuse(resolved_ip)
+    }
+
     /// Executes the full provision + 6-step setup + optional Cloudflare DNS plan using current options.
     pub fn execute_build(&mut self) {
         self.execute_build_with_ui(|_| {});
@@ -2472,86 +2599,24 @@ impl TuiApp {
                         }
                     };
 
-                    if let Some(existing) = existing_instance {
-                        let existing_pub_ip = existing
-                            .public_ip
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("")
-                            .to_string();
-                        self.push_log(format!(
-                            "[PROVISION] Reusing existing {} instance '{}' (id={}, public_ip={})",
-                            provider_display_label(self.selected_provider),
-                            desired_hostname,
-                            existing.id,
-                            if existing_pub_ip.is_empty() {
-                                "(none)"
-                            } else {
-                                &existing_pub_ip
-                            }
-                        ));
-                        self.session.vps_instance_id = Some(existing.id.clone());
-                        self.session.public_ip = if existing_pub_ip.is_empty() {
-                            None
-                        } else {
-                            Some(existing_pub_ip.clone())
-                        };
-                        self.status_message =
-                            format!("Reusing existing instance '{}'...", desired_hostname);
-                        on_update(self);
-
-                        let resolved_ip = if tailscale_mode {
-                            self.push_log(format!(
-                                "[PROVISION] Waiting for Tailscale device '{}'...",
-                                desired_hostname
-                            ));
-                            self.status_message =
-                                format!("Waiting for Tailscale device '{}'...", desired_hostname);
-                            on_update(self);
-                            match ts_client.as_ref().expect("tailscale client").wait_for_device(
-                                &desired_hostname,
-                                Duration::from_secs(300),
-                                Duration::from_secs(5),
-                            ) {
-                                Ok(ts_ip) => {
-                                    self.session.tailscale_ip = Some(ts_ip.clone());
-                                    ts_ip
-                                }
-                                Err(err) => {
-                                    let msg = format!(
-                                        "Failed to find Tailscale device '{}': {}",
-                                        desired_hostname, err
-                                    );
-                                    self.push_log(format!("[ERROR] {}", msg));
-                                    self.status_message = msg;
-                                    on_update(self);
-                                    return;
-                                }
-                            }
-                        } else {
-                            if existing_pub_ip.is_empty() {
-                                let msg = format!(
-                                    "Existing {} instance '{}' has no public IP",
-                                    provider_display_label(self.selected_provider),
-                                    desired_hostname
-                                );
-                                self.push_log(format!("[ERROR] {}", msg));
-                                self.status_message = msg;
-                                on_update(self);
-                                return;
-                            }
-                            existing_pub_ip
-                        };
-                        self.session.vps_ip = Some(resolved_ip.clone());
-                        if let Some(ref path) = self.state_path {
-                            let _ = SessionState::new(path).save_session(&self.session);
+                    let reused_target_ip = if let Some(existing) = existing_instance {
+                        match self.resolve_existing_instance_for_build(
+                            provider.as_ref(),
+                            ts_client.as_ref(),
+                            existing,
+                            tailscale_mode,
+                            &desired_hostname,
+                            &mut on_update,
+                        ) {
+                            ExistingInstanceOutcome::Reuse(ip) => Some(ip),
+                            ExistingInstanceOutcome::Recreate => None,
+                            ExistingInstanceOutcome::Abort => return,
                         }
-                        self.record_current_instance_password(
-                            Some(&existing.id),
-                            self.session.public_ip.as_deref(),
-                        );
-                        on_update(self);
+                    } else {
+                        None
+                    };
+
+                    if let Some(resolved_ip) = reused_target_ip {
                         resolved_ip
                     } else {
                         let region = self
@@ -2684,6 +2749,15 @@ impl TuiApp {
                                 res.ip
                             }
                             Err(err) => {
+                                if let Some(ref state) = prov_state {
+                                    if let Ok(reloaded) = state.load_session() {
+                                        self.session = reloaded;
+                                    }
+                                }
+                                self.record_current_instance_password(
+                                    self.session.vps_instance_id.as_deref(),
+                                    self.session.public_ip.as_deref(),
+                                );
                                 let msg = format!("Provision failed: {}", err);
                                 self.push_log(format!("[ERROR] {}", msg));
                                 self.status_message = msg;
@@ -4791,6 +4865,13 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn drain_pending_events() -> Result<()> {
+    while event::poll(Duration::ZERO)? {
+        let _ = event::read()?;
+    }
+    Ok(())
+}
+
 /// Runs the interactive terminal UI, restoring terminal state on exit or panic.
 pub fn run_tui(settings_path: Option<&Path>, state_path: Option<&Path>) -> Result<()> {
     let mut app = TuiApp::from_paths(settings_path, state_path)?;
@@ -4804,8 +4885,11 @@ pub fn run_tui(settings_path: Option<&Path>, state_path: Option<&Path>) -> Resul
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
                 app.handle_key_with_ui(key, |app_state| {
+                    // Discard keys typed during blocking provision/SSH calls so they cannot quit afterward.
+                    let _ = drain_pending_events();
                     let _ = guard.terminal.draw(|frame| app_state.render_frame(frame));
                 });
+                drain_pending_events()?;
                 if app.should_quit {
                     break;
                 }
@@ -7380,6 +7464,539 @@ esac"#
         let _ = std::net::TcpStream::connect(ts_addr);
         vultr_handle.join().unwrap();
         ts_handle.join().unwrap();
+        Ok(())
+    }
+
+    struct TestEnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl TestEnvGuard {
+        fn new(keys: &[&str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    struct MockHttpServer {
+        addr: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockHttpServer {
+        fn spawn<F>(mut handler: F) -> Result<Self>
+        where
+            F: FnMut(&str, &str, &str) -> (&'static str, String) + Send + 'static,
+        {
+            use std::io::{BufRead, BufReader, Read, Write};
+            use std::net::TcpListener;
+            use std::sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            };
+
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let addr = listener.local_addr()?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_bg = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                for stream_res in listener.incoming() {
+                    if stop_bg.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream_res else {
+                        break;
+                    };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let mut content_len: usize = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                content_len = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                    let mut body_buf = vec![0u8; content_len];
+                    if content_len > 0 {
+                        let _ = reader.read_exact(&mut body_buf);
+                    }
+                    let req_body = String::from_utf8_lossy(&body_buf);
+                    let mut parts = req_line.split_whitespace();
+                    let method = parts.next().unwrap_or("");
+                    let raw_path = parts.next().unwrap_or("");
+                    let path = raw_path.split('?').next().unwrap_or(raw_path);
+                    let (status, resp_body) = handler(method, path, &req_body);
+                    let resp = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            Ok(Self {
+                addr,
+                stop,
+                handle: Some(handle),
+            })
+        }
+    }
+
+    impl Drop for MockHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.addr);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    #[test]
+    fn execute_build_with_ui_tailscale_wait_failure_preserves_instance_id_public_ip_and_password(
+    ) -> Result<()> {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let _lock = crate::env_lock();
+        let _guard = TestEnvGuard::new(&["VULTR_API_BASE_URL", "TAILSCALE_API_BASE"]);
+
+        let ts_key_created = Arc::new(AtomicBool::new(false));
+        let ts_key_bg = Arc::clone(&ts_key_created);
+
+        let vultr_srv = MockHttpServer::spawn(|method, path, _body| match (method, path) {
+            ("GET", "/v2/instances") => (
+                "200 OK",
+                r#"{"instances":[],"meta":{"links":{"next":""}}}"#.to_string(),
+            ),
+            ("POST", "/v2/instances") => (
+                "202 Accepted",
+                r#"{"instance":{"id":"vultr-ts-fail-1","label":"fail-node","status":"pending","power_status":"stopped","main_ip":"0.0.0.0"}}"#
+                    .to_string(),
+            ),
+            ("GET", "/v2/instances/vultr-ts-fail-1") => (
+                "200 OK",
+                r#"{"instance":{"id":"vultr-ts-fail-1","label":"fail-node","status":"active","power_status":"running","main_ip":"198.51.100.77"}}"#
+                    .to_string(),
+            ),
+            _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+        })?;
+
+        let ts_srv = MockHttpServer::spawn(move |method, path, _body| match (method, path) {
+            ("POST", "/tailnet/-/keys") => {
+                ts_key_bg.store(true, Ordering::SeqCst);
+                (
+                    "200 OK",
+                    r#"{"id":"key-fail","key":"tskey-auth-fail"}"#.to_string(),
+                )
+            }
+            ("GET", "/tailnet/-/devices") => {
+                if !ts_key_bg.load(Ordering::SeqCst) {
+                    ("200 OK", r#"{"devices":[]}"#.to_string())
+                } else {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"message":"tailscale wait failure"}"#.to_string(),
+                    )
+                }
+            }
+            _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+        })?;
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        std::env::set_var(
+            "VULTR_API_BASE_URL",
+            format!("http://{}/v2", vultr_srv.addr),
+        );
+        std::env::set_var("TAILSCALE_API_BASE", format!("http://{}", ts_srv.addr));
+
+        let settings = Settings::new(&settings_path);
+        settings.set_vultr_api_key("vultr-test-key")?;
+        settings.set_tailscale_api_key("ts-test-key")?;
+
+        let state = SessionState::new(&state_path);
+        state.save_session(&SessionData {
+            vps_provider: Some("vultr".to_string()),
+            vps_instance_id: Some("stale-prev-id".to_string()),
+            public_ip: Some("203.0.113.1".to_string()),
+            vps_ip: Some("100.64.99.99".to_string()),
+            tailscale_ip: Some("100.64.99.99".to_string()),
+            tailscale_hostname: Some("fail-node".to_string()),
+            transport_mode: Some("tailscale".to_string()),
+            username: Some("deploy".to_string()),
+            sudo_password: Some("FailPass99".to_string()),
+            ..Default::default()
+        })?;
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.build_dry_run = false;
+        app.execute_build_with_ui(|_| {});
+
+        assert!(app.logs.iter().any(|l| l.contains("[ERROR] Provision failed:")));
+        assert!(app.status_message.contains("Provision failed:"));
+
+        let saved = state.load_session()?;
+        assert_eq!(saved.vps_instance_id.as_deref(), Some("vultr-ts-fail-1"));
+        assert_eq!(saved.public_ip.as_deref(), Some("198.51.100.77"));
+        assert_eq!(saved.vps_ip, None);
+        assert_eq!(saved.tailscale_ip, None);
+        assert_eq!(saved.sudo_password.as_deref(), Some("FailPass99"));
+
+        assert_eq!(app.session.vps_instance_id.as_deref(), Some("vultr-ts-fail-1"));
+        assert_eq!(app.session.public_ip.as_deref(), Some("198.51.100.77"));
+        assert_eq!(app.session.vps_ip, None);
+        assert_eq!(app.session.tailscale_ip, None);
+
+        assert_eq!(
+            settings
+                .lookup_instance_password(
+                    Some("vultr-ts-fail-1"),
+                    Some("fail-node"),
+                    Some("198.51.100.77"),
+                )?
+                .as_deref(),
+            Some("FailPass99")
+        );
+
+        let bottom_masked = render_to_string(&app);
+        assert!(bottom_masked.contains("Public IP:     198.51.100.77 | Target: (not set)"));
+        assert!(bottom_masked.contains("Tailscale IP:  (not set)"));
+        assert!(bottom_masked.contains("Sudo Pass:"));
+        assert!(!bottom_masked.contains("FailPass99"));
+
+        app.show_password = true;
+        let bottom_revealed = render_to_string(&app);
+        assert!(bottom_revealed.contains("FailPass99"));
+
+        let running_inst = ProviderInstance {
+            provider: ProviderKind::Vultr,
+            id: "vultr-ts-fail-1".to_string(),
+            name: "fail-node".to_string(),
+            status: "active".to_string(),
+            public_ip: Some("198.51.100.77".to_string()),
+            region: Some("ewr".to_string()),
+            plan: Some("vc2-1c-1gb".to_string()),
+            created_at: None,
+        };
+        assert_eq!(
+            app.password_for_instance(&running_inst).as_deref(),
+            Some("FailPass99")
+        );
+        app.running_instances = vec![running_inst];
+        app.screen = Screen::RunningInstances;
+        let running_screen = render_to_string(&app);
+        assert!(running_screen.contains("vultr-ts-fail-1"));
+        assert!(running_screen.contains("198.51.100.77"));
+        assert!(running_screen.contains("FailPass99"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_build_with_ui_destroys_stale_active_vm_absent_from_tailscale_and_creates_fresh_build(
+    ) -> Result<()> {
+        use std::fs::{self, File};
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+
+        let _lock = crate::env_lock();
+        let _guard = TestEnvGuard::new(&[
+            "VULTR_API_BASE_URL",
+            "TAILSCALE_API_BASE",
+            "BAB_SSH_BIN",
+            "BAB_SSH_POLL_MS",
+        ]);
+
+        let vultr_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let vultr_events_bg = Arc::clone(&vultr_events);
+        let deleted_stale = Arc::new(AtomicBool::new(false));
+        let deleted_stale_bg = Arc::clone(&deleted_stale);
+        let created_fresh = Arc::new(AtomicBool::new(false));
+        let created_fresh_bg = Arc::clone(&created_fresh);
+        let ts_key_created = Arc::new(AtomicBool::new(false));
+        let ts_key_bg = Arc::clone(&ts_key_created);
+
+        let vultr_srv = MockHttpServer::spawn(move |method, path, body| {
+            vultr_events_bg
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", method, path));
+            match (method, path) {
+                ("GET", "/v2/instances") => (
+                    "200 OK",
+                    r#"{"instances":[{"id":"vultr-stale-1","label":"stale-node","status":"active","power_status":"running","main_ip":"203.0.113.10","region":"ewr","plan":"vc2-1c-1gb"}],"meta":{"links":{"next":""}}}"#
+                        .to_string(),
+                ),
+                ("DELETE", "/v2/instances/vultr-stale-1") => {
+                    deleted_stale_bg.store(true, Ordering::SeqCst);
+                    ("204 No Content", String::new())
+                }
+                ("POST", "/v2/instances") => {
+                    assert!(
+                        body.contains("user_data"),
+                        "expected cloud-init user_data in POST /v2/instances body"
+                    );
+                    created_fresh_bg.store(true, Ordering::SeqCst);
+                    (
+                        "202 Accepted",
+                        r#"{"instance":{"id":"vultr-fresh-2","label":"stale-node","status":"pending","power_status":"stopped","main_ip":"0.0.0.0"}}"#
+                            .to_string(),
+                    )
+                }
+                ("GET", "/v2/instances/vultr-fresh-2") => (
+                    "200 OK",
+                    r#"{"instance":{"id":"vultr-fresh-2","label":"stale-node","status":"active","power_status":"running","main_ip":"203.0.113.88"}}"#
+                        .to_string(),
+                ),
+                _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+            }
+        })?;
+
+        let ts_srv = MockHttpServer::spawn(move |method, path, _body| match (method, path) {
+            ("GET", "/tailnet/-/devices") => {
+                if !ts_key_bg.load(Ordering::SeqCst) {
+                    ("200 OK", r#"{"devices":[]}"#.to_string())
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"devices":[{"id":"ts-fresh-2","hostname":"stale-node","name":"stale-node.tailnet.ts.net","addresses":["100.64.22.2"],"online":true}]}"#
+                            .to_string(),
+                    )
+                }
+            }
+            ("POST", "/tailnet/-/keys") => {
+                ts_key_bg.store(true, Ordering::SeqCst);
+                (
+                    "200 OK",
+                    r#"{"id":"key-fresh","key":"tskey-auth-fresh"}"#.to_string(),
+                )
+            }
+            _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+        })?;
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+        let mock_ssh = dir.path().join("mock-ssh.sh");
+        {
+            let mut f = File::create(&mock_ssh)?;
+            writeln!(f, "#!/bin/sh\ncat >/dev/null\necho ok\nexit 0")?;
+        }
+        fs::set_permissions(&mock_ssh, fs::Permissions::from_mode(0o755))?;
+
+        std::env::set_var(
+            "VULTR_API_BASE_URL",
+            format!("http://{}/v2", vultr_srv.addr),
+        );
+        std::env::set_var("TAILSCALE_API_BASE", format!("http://{}", ts_srv.addr));
+        std::env::set_var("BAB_SSH_BIN", &mock_ssh);
+        std::env::set_var("BAB_SSH_POLL_MS", "5");
+
+        let settings = Settings::new(&settings_path);
+        settings.set_vultr_api_key("vultr-test-key")?;
+        settings.set_tailscale_api_key("ts-test-key")?;
+
+        let state = SessionState::new(&state_path);
+        state.save_session(&SessionData {
+            vps_provider: Some("vultr".to_string()),
+            vps_instance_id: Some("vultr-stale-1".to_string()),
+            public_ip: Some("203.0.113.10".to_string()),
+            vps_ip: Some("100.64.1.1".to_string()),
+            tailscale_ip: Some("100.64.1.1".to_string()),
+            tailscale_hostname: Some("stale-node".to_string()),
+            transport_mode: Some("tailscale".to_string()),
+            username: Some("deploy".to_string()),
+            sudo_password: Some("FreshPass1".to_string()),
+            ..Default::default()
+        })?;
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.build_dry_run = false;
+        app.execute_build_with_ui(|_| {});
+
+        assert!(deleted_stale.load(Ordering::SeqCst));
+        assert!(created_fresh.load(Ordering::SeqCst));
+        let events = vultr_events.lock().unwrap().clone();
+        let delete_pos = events
+            .iter()
+            .position(|e| e == "DELETE /v2/instances/vultr-stale-1")
+            .expect("DELETE /v2/instances/vultr-stale-1 recorded");
+        let create_pos = events
+            .iter()
+            .position(|e| e == "POST /v2/instances")
+            .expect("POST /v2/instances recorded");
+        assert!(delete_pos < create_pos);
+
+        assert!(app.logs.iter().any(|l| {
+            l.contains("[PROVISION] Existing Vultr instance 'stale-node' (id=vultr-stale-1) is not on Tailscale; destroying stale instance before creating a fresh one...")
+        }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[PROVISION] Vultr ready: instance=vultr-fresh-2, ip=100.64.22.2")));
+        assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
+
+        assert_eq!(app.session.vps_instance_id.as_deref(), Some("vultr-fresh-2"));
+        assert_eq!(app.session.public_ip.as_deref(), Some("203.0.113.88"));
+        assert_eq!(app.session.tailscale_ip.as_deref(), Some("100.64.22.2"));
+        assert_eq!(app.session.vps_ip.as_deref(), Some("100.64.22.2"));
+
+        let saved = state.load_session()?;
+        assert_eq!(saved.vps_instance_id.as_deref(), Some("vultr-fresh-2"));
+        assert_eq!(saved.public_ip.as_deref(), Some("203.0.113.88"));
+        assert_eq!(saved.tailscale_ip.as_deref(), Some("100.64.22.2"));
+        assert_eq!(saved.vps_ip.as_deref(), Some("100.64.22.2"));
+        assert_eq!(
+            settings
+                .lookup_instance_password(
+                    Some("vultr-fresh-2"),
+                    Some("stale-node"),
+                    Some("203.0.113.88"),
+                )?
+                .as_deref(),
+            Some("FreshPass1")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_build_with_ui_reuses_existing_active_vm_present_on_tailscale() -> Result<()> {
+        use std::fs::{self, File};
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let _lock = crate::env_lock();
+        let _guard = TestEnvGuard::new(&[
+            "VULTR_API_BASE_URL",
+            "TAILSCALE_API_BASE",
+            "BAB_SSH_BIN",
+            "BAB_SSH_POLL_MS",
+        ]);
+
+        let destroyed_or_created = Arc::new(AtomicBool::new(false));
+        let destroyed_or_created_bg = Arc::clone(&destroyed_or_created);
+
+        let vultr_srv = MockHttpServer::spawn(move |method, path, _body| match (method, path) {
+            ("GET", "/v2/instances") => (
+                "200 OK",
+                r#"{"instances":[{"id":"vultr-live-1","label":"live-node","status":"active","power_status":"running","main_ip":"203.0.113.55","region":"ewr","plan":"vc2-1c-1gb"}],"meta":{"links":{"next":""}}}"#
+                    .to_string(),
+            ),
+            ("DELETE", _) | ("POST", "/v2/instances") => {
+                destroyed_or_created_bg.store(true, Ordering::SeqCst);
+                ("500 Internal Server Error", r#"{"error":"unexpected"}"#.to_string())
+            }
+            _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+        })?;
+
+        let ts_srv = MockHttpServer::spawn(|method, path, _body| match (method, path) {
+            ("GET", "/tailnet/-/devices") => (
+                "200 OK",
+                r#"{"devices":[{"id":"ts-live-1","hostname":"live-node","name":"live-node.tailnet.ts.net","addresses":["100.64.33.3"],"online":true}]}"#
+                    .to_string(),
+            ),
+            _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
+        })?;
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+        let mock_ssh = dir.path().join("mock-ssh.sh");
+        {
+            let mut f = File::create(&mock_ssh)?;
+            writeln!(f, "#!/bin/sh\ncat >/dev/null\necho ok\nexit 0")?;
+        }
+        fs::set_permissions(&mock_ssh, fs::Permissions::from_mode(0o755))?;
+
+        std::env::set_var(
+            "VULTR_API_BASE_URL",
+            format!("http://{}/v2", vultr_srv.addr),
+        );
+        std::env::set_var("TAILSCALE_API_BASE", format!("http://{}", ts_srv.addr));
+        std::env::set_var("BAB_SSH_BIN", &mock_ssh);
+        std::env::set_var("BAB_SSH_POLL_MS", "5");
+
+        let settings = Settings::new(&settings_path);
+        settings.set_vultr_api_key("vultr-test-key")?;
+        settings.set_tailscale_api_key("ts-test-key")?;
+
+        let state = SessionState::new(&state_path);
+        state.save_session(&SessionData {
+            vps_provider: Some("vultr".to_string()),
+            tailscale_hostname: Some("live-node".to_string()),
+            transport_mode: Some("tailscale".to_string()),
+            username: Some("deploy".to_string()),
+            sudo_password: Some("ReusePass1".to_string()),
+            ..Default::default()
+        })?;
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.build_dry_run = false;
+        app.execute_build_with_ui(|_| {});
+
+        assert!(!destroyed_or_created.load(Ordering::SeqCst));
+        assert!(app.logs.iter().any(|l| {
+            l.contains("[PROVISION] Reusing existing Vultr instance 'live-node' (id=vultr-live-1, public_ip=203.0.113.55)")
+        }));
+        assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
+        assert_eq!(app.session.vps_instance_id.as_deref(), Some("vultr-live-1"));
+        assert_eq!(app.session.public_ip.as_deref(), Some("203.0.113.55"));
+        assert_eq!(app.session.tailscale_ip.as_deref(), Some("100.64.33.3"));
+        assert_eq!(app.session.vps_ip.as_deref(), Some("100.64.33.3"));
+
+        let saved = state.load_session()?;
+        assert_eq!(saved.vps_instance_id.as_deref(), Some("vultr-live-1"));
+        assert_eq!(saved.tailscale_ip.as_deref(), Some("100.64.33.3"));
+        assert_eq!(
+            settings
+                .lookup_instance_password(
+                    Some("vultr-live-1"),
+                    Some("live-node"),
+                    Some("203.0.113.55"),
+                )?
+                .as_deref(),
+            Some("ReusePass1")
+        );
         Ok(())
     }
 }

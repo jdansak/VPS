@@ -401,6 +401,42 @@ pub fn provision_full_flow(
     provision_full_flow_with_progress(provider, tailscale, cfg, session, |_| {})
 }
 
+/// Populates provisioning configuration metadata onto `SessionData`, preserving any existing
+/// `sudo_password` when `cfg.sudo_password` is `None` or blank.
+fn populate_provision_session_data(
+    data: &mut SessionData,
+    cfg: &ProvisionConfig,
+    provider_kind: ProviderKind,
+    instance_id: &str,
+    transport_mode: &str,
+) {
+    data.vps_instance_id = Some(instance_id.to_string());
+    data.vps_provider = Some(provider_kind.to_string());
+    data.tailscale_hostname = Some(cfg.hostname.clone());
+    data.username = Some(cfg.username.clone());
+    data.transport_mode = Some(transport_mode.to_string());
+    data.server_role = Some(cfg.role.clone());
+    data.vps_region = Some(cfg.region.clone());
+    data.vps_plan = Some(cfg.plan.clone());
+    data.vps_image = Some(cfg.image_id.clone());
+    if let Some(pw) = cfg.sudo_password.as_deref().and_then(non_empty_trimmed) {
+        data.sudo_password = Some(pw);
+    }
+}
+
+/// Loads `SessionData` (or defaults), applies `update`, and persists it when `session` is `Some`.
+fn update_provision_session(
+    session: Option<&SessionState>,
+    update: impl FnOnce(&mut SessionData),
+) -> Result<()> {
+    let Some(ss) = session else {
+        return Ok(());
+    };
+    let mut data = ss.load_session().unwrap_or_else(|_| SessionData::default());
+    update(&mut data);
+    ss.save_session(&data)
+}
+
 /// Executes the full provisioning flow while emitting human-readable progress updates via `on_progress`.
 pub fn provision_full_flow_with_progress<F>(
     provider: &dyn VpsProvider,
@@ -454,6 +490,19 @@ where
         cfg.hostname
     ));
     let instance_id = provider.create_instance(&req)?;
+    let transport_mode = if cfg.tailscale_mode { "tailscale" } else { "ssh" };
+    update_provision_session(session, |data| {
+        populate_provision_session_data(
+            data,
+            cfg,
+            provider.kind(),
+            &instance_id,
+            transport_mode,
+        );
+        data.vps_ip = None;
+        data.public_ip = None;
+        data.tailscale_ip = None;
+    })?;
     on_progress(&format!(
         "[PROVISION] Instance '{}' created; polling {} until active...",
         instance_id,
@@ -487,7 +536,11 @@ where
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let (ip, tailscale_ip, public_ip, session_tailscale_ip, session_public_ip, ssh_key, transport_mode) =
+    update_provision_session(session, |data| {
+        data.public_ip = discovered_public_ip.clone();
+    })?;
+
+    let (ip, tailscale_ip, public_ip, session_tailscale_ip, session_public_ip, ssh_key) =
         if cfg.tailscale_mode {
             let ts = tailscale.expect("validated above");
             let ts_start = std::time::Instant::now();
@@ -515,7 +568,6 @@ where
                 Some(ts_ip),
                 discovered_public_ip,
                 Some("tailscale".to_string()),
-                "tailscale",
             )
         } else {
             let public_ip = discovered_public_ip.ok_or_else(|| {
@@ -524,12 +576,7 @@ where
                     instance_id
                 )
             })?;
-            let ssh_key = cfg
-                .ssh_key_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(String::from);
+            let ssh_key = cfg.ssh_key_path.as_deref().and_then(non_empty_trimmed);
             (
                 public_ip.clone(),
                 String::new(),
@@ -537,35 +584,22 @@ where
                 None,
                 Some(public_ip),
                 ssh_key,
-                "ssh",
             )
         };
 
-    if let Some(ss) = session {
-        let mut data = ss.load_session().unwrap_or_else(|_| SessionData::default());
+    update_provision_session(session, |data| {
+        populate_provision_session_data(
+            data,
+            cfg,
+            provider.kind(),
+            &instance_id,
+            transport_mode,
+        );
         data.vps_ip = Some(ip.clone());
         data.public_ip = session_public_ip;
         data.tailscale_ip = session_tailscale_ip;
         data.ssh_key = ssh_key;
-        data.username = Some(cfg.username.clone());
-        data.transport_mode = Some(transport_mode.to_string());
-        data.vps_provider = Some(provider.kind().to_string());
-        data.vps_instance_id = Some(instance_id.clone());
-        data.tailscale_hostname = Some(cfg.hostname.clone());
-        data.server_role = Some(cfg.role.clone());
-        data.vps_region = Some(cfg.region.clone());
-        data.vps_plan = Some(cfg.plan.clone());
-        data.vps_image = Some(cfg.image_id.clone());
-        if let Some(pw) = cfg
-            .sudo_password
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            data.sudo_password = Some(pw.to_string());
-        }
-        ss.save_session(&data)?;
-    }
+    })?;
 
     Ok(ProvisionResult {
         instance_id,
@@ -1544,6 +1578,134 @@ mod tests {
         provision_full_flow_with_progress(&ssh_provider, None, &ssh_cfg, Some(&session), |_| {})?;
         let after_none = session.load_session()?;
         assert_eq!(after_none.sudo_password.as_deref(), Some("Abc1234567"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn provision_full_flow_with_progress_preserves_partial_session_on_tailscale_timeout(
+    ) -> Result<()> {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            for stream_res in listener.incoming() {
+                if stop_bg.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream_res else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = trimmed.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if content_len > 0 {
+                    let mut buf = vec![0u8; content_len];
+                    let _ = reader.read_exact(&mut buf);
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("");
+                let body = if path.ends_with("/keys") {
+                    r#"{"key":"tskey-auth-timeout"}"#
+                } else {
+                    r#"{"devices":[]}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let ts = TailscaleClient::with_config("ts-api-key", format!("http://{}", addr), "-")?;
+        let provider = MockProvider::new(Some("203.0.113.55"));
+        let tmp = tempfile::NamedTempFile::new()?;
+        let session = SessionState::new(tmp.path());
+        session.save_session(&SessionData {
+            vps_instance_id: Some("old-inst".to_string()),
+            vps_provider: Some("linode".to_string()),
+            tailscale_hostname: Some("old-host".to_string()),
+            vps_ip: Some("100.64.9.9".to_string()),
+            public_ip: Some("198.51.100.99".to_string()),
+            tailscale_ip: Some("100.64.9.9".to_string()),
+            sudo_password: Some("OldPass999".to_string()),
+            ..SessionData::default()
+        })?;
+
+        let mut cfg = base_cfg(true);
+        cfg.tailscale_timeout = Duration::from_millis(20);
+        cfg.poll_interval = Duration::from_millis(2);
+        cfg.sudo_password = Some("TimeoutPass1".to_string());
+
+        let err = provision_full_flow_with_progress(&provider, Some(&ts), &cfg, Some(&session), |_| {})
+            .unwrap_err();
+        assert!(err.to_string().contains("Timed out waiting for device bab-vps"));
+
+        let loaded = session.load_session()?;
+        assert_eq!(loaded.vps_instance_id.as_deref(), Some("inst-123"));
+        assert_eq!(loaded.public_ip.as_deref(), Some("203.0.113.55"));
+        assert_eq!(loaded.vps_provider.as_deref(), Some("vultr"));
+        assert_eq!(loaded.tailscale_hostname.as_deref(), Some("bab-vps"));
+        assert_eq!(loaded.username.as_deref(), Some("deploy"));
+        assert_eq!(loaded.transport_mode.as_deref(), Some("tailscale"));
+        assert_eq!(loaded.server_role.as_deref(), Some("caddy"));
+        assert_eq!(loaded.vps_region.as_deref(), Some("ewr"));
+        assert_eq!(loaded.vps_plan.as_deref(), Some("vc2-1c-1gb"));
+        assert_eq!(loaded.vps_image.as_deref(), Some("2284"));
+        assert_eq!(loaded.sudo_password.as_deref(), Some("TimeoutPass1"));
+        assert_eq!(loaded.vps_ip, None);
+        assert_eq!(loaded.tailscale_ip, None);
+
+        // Blank sudo_password on a subsequent timed-out run preserves existing sudo_password and clears stale IPs.
+        session.set_vps_ip("100.64.8.8")?;
+        session.set_tailscale_ip("100.64.8.8")?;
+        session.set_public_ip("198.51.100.88")?;
+        cfg.sudo_password = Some("   ".to_string());
+
+        let err2 = provision_full_flow_with_progress(&provider, Some(&ts), &cfg, Some(&session), |_| {})
+            .unwrap_err();
+        assert!(err2.to_string().contains("Timed out waiting for device bab-vps"));
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(addr);
+        handle.join().unwrap();
+
+        let preserved = session.load_session()?;
+        assert_eq!(preserved.vps_instance_id.as_deref(), Some("inst-123"));
+        assert_eq!(preserved.public_ip.as_deref(), Some("203.0.113.55"));
+        assert_eq!(preserved.vps_provider.as_deref(), Some("vultr"));
+        assert_eq!(preserved.tailscale_hostname.as_deref(), Some("bab-vps"));
+        assert_eq!(preserved.sudo_password.as_deref(), Some("TimeoutPass1"));
+        assert_eq!(preserved.vps_ip, None);
+        assert_eq!(preserved.tailscale_ip, None);
 
         Ok(())
     }

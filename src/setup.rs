@@ -454,10 +454,10 @@ esac
 if ! id "${{NEW_USER}}" >/dev/null 2>&1; then
     case "${{DISTRO_FAMILY}}" in
         debian)
-            adduser --disabled-password --gecos "" "${{NEW_USER}}"
+            adduser --disabled-password --gecos "" "${{NEW_USER}}" 2>/dev/null || adduser --disabled-password --allow-bad-names --gecos "" "${{NEW_USER}}" 2>/dev/null || adduser --disabled-password --force-badname --gecos "" "${{NEW_USER}}" 2>/dev/null || useradd --badname -m -s /bin/bash "${{NEW_USER}}" 2>/dev/null || useradd -m -s /bin/bash "${{NEW_USER}}"
             ;;
         rhel)
-            useradd -m -s /bin/bash "${{NEW_USER}}"
+            useradd -m -s /bin/bash "${{NEW_USER}}" 2>/dev/null || useradd --badname -m -s /bin/bash "${{NEW_USER}}"
             ;;
     esac
 fi
@@ -467,7 +467,9 @@ if ! id -nG "${{NEW_USER}}" | grep -qw "${{SUDO_GRP}}"; then
 fi
 
 if [ -n "${{SUDO_PASSWORD}}" ]; then
-    printf '%s:%s\n' "${{NEW_USER}}" "${{SUDO_PASSWORD}}" | chpasswd
+    if id -u "${{NEW_USER}}" >/dev/null 2>&1; then
+        printf '%s:%s\n' "${{NEW_USER}}" "${{SUDO_PASSWORD}}" | chpasswd || true
+    fi
 fi
 
 {sudoers_block}
@@ -488,12 +490,12 @@ if [ -n "${{SSH_PUBKEY}}" ] && ! grep -qxF "${{SSH_PUBKEY}}" "${{AUTH_KEYS}}" 2>
     fi
     printf '%s\n' "${{SSH_PUBKEY}}" >> "${{AUTH_KEYS}}"
 fi
-chown -R "${{NEW_USER}}:${{NEW_USER}}" "${{SSH_DIR}}"
+chown -R "${{NEW_USER}}:${{NEW_USER}}" "${{SSH_DIR}}" 2>/dev/null || chown -R "${{NEW_USER}}" "${{SSH_DIR}}" || true
 chmod 700 "${{SSH_DIR}}"
 chmod 600 "${{AUTH_KEYS}}"
 
 mkdir -p "/home/${{NEW_USER}}/apps"
-chown -R "${{NEW_USER}}:${{NEW_USER}}" "/home/${{NEW_USER}}/apps""#
+chown -R "${{NEW_USER}}:${{NEW_USER}}" "/home/${{NEW_USER}}/apps" 2>/dev/null || chown -R "${{NEW_USER}}" "/home/${{NEW_USER}}/apps" || true"#
             );
             wrap_root_script(&cfg.ssh_user, &body)
         }
@@ -1631,5 +1633,34 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn create_user_supports_mixed_case_usernames_and_guards_chpasswd_and_chown() {
+        for ssh_user in ["root", "ubuntu"] {
+            let mut cfg = sample_config(ServerRole::Vanilla, ssh_user, false);
+            cfg.new_username = "Goobey".to_string();
+            cfg.sudo_password = Some("S3cr'et!".to_string());
+            let script = build_step_script(SetupStepKind::CreateUser, &cfg);
+            assert_bash_syntax_ok(&script, &format!("create-user-mixed-case-{ssh_user}"));
+            assert!(script.contains("NEW_USER='Goobey'"));
+            assert!(script.contains(
+                "adduser --disabled-password --gecos \"\" \"${NEW_USER}\" 2>/dev/null || adduser --disabled-password --allow-bad-names --gecos \"\" \"${NEW_USER}\" 2>/dev/null || adduser --disabled-password --force-badname --gecos \"\" \"${NEW_USER}\" 2>/dev/null || useradd --badname -m -s /bin/bash \"${NEW_USER}\" 2>/dev/null || useradd -m -s /bin/bash \"${NEW_USER}\""
+            ));
+            assert!(script.contains(
+                "useradd -m -s /bin/bash \"${NEW_USER}\" 2>/dev/null || useradd --badname -m -s /bin/bash \"${NEW_USER}\""
+            ));
+            assert!(script.contains("if [ -n \"${SUDO_PASSWORD}\" ]; then"));
+            assert!(script.contains("if id -u \"${NEW_USER}\" >/dev/null 2>&1; then"));
+            assert!(script.contains(
+                "printf '%s:%s\\n' \"${NEW_USER}\" \"${SUDO_PASSWORD}\" | chpasswd || true"
+            ));
+            assert!(script.contains(
+                "chown -R \"${NEW_USER}:${NEW_USER}\" \"${SSH_DIR}\" 2>/dev/null || chown -R \"${NEW_USER}\" \"${SSH_DIR}\" || true"
+            ));
+            assert!(script.contains(
+                "chown -R \"${NEW_USER}:${NEW_USER}\" \"/home/${NEW_USER}/apps\" 2>/dev/null || chown -R \"${NEW_USER}\" \"/home/${NEW_USER}/apps\" || true"
+            ));
+        }
     }
 }

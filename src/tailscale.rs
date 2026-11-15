@@ -369,7 +369,9 @@ pub fn generate_cloud_init_with_password(
     let password_block = match password.map(str::trim).filter(|s| !s.is_empty()) {
         Some(pw) => {
             let q_password = shell_quote(pw);
-            format!("\nprintf '%s:%s\\n' {q_username} {q_password} | chpasswd\n")
+            format!(
+                "\nif id -u {q_username} >/dev/null 2>&1; then\n  printf '%s:%s\\n' {q_username} {q_password} | chpasswd || true\nfi\n"
+            )
         }
         None => String::new(),
     };
@@ -387,12 +389,12 @@ fi
 # Create user if missing
 if ! id -u {q_username} >/dev/null 2>&1; then
   if [ -f /etc/debian_version ]; then
-    adduser --disabled-password --gecos "" {q_username} || true
+    adduser --disabled-password --gecos "" {q_username} 2>/dev/null || adduser --disabled-password --allow-bad-names --gecos "" {q_username} 2>/dev/null || adduser --disabled-password --force-badname --gecos "" {q_username} 2>/dev/null || useradd --badname -m -s /bin/bash {q_username} 2>/dev/null || useradd -m -s /bin/bash {q_username} || true
     if getent group sudo >/dev/null 2>&1; then
       usermod -aG sudo {q_username} || true
     fi
   else
-    useradd -m -s /bin/bash {q_username} || true
+    useradd -m -s /bin/bash {q_username} 2>/dev/null || useradd --badname -m -s /bin/bash {q_username} || true
     if getent group sudo >/dev/null 2>&1; then
       usermod -aG sudo {q_username} || true
     elif getent group wheel >/dev/null 2>&1; then
@@ -415,7 +417,7 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 
 # Bring up Tailscale
-tailscale up --authkey={q_auth_key} --ssh --hostname={q_hostname}
+tailscale up --authkey={q_auth_key} --ssh --hostname={q_hostname} || (sleep 3 && tailscale up --authkey={q_auth_key} --ssh --hostname={q_hostname})
 "#,
         q_hostname = q_hostname,
         q_username = q_username,
@@ -446,7 +448,9 @@ pub fn generate_ssh_cloud_init_with_password(
     let password_block = match password.map(str::trim).filter(|s| !s.is_empty()) {
         Some(pw) => {
             let q_password = shell_quote(pw);
-            format!("\n  printf '%s:%s\\n' \"$NEW_USER\" {q_password} | chpasswd")
+            format!(
+                "\n  if id -u \"$NEW_USER\" >/dev/null 2>&1; then\n    printf '%s:%s\\n' \"$NEW_USER\" {q_password} | chpasswd || true\n  fi"
+            )
         }
         None => String::new(),
     };
@@ -479,7 +483,7 @@ fi
 # Create non-root user if missing and configure sudoers
 if [ "$NEW_USER" != "root" ]; then
   if ! id -u "$NEW_USER" >/dev/null 2>&1; then
-    useradd -m -s /bin/bash "$NEW_USER"
+    useradd -m -s /bin/bash "$NEW_USER" 2>/dev/null || useradd --badname -m -s /bin/bash "$NEW_USER" 2>/dev/null || adduser --disabled-password --allow-bad-names --gecos "" "$NEW_USER" 2>/dev/null || adduser --disabled-password --force-badname --gecos "" "$NEW_USER" 2>/dev/null || adduser --disabled-password --gecos "" "$NEW_USER" 2>/dev/null || true
   fi
   if [ -n "$SUDO_GROUP" ]; then
     usermod -aG "$SUDO_GROUP" "$NEW_USER" || true
@@ -508,7 +512,7 @@ if [ "$NEW_USER" != "root" ]; then
   if ! grep -Fqx "$SSH_PUBKEY" "${{USER_SSH_DIR}}/authorized_keys"; then
     printf '%s\n' "$SSH_PUBKEY" >> "${{USER_SSH_DIR}}/authorized_keys"
   fi
-  chown -R "${{NEW_USER}}:${{NEW_USER}}" "$USER_SSH_DIR"
+  chown -R "${{NEW_USER}}:${{NEW_USER}}" "$USER_SSH_DIR" 2>/dev/null || chown -R "${{NEW_USER}}" "$USER_SSH_DIR" || true
 fi
 "#,
         q_hostname = q_hostname,
@@ -1099,5 +1103,65 @@ mod tests {
             generate_ssh_cloud_init_with_password(pubkey, "ssh-vps", "deploy", Some("  \t "));
         assert!(!blank_pw.contains("chpasswd"));
         assert_valid_bash(&blank_pw);
+    }
+
+    #[test]
+    fn cloud_init_supports_mixed_case_usernames_and_guards_chpasswd_and_tailscale_up() {
+        let with_pw = generate_cloud_init_with_password(
+            "tskey-auth-123",
+            "edge-vps",
+            "Goobey",
+            Some("MyS3cr'et!"),
+        );
+        assert!(with_pw.contains("if ! id -u 'Goobey' >/dev/null 2>&1; then"));
+        assert!(with_pw.contains(
+            "adduser --disabled-password --gecos \"\" 'Goobey' 2>/dev/null || adduser --disabled-password --allow-bad-names --gecos \"\" 'Goobey' 2>/dev/null || adduser --disabled-password --force-badname --gecos \"\" 'Goobey' 2>/dev/null || useradd --badname -m -s /bin/bash 'Goobey' 2>/dev/null || useradd -m -s /bin/bash 'Goobey' || true"
+        ));
+        assert!(with_pw.contains(
+            "useradd -m -s /bin/bash 'Goobey' 2>/dev/null || useradd --badname -m -s /bin/bash 'Goobey' || true"
+        ));
+        assert!(with_pw.contains("'/etc/sudoers.d/Goobey'"));
+        assert!(with_pw.contains("if id -u 'Goobey' >/dev/null 2>&1; then"));
+        assert!(with_pw.contains("printf '%s:%s\\n' 'Goobey' 'MyS3cr'\\''et!' | chpasswd || true"));
+        assert!(with_pw.contains(
+            "tailscale up --authkey='tskey-auth-123' --ssh --hostname='edge-vps' || (sleep 3 && tailscale up --authkey='tskey-auth-123' --ssh --hostname='edge-vps')"
+        ));
+        assert_valid_bash(&with_pw);
+
+        let without_pw = generate_cloud_init("tskey-auth-123", "edge-vps", "Goobey");
+        assert!(!without_pw.contains("chpasswd"));
+        assert!(without_pw.contains("--allow-bad-names"));
+        assert!(without_pw.contains("--force-badname"));
+        assert!(without_pw.contains("useradd --badname -m -s /bin/bash 'Goobey'"));
+        assert!(without_pw.contains("(sleep 3 && tailscale up --authkey='tskey-auth-123' --ssh --hostname='edge-vps')"));
+        assert_valid_bash(&without_pw);
+    }
+
+    #[test]
+    fn ssh_cloud_init_supports_mixed_case_usernames_and_guards_chpasswd_and_chown() {
+        let pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey Goobey@workstation";
+        let with_pw = generate_ssh_cloud_init_with_password(
+            pubkey,
+            "ssh-vps",
+            "Goobey",
+            Some("Pass'123"),
+        );
+        assert!(with_pw.contains("NEW_USER='Goobey'"));
+        assert!(with_pw.contains(
+            "useradd -m -s /bin/bash \"$NEW_USER\" 2>/dev/null || useradd --badname -m -s /bin/bash \"$NEW_USER\" 2>/dev/null || adduser --disabled-password --allow-bad-names --gecos \"\" \"$NEW_USER\" 2>/dev/null || adduser --disabled-password --force-badname --gecos \"\" \"$NEW_USER\" 2>/dev/null || adduser --disabled-password --gecos \"\" \"$NEW_USER\" 2>/dev/null || true"
+        ));
+        assert!(with_pw.contains("if id -u \"$NEW_USER\" >/dev/null 2>&1; then"));
+        assert!(with_pw.contains("printf '%s:%s\\n' \"$NEW_USER\" 'Pass'\\''123' | chpasswd || true"));
+        assert!(with_pw.contains(
+            "chown -R \"${NEW_USER}:${NEW_USER}\" \"$USER_SSH_DIR\" 2>/dev/null || chown -R \"${NEW_USER}\" \"$USER_SSH_DIR\" || true"
+        ));
+        assert!(!with_pw.to_ascii_lowercase().contains("tailscale"));
+        assert_valid_bash(&with_pw);
+
+        let without_pw = generate_ssh_cloud_init(pubkey, "ssh-vps", "Goobey");
+        assert!(!without_pw.contains("chpasswd"));
+        assert!(without_pw.contains("--allow-bad-names"));
+        assert!(without_pw.contains("--force-badname"));
+        assert_valid_bash(&without_pw);
     }
 }
