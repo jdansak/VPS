@@ -1228,6 +1228,7 @@ fn setup_runner_all_roles_over_tailscale_transport_via_with_bins() -> Result<()>
             ssh_pubkey: None,
             dry_run: false,
             github_deploy: None,
+            sudo_nopasswd: true,
         };
         let runner = SetupRunner::new(&transport, Some(&session));
         let mut steps_seen = Vec::new();
@@ -1327,6 +1328,7 @@ fn setup_runner_respects_bab_ssh_bin_env_var_serialized() -> Result<()> {
         ssh_pubkey: None,
         dry_run: false,
         github_deploy: None,
+        sudo_nopasswd: true,
     };
 
     let reports = runner.run_all(&cfg, |_| {})?;
@@ -1462,6 +1464,7 @@ fn setup_runner_vanilla_both_transport_modes_end_to_end() -> Result<()> {
             },
             dry_run: false,
             github_deploy: None,
+            sudo_nopasswd: true,
         };
 
         let reports = runner.run_all(&cfg, |_| {})?;

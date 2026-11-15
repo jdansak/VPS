@@ -28,6 +28,7 @@ pub struct SetupConfig {
     pub ssh_pubkey: Option<String>,
     pub dry_run: bool,
     pub github_deploy: Option<GithubDeployConfig>,
+    pub sudo_nopasswd: bool,
 }
 
 /// Ordered stages of the remote server setup workflow.
@@ -418,6 +419,16 @@ esac"#
                     .map(str::trim)
                     .unwrap_or(""),
             );
+            let sudoers_block = if cfg.sudo_nopasswd {
+                r#"if [ ! -f "/etc/sudoers.d/${NEW_USER}" ]; then
+    echo "${NEW_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${NEW_USER}"
+    chmod 440 "/etc/sudoers.d/${NEW_USER}"
+fi"#
+            } else {
+                r#"if [ "${SSH_USER}" = "root" ]; then
+    rm -f "/etc/sudoers.d/${NEW_USER}"
+fi"#
+            };
             let distro = distro_detect_block();
             let body = format!(
                 r#"{distro}
@@ -446,10 +457,7 @@ if ! id -nG "${{NEW_USER}}" | grep -qw "${{SUDO_GRP}}"; then
     usermod -aG "${{SUDO_GRP}}" "${{NEW_USER}}"
 fi
 
-if [ ! -f "/etc/sudoers.d/${{NEW_USER}}" ]; then
-    echo "${{NEW_USER}} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${{NEW_USER}}"
-    chmod 440 "/etc/sudoers.d/${{NEW_USER}}"
-fi
+{sudoers_block}
 
 SSH_DIR="/home/${{NEW_USER}}/.ssh"
 AUTH_KEYS="${{SSH_DIR}}/authorized_keys"
@@ -645,6 +653,13 @@ esac"#
             };
             let quoted_transport = shell_quote(transport_label);
             let quoted_user = shell_quote(&cfg.new_username);
+            let sudoers_cleanup = if cfg.sudo_nopasswd {
+                String::new()
+            } else {
+                format!(
+                    "\n\nNEW_USER={quoted_user}\nrm -f \"/etc/sudoers.d/${{NEW_USER}}\""
+                )
+            };
             let body = format!(
                 r##"{distro}
 
@@ -725,7 +740,7 @@ case "${{DISTRO_FAMILY}}" in
         printf '%s\n' "${{MOTD_SCRIPT}}" > /etc/profile.d/vps-dashboard.sh
         chmod +x /etc/profile.d/vps-dashboard.sh
         ;;
-esac"##
+esac{sudoers_cleanup}"##
             );
             wrap_root_script(&cfg.ssh_user, &body)
         }
@@ -911,6 +926,7 @@ mod tests {
             ssh_pubkey: None,
             dry_run,
             github_deploy: None,
+            sudo_nopasswd: true,
         }
     }
 
@@ -1481,5 +1497,43 @@ mod tests {
             assert!(lines[1].contains("deploy@100.64.0.50") && lines[1].ends_with("|SUDO:yes"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn create_user_respects_sudo_nopasswd_true_and_false() {
+        let mut cfg_true = sample_config(ServerRole::Vanilla, "root", false);
+        cfg_true.sudo_nopasswd = true;
+        let script_true = build_step_script(SetupStepKind::CreateUser, &cfg_true);
+        assert_bash_syntax_ok(&script_true, "create-user-sudo-nopasswd-true");
+        assert!(script_true.contains("usermod -aG \"${SUDO_GRP}\" \"${NEW_USER}\""));
+        assert!(script_true.contains("echo \"${NEW_USER} ALL=(ALL) NOPASSWD:ALL\" > \"/etc/sudoers.d/${NEW_USER}\""));
+        assert!(script_true.contains("chmod 440 \"/etc/sudoers.d/${NEW_USER}\""));
+
+        let mut cfg_false = sample_config(ServerRole::Vanilla, "root", false);
+        cfg_false.sudo_nopasswd = false;
+        let script_false = build_step_script(SetupStepKind::CreateUser, &cfg_false);
+        assert_bash_syntax_ok(&script_false, "create-user-sudo-nopasswd-false");
+        assert!(!script_false.contains("NOPASSWD:ALL"));
+        assert!(script_false.contains("usermod -aG \"${SUDO_GRP}\" \"${NEW_USER}\""));
+        assert!(script_false.contains("if [ \"${SSH_USER}\" = \"root\" ]; then"));
+        assert!(script_false.contains("rm -f \"/etc/sudoers.d/${NEW_USER}\""));
+    }
+
+    #[test]
+    fn configure_motd_cleans_up_sudoers_only_when_sudo_nopasswd_false() {
+        for ssh_user in ["root", "ubuntu"] {
+            let mut cfg_true = sample_config(ServerRole::Vanilla, ssh_user, false);
+            cfg_true.sudo_nopasswd = true;
+            let script_true = build_step_script(SetupStepKind::ConfigureMotd, &cfg_true);
+            assert_bash_syntax_ok(&script_true, &format!("motd-sudo-nopasswd-true-{ssh_user}"));
+            assert!(!script_true.contains("/etc/sudoers.d/"));
+
+            let mut cfg_false = sample_config(ServerRole::Vanilla, ssh_user, false);
+            cfg_false.sudo_nopasswd = false;
+            let script_false = build_step_script(SetupStepKind::ConfigureMotd, &cfg_false);
+            assert_bash_syntax_ok(&script_false, &format!("motd-sudo-nopasswd-false-{ssh_user}"));
+            assert!(script_false.contains("NEW_USER='deploy'"));
+            assert!(script_false.contains("rm -f \"/etc/sudoers.d/${NEW_USER}\""));
+        }
     }
 }

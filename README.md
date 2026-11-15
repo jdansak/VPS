@@ -5,16 +5,17 @@
 ## Highlights
 
 - **Pure Rust TUI & CLI (`bab`)**: Interactive `ratatui` terminal UI (`bab` / `bab tui`) plus scriptable CLI subcommands (`setup`, `instances` / `ps` / `list`, `destroy` / `rm` / `delete`, `catalog`, `dns`, `deploy`, `roles`, `cloud-init`, `devices`, `settings`, `status`).
-- **Interactive TUI (9-Item Home Menu)**:
+- **Interactive TUI (10-Item Home Menu)**:
   1. **Select Provider, Location & Size**
   2. **Select Server Role**
-  3. **Access, User & Transport**
+  3. **Access, User & Transport** (includes synced `SUDO_NOPASSWD` Passwordless Sudo ON/OFF toggle)
   4. **Cloudflare DNS** (includes synced `CF_ENABLED` ON/OFF toggle)
   5. **GitHub Repo Deployment** (includes synced `GITHUB_ENABLED` ON/OFF toggle)
   6. **API Key Settings** (auto-saves encrypted keys as you edit)
-  7. **Build Box with Current Options** (`Screen::BuildBox`): review current configuration, toggle Cloudflare DNS ON/OFF (`d` / `Space`) and GitHub Repo Deployment ON/OFF (`g`), toggle Dry-Run (`n`), and run provisioning + setup (`Enter` / `x`). Bright green (`ON`) and bright red (`OFF`) toggle indicators stay synced across **Cloudflare DNS**, **GitHub Repo Deployment**, and **Build Box with Current Options**.
+  7. **Build Box with Current Options** (`Screen::BuildBox`): review current configuration, toggle Cloudflare DNS ON/OFF (`d` / `Space`), GitHub Repo Deployment ON/OFF (`g`), and Passwordless Sudo ON/OFF (`p`), toggle Dry-Run (`n`), and run provisioning + setup (`Enter` / `x`). Bright green (`ON`) and bright red (`OFF`) toggle indicators stay synced across **Access, User & Transport**, **Cloudflare DNS**, **GitHub Repo Deployment**, and **Build Box with Current Options**.
   8. **Running Systems & Destroy** (`Screen::RunningInstances`): query live instances across configured Vultr, UpCloud, and Linode accounts (`r` to refresh), inspect status/IPs/region/plan, and destroy selected instances (`d` / `x` / `Delete` with `y`/`Enter` confirmation).
-  9. **Quit** (`9` or `q` on the Home screen).
+  9. **`[9]` View Log** (`Screen::ViewLog`): inspect persistent timestamped logs stored in `~/.config/bab/bab.log` (`j`/`k` or `Up`/`Down` to scroll, `PgUp`/`PgDn` to page, `g`/`G` to jump to top/bottom, `r` to reload from disk, `c` to clear).
+  10. **`[0]` Quit** (`0` or `q` on the Home screen).
   - **Consistent Back Navigation**: Pressing `q`, `Esc`, or `b` from any submenu returns to the **Home** screen instead of exiting the application (when not editing a field or confirming an action).
 - **Four Server Roles**:
   1. **Vanilla (`vanilla`)**: Plain hardened base OS with system updates, non-root `sudo` user, SSH/Tailscale hardening, firewall (`ufw`/`firewalld`), Fail2ban, and unattended security upgrades — without Docker, Caddy, or WireGuard.
@@ -43,14 +44,14 @@
 
 ## Non-Root `sudo` User Configuration
 
-`bab` always creates a non-root administrative user on the target VPS, adds it to the `sudo` (Debian/Ubuntu) or `wheel` (RHEL/AlmaLinux/Rocky/Fedora) group, configures passwordless sudo via `/etc/sudoers.d/<username>` (`0440`), and installs your SSH authorized keys for that user.
+`bab` always creates a non-root administrative user on the target VPS, adds it to the `sudo` (Debian/Ubuntu) or `wheel` (RHEL/AlmaLinux/Rocky/Fedora) group, configures passwordless sudo (`NOPASSWD:ALL`) via `/etc/sudoers.d/<username>` (`0440`) when **Passwordless Sudo (`SUDO_NOPASSWD`)** is `ON` (or removes `/etc/sudoers.d/<username>` after setup completes when `OFF` so `sudo` prompts for a password), and installs your SSH authorized keys for that user.
 
-Where the username is set:
+Where the username and passwordless sudo setting are configured:
 
-- **Default**: `deploy`
-- **TUI**: Select **Access, User & Transport** from the Home menu and edit **Sudo Username** (`'s'` to save).
-- **CLI**: Pass `--user <USERNAME>` on `bab setup`, `bab deploy`, or `bab cloud-init`.
-- **State File**: Saved as `USERNAME` in `~/.config/bab/state.conf` (override path with `BAB_STATE_FILE` / `BAB_CONFIG_DIR`).
+- **Default**: username `deploy`, passwordless sudo `ON` (`SUDO_NOPASSWD=true`)
+- **TUI**: Select **Access, User & Transport** (`[3]`) from the Home menu to edit **Sudo Username** (`'s'` to save) or toggle **Passwordless Sudo** ON/OFF (`Space`/`Enter`/`Left`/`Right` on that field or `'p'`), or press `'p'` on **Build Box with Current Options** (`[7]`).
+- **CLI**: Pass `--user <USERNAME>` on `bab setup`, `bab deploy`, or `bab cloud-init`, and pass `--sudo-nopasswd` or `--no-sudo-nopasswd` on `bab setup` (overrides saved `SUDO_NOPASSWD`).
+- **State File**: Saved as `USERNAME` and `SUDO_NOPASSWD` in `~/.config/bab/state.conf` (override path with `BAB_STATE_FILE` / `BAB_CONFIG_DIR`).
 
 ## Quick Start
 
@@ -120,6 +121,10 @@ bab setup --provider existing --no-cf-dns --dry-run
 bab setup --provider existing --github-deploy --dry-run
 bab setup --provider existing --no-github-deploy --dry-run
 
+# Require a password for sudo (--no-sudo-nopasswd) or grant passwordless NOPASSWD:ALL (--sudo-nopasswd)
+bab setup --provider existing --no-sudo-nopasswd --dry-run
+bab setup --provider existing --sudo-nopasswd --dry-run
+
 # List running instances across configured cloud providers (aliases: ps, list)
 bab instances
 bab ps --provider vultr --all
@@ -142,7 +147,8 @@ bab status
 - **`~/.config/bab/`** (`0700`): Default configuration directory (override with `BAB_CONFIG_DIR` or legacy `BAB_SSH_DIR` / `VPSKIT_SSH_DIR` / `SSH_DIR`).
 - **`~/.config/bab/credentials.enc`** (`0600`): `ChaCha20-Poly1305` (`enc:v1:`) encrypted API keys and tokens (`TAILSCALE_API_KEY`, `VULTR_API_KEY`, `UPCLOUD_API_TOKEN`, `LINODE_API_TOKEN`, `CLOUDFLARE_API_TOKEN`, `GITHUB_TOKEN`; override path with `BAB_SETTINGS_FILE`).
 - **`~/.config/bab/master.key`** (`0600`): Auto-generated 256-bit base64 master key used for `credentials.enc` (override path with `BAB_MASTER_KEY_FILE`, or set `BAB_ENCRYPTION_KEY` to derive the key from a passphrase instead of using `master.key`).
-- **`~/.config/bab/state.conf`** (`0600`): Saved session state including `VPS_IP`, `PUBLIC_IP`, `TAILSCALE_IP`, `SSH_KEY`, `USERNAME`, `TRANSPORT_MODE`, `VPS_PROVIDER`, `VPS_INSTANCE_ID`, `VPS_REGION`, `VPS_PLAN`, `VPS_IMAGE`, `TAILSCALE_HOSTNAME`, `SERVER_ROLE`, `CF_ZONE`, `CF_RECORD`, `CF_TARGET`, `CF_PROXIED`, `CF_ENABLED`, `GITHUB_REPO`, `GITHUB_BRANCH`, `GITHUB_DEPLOY_PATH`, `GITHUB_DEPLOY_CMD`, `GITHUB_ENABLED` (override path with `BAB_STATE_FILE`).
+- **`~/.config/bab/state.conf`** (`0600`): Saved session state including `VPS_IP`, `PUBLIC_IP`, `TAILSCALE_IP`, `SSH_KEY`, `USERNAME`, `SUDO_NOPASSWD`, `TRANSPORT_MODE`, `VPS_PROVIDER`, `VPS_INSTANCE_ID`, `VPS_REGION`, `VPS_PLAN`, `VPS_IMAGE`, `TAILSCALE_HOSTNAME`, `SERVER_ROLE`, `CF_ZONE`, `CF_RECORD`, `CF_TARGET`, `CF_PROXIED`, `CF_ENABLED`, `GITHUB_REPO`, `GITHUB_BRANCH`, `GITHUB_DEPLOY_PATH`, `GITHUB_DEPLOY_CMD`, `GITHUB_ENABLED` (override path with `BAB_STATE_FILE`).
+- **`~/.config/bab/bab.log`** (`0600`): Persistent timestamped activity log shared by TUI builds/destroys and CLI `setup`, `deploy`, and `destroy` runs, with an auto-trimmed 10 MB cap (override path with `BAB_LOG_FILE`).
 - **`BAB_SSH_BIN` / `BAB_SCP_BIN` / `BAB_SSH_KEYGEN_BIN`**: Optional binary overrides for SSH/SCP/`ssh-keygen` execution and testing.
 
 ## Testing

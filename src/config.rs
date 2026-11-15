@@ -12,12 +12,16 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MASTER_KEY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 const ENC_V1_PREFIX: &str = "enc:v1:";
 const MASTER_KEY_LEN: usize = 32;
+
+/// Maximum log file size retained by [`LogStore`] (10 MiB).
+pub const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Environment variable names for API keys supported by `Settings`.
 pub const API_KEY_ENV_NAMES: [&str; 6] = [
@@ -65,6 +69,96 @@ fn resolve_state_path(file_vars: &[&str], default_filename: &str) -> Result<Path
     Ok(default_config_dir()?.join(default_filename))
 }
 
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent)?;
+            // chmod 0o700 on the directory
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write<F>(path: &Path, write_fn: F) -> Result<()>
+where
+    F: FnOnce(&mut File) -> Result<()>,
+{
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let base_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state");
+    let pid = std::process::id();
+
+    let (mut tmp_file, tmp_path) = loop {
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!("{}.tmp.{}.{}", base_name, pid, seq));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(f) => break (f, candidate),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    let write_result = (|| -> Result<()> {
+        write_fn(&mut tmp_file)?;
+        tmp_file.sync_all()?;
+        drop(tmp_file);
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_result
+}
+
+/// Format the current UTC wall-clock time as `[YYYY-MM-DDTHH:MM:SSZ]`.
+pub fn format_utc_timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_utc_timestamp_from_secs(secs)
+}
+
+fn format_utc_timestamp_from_secs(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let sod = secs % 86_400;
+    let hour = sod / 3_600;
+    let minute = (sod % 3_600) / 60;
+    let second = sod % 60;
+
+    // Howard Hinnant's civil-from-days integer arithmetic (days since 1970-01-01).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    format!(
+        "[{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z]",
+        year, month, day, hour, minute, second
+    )
+}
+
 /// Represents a file storing KEY="value" lines.
 #[derive(Debug, Clone)]
 pub struct StateFile {
@@ -97,7 +191,7 @@ impl StateFile {
 
     /// Write a KEY="value" line, preserving other lines, removing any existing entries for the key.
     pub fn write_var(&self, key: &str, value: &str) -> Result<()> {
-        self.ensure_parent_dir()?;
+        ensure_parent_dir(&self.path)?;
         let prefix = format!("{}=", key);
         let mut lines = if self.path.exists() {
             let file = File::open(&self.path)?;
@@ -136,49 +230,12 @@ impl StateFile {
     }
 
     fn write_lines_atomic(&self, lines: &[String]) -> Result<()> {
-        self.ensure_parent_dir()?;
-        let parent = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let base_name = self
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("state");
-        let pid = std::process::id();
-
-        let (mut tmp_file, tmp_path) = loop {
-            let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let candidate = parent.join(format!("{}.tmp.{}.{}", base_name, pid, seq));
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&candidate)
-            {
-                Ok(f) => break (f, candidate),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.into()),
-            }
-        };
-
-        let write_result = (|| -> Result<()> {
+        atomic_write(&self.path, |tmp_file| {
             for l in lines {
                 writeln!(tmp_file, "{}", l)?;
             }
-            tmp_file.sync_all()?;
-            drop(tmp_file);
-            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
-            fs::rename(&tmp_path, &self.path)?;
             Ok(())
-        })();
-
-        if write_result.is_err() {
-            let _ = fs::remove_file(&tmp_path);
-        }
-        write_result
+        })
     }
 
     /// Read all KEY="value" pairs into a BTreeMap.
@@ -200,17 +257,6 @@ impl StateFile {
             }
         }
         Ok(map)
-    }
-
-    fn ensure_parent_dir(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent)?;
-                // chmod 0o700 on the directory
-                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -684,6 +730,12 @@ impl SessionState {
     pub fn set_github_enabled(&self, v: &str) -> Result<()> {
         self.set_var("GITHUB_ENABLED", v)
     }
+    pub fn sudo_nopasswd(&self) -> Result<Option<String>> {
+        self.get_var("SUDO_NOPASSWD")
+    }
+    pub fn set_sudo_nopasswd(&self, v: &str) -> Result<()> {
+        self.set_var("SUDO_NOPASSWD", v)
+    }
 
     pub fn save_session(&self, data: &SessionData) -> Result<()> {
         // Helper to write or remove based on Option
@@ -719,6 +771,10 @@ impl SessionState {
         set_opt!("GITHUB_DEPLOY_PATH", data.github_deploy_path);
         set_opt!("GITHUB_DEPLOY_CMD", data.github_deploy_cmd);
         set_opt!("GITHUB_ENABLED", data.github_enabled);
+        match data.sudo_nopasswd.as_deref() {
+            Some(v) if !v.trim().is_empty() => self.set_var("SUDO_NOPASSWD", v)?,
+            _ => self.remove_var("SUDO_NOPASSWD")?,
+        }
         Ok(())
     }
 
@@ -747,6 +803,7 @@ impl SessionState {
             github_deploy_path: self.github_deploy_path()?,
             github_deploy_cmd: self.github_deploy_cmd()?,
             github_enabled: self.github_enabled()?,
+            sudo_nopasswd: self.sudo_nopasswd()?,
         })
     }
 }
@@ -776,6 +833,157 @@ pub struct SessionData {
     pub github_deploy_path: Option<String>,
     pub github_deploy_cmd: Option<String>,
     pub github_enabled: Option<String>,
+    pub sudo_nopasswd: Option<String>,
+}
+
+/// Persistent append-only log store with a maximum retained byte cap.
+#[derive(Debug, Clone)]
+pub struct LogStore {
+    path: PathBuf,
+    max_bytes: u64,
+}
+
+impl LogStore {
+    /// Create a [`LogStore`] at `path` using [`MAX_LOG_FILE_BYTES`].
+    pub fn new<P: Into<PathBuf>>(path: P) -> Self {
+        Self::with_max_bytes(path, MAX_LOG_FILE_BYTES)
+    }
+
+    /// Create a [`LogStore`] at `path` with a custom `max_bytes` cap.
+    pub fn with_max_bytes<P: Into<PathBuf>>(path: P, max_bytes: u64) -> Self {
+        Self {
+            path: path.into(),
+            max_bytes,
+        }
+    }
+
+    /// Resolve the default log file path (`BAB_LOG_FILE` or `<config_dir>/bab.log`).
+    pub fn default_path() -> Result<PathBuf> {
+        resolve_state_path(&["BAB_LOG_FILE"], "bab.log")
+    }
+
+    /// Open a [`LogStore`] at [`LogStore::default_path`].
+    pub fn load_default() -> Result<Self> {
+        Ok(Self::new(Self::default_path()?))
+    }
+
+    /// Return the path to the backing log file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the configured maximum retained byte size.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
+    }
+
+    /// Return the current file size in bytes, or `0` if the file does not exist.
+    pub fn file_size(&self) -> u64 {
+        fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Append a single line to the log file, enforcing `max_bytes`.
+    pub fn append_line(&self, line: &str) -> Result<()> {
+        self.append_lines_impl(std::iter::once(line))
+    }
+
+    /// Append lines to the log file, enforcing `max_bytes`. Empty slices are a no-op.
+    pub fn append_lines(&self, lines: &[String]) -> Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        self.append_lines_impl(lines.iter().map(String::as_str))
+    }
+
+    fn append_lines_impl<'a, I>(&self, lines: I) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        ensure_parent_dir(&self.path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&self.path)?;
+        for line in lines {
+            let clean = line.trim_end_matches(['\r', '\n']);
+            writeln!(file, "{}", clean)?;
+        }
+        file.flush()?;
+        drop(file);
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+        self.enforce_max_bytes()
+    }
+
+    fn enforce_max_bytes(&self) -> Result<()> {
+        if self.file_size() <= self.max_bytes {
+            return Ok(());
+        }
+        if self.max_bytes == 0 {
+            return atomic_write(&self.path, |_| Ok(()));
+        }
+        let data = fs::read(&self.path)?;
+        let max_bytes = self.max_bytes as usize;
+        if data.len() <= max_bytes {
+            return Ok(());
+        }
+        let start = data.len() - max_bytes;
+        let cut = if start > 0 && data[start - 1] == b'\n' {
+            start
+        } else {
+            match data[start..].iter().position(|&b| b == b'\n') {
+                Some(nl_pos) if start + nl_pos + 1 < data.len() => start + nl_pos + 1,
+                _ => {
+                    let mut idx = start;
+                    while idx < data.len() && (data[idx] & 0b1100_0000) == 0b1000_0000 {
+                        idx += 1;
+                    }
+                    idx
+                }
+            }
+        };
+        atomic_write(&self.path, |tmp| {
+            tmp.write_all(&data[cut..])?;
+            Ok(())
+        })
+    }
+
+    /// Append lines prefixed with `format_utc_timestamp()` (except empty lines).
+    pub fn append_timestamped_lines(&self, lines: &[String]) -> Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let ts = format_utc_timestamp();
+        let stamped: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                let clean = line.trim_end_matches(['\r', '\n']);
+                if clean.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} {}", ts, clean)
+                }
+            })
+            .collect();
+        self.append_lines(&stamped)
+    }
+
+    /// Read all lines from the log file, returning an empty vector if missing.
+    pub fn read_lines(&self) -> Result<Vec<String>> {
+        match fs::read(&self.path) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                Ok(text.lines().map(ToString::to_string).collect())
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Atomically replace the log file with an empty `0o600` file (creating parent `0o700` dir if missing).
+    pub fn clear(&self) -> Result<()> {
+        atomic_write(&self.path, |_| Ok(()))
+    }
 }
 
 #[cfg(test)]
@@ -1140,6 +1348,7 @@ mod tests {
             github_deploy_path: Some("/home/deploy/apps/repo".to_string()),
             github_deploy_cmd: Some("docker compose up -d".to_string()),
             github_enabled: Some("true".to_string()),
+            sudo_nopasswd: Some("true".to_string()),
         };
         ss.save_session(&data)?;
         assert_eq!(ss.load_session()?, data);
@@ -1151,15 +1360,83 @@ mod tests {
         assert_eq!(ss.cf_enabled()?, Some("false".to_string()));
         ss.set_github_enabled("false")?;
         assert_eq!(ss.github_enabled()?, Some("false".to_string()));
+        ss.set_sudo_nopasswd("false")?;
+        assert_eq!(ss.sudo_nopasswd()?, Some("false".to_string()));
         let cleared = SessionData {
             cf_record: None,
             cf_enabled: None,
             github_deploy_cmd: None,
             github_enabled: None,
+            sudo_nopasswd: None,
             ..data
         };
         ss.save_session(&cleared)?;
         assert_eq!(ss.load_session()?, cleared);
+        Ok(())
+    }
+
+    #[test]
+    fn session_sudo_nopasswd_round_trip_and_clear() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let ss = SessionState::new(tmp.path());
+
+        // Initially unset -> None
+        assert_eq!(ss.sudo_nopasswd()?, None);
+        assert_eq!(ss.load_session()?.sudo_nopasswd, None);
+
+        // Typed setter/getter round-trip
+        ss.set_sudo_nopasswd("false")?;
+        assert_eq!(ss.sudo_nopasswd()?, Some("false".to_string()));
+        assert_eq!(ss.load_session()?.sudo_nopasswd, Some("false".to_string()));
+
+        // save_session / load_session round-trip with "true" and "false"
+        let enabled = SessionData {
+            sudo_nopasswd: Some("true".to_string()),
+            ..SessionData::default()
+        };
+        ss.save_session(&enabled)?;
+        assert_eq!(ss.load_session()?.sudo_nopasswd, Some("true".to_string()));
+        assert!(fs::read_to_string(tmp.path())?.contains("SUDO_NOPASSWD=\"true\""));
+
+        let disabled = SessionData {
+            sudo_nopasswd: Some("false".to_string()),
+            ..SessionData::default()
+        };
+        ss.save_session(&disabled)?;
+        assert_eq!(ss.load_session()?.sudo_nopasswd, Some("false".to_string()));
+        assert!(fs::read_to_string(tmp.path())?.contains("SUDO_NOPASSWD=\"false\""));
+
+        // Some("") and whitespace-only values remove the key and load back as None
+        let empty = SessionData {
+            sudo_nopasswd: Some(String::new()),
+            ..SessionData::default()
+        };
+        ss.save_session(&empty)?;
+        assert_eq!(ss.sudo_nopasswd()?, None);
+        assert_eq!(ss.load_session()?.sudo_nopasswd, None);
+        assert!(!fs::read_to_string(tmp.path())?.contains("SUDO_NOPASSWD="));
+
+        ss.set_sudo_nopasswd("true")?;
+        let whitespace = SessionData {
+            sudo_nopasswd: Some("   ".to_string()),
+            ..SessionData::default()
+        };
+        ss.save_session(&whitespace)?;
+        assert_eq!(ss.sudo_nopasswd()?, None);
+        assert_eq!(ss.load_session()?.sudo_nopasswd, None);
+        assert!(!fs::read_to_string(tmp.path())?.contains("SUDO_NOPASSWD="));
+
+        // None preserves unset / removes existing key
+        ss.set_sudo_nopasswd("false")?;
+        let unset = SessionData {
+            sudo_nopasswd: None,
+            ..SessionData::default()
+        };
+        ss.save_session(&unset)?;
+        assert_eq!(ss.sudo_nopasswd()?, None);
+        assert_eq!(ss.load_session()?.sudo_nopasswd, None);
+        assert!(!fs::read_to_string(tmp.path())?.contains("SUDO_NOPASSWD="));
+
         Ok(())
     }
 
@@ -1327,6 +1604,186 @@ mod tests {
             settings.cloudflare_api_token()?,
             Some("cf-rotated-789".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn log_store_default_path_honors_env_overrides() -> Result<()> {
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard::new(&[
+            "BAB_LOG_FILE",
+            "BAB_CONFIG_DIR",
+            "BAB_SSH_DIR",
+            "VPSKIT_SSH_DIR",
+            "SSH_DIR",
+            "HOME",
+        ]);
+        for k in [
+            "BAB_LOG_FILE",
+            "BAB_CONFIG_DIR",
+            "BAB_SSH_DIR",
+            "VPSKIT_SSH_DIR",
+            "SSH_DIR",
+        ] {
+            env::remove_var(k);
+        }
+
+        let dir = tempdir()?;
+        let fake_home = dir.path().join("home");
+        fs::create_dir_all(&fake_home)?;
+        env::set_var("HOME", &fake_home);
+        assert_eq!(
+            LogStore::default_path()?,
+            fake_home.join(".config").join("bab").join("bab.log")
+        );
+
+        let cfg_dir = dir.path().join("custom-cfg");
+        env::set_var("BAB_CONFIG_DIR", &cfg_dir);
+        assert_eq!(LogStore::default_path()?, cfg_dir.join("bab.log"));
+
+        let explicit_log = dir.path().join("override").join("my.log");
+        env::set_var("BAB_LOG_FILE", &explicit_log);
+        assert_eq!(LogStore::default_path()?, explicit_log);
+
+        let store = LogStore::load_default()?;
+        assert_eq!(store.path(), explicit_log.as_path());
+        assert_eq!(store.max_bytes(), MAX_LOG_FILE_BYTES);
+        assert_eq!(MAX_LOG_FILE_BYTES, 10_485_760);
+        Ok(())
+    }
+
+    #[test]
+    fn log_store_append_creates_permissions_and_round_trips() -> Result<()> {
+        let dir = tempdir()?;
+        let log_dir = dir.path().join("nested").join("logs");
+        let log_path = log_dir.join("bab.log");
+        let store = LogStore::new(&log_path);
+
+        assert_eq!(store.file_size(), 0);
+        assert!(store.read_lines()?.is_empty());
+
+        // Empty slice is a no-op and does not create files/dirs
+        store.append_lines(&[])?;
+        assert!(!log_path.exists());
+        assert!(!log_dir.exists());
+
+        store.append_line("first line\r\n")?;
+        assert_eq!(fs::metadata(&log_dir)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&log_path)?.permissions().mode() & 0o777, 0o600);
+
+        store.append_lines(&["second line".to_string(), "third line\n".to_string()])?;
+        assert_eq!(
+            store.read_lines()?,
+            vec![
+                "first line".to_string(),
+                "second line".to_string(),
+                "third line".to_string(),
+            ]
+        );
+        let expected_bytes = "first line\nsecond line\nthird line\n".len() as u64;
+        assert_eq!(store.file_size(), expected_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn log_store_enforces_max_bytes_on_line_and_utf8_boundaries() -> Result<()> {
+        let dir = tempdir()?;
+        let log_path = dir.path().join("capped.log");
+        let store = LogStore::with_max_bytes(&log_path, 14);
+
+        store.append_line("alpha")?; // 6 bytes
+        store.append_line("beta")?; // 5 bytes -> 11 bytes total
+        assert_eq!(store.read_lines()?, vec!["alpha", "beta"]);
+
+        // Adding "gamma\n" (6 bytes) -> 17 bytes > 14 -> drops "alpha\n" cleanly
+        store.append_line("gamma")?;
+        assert_eq!(store.read_lines()?, vec!["beta", "gamma"]);
+        assert_eq!(store.file_size(), 11);
+
+        // Exact-fit line boundary when oldest dropped leaves exact max_bytes
+        let exact_path = dir.path().join("exact.log");
+        let exact_store = LogStore::with_max_bytes(&exact_path, 12);
+        exact_store.append_lines(&[
+            "alpha".to_string(),
+            "omega".to_string(),
+            "theta".to_string(),
+        ])?;
+        assert_eq!(exact_store.read_lines()?, vec!["omega", "theta"]);
+        assert_eq!(exact_store.file_size(), 12);
+
+        // Oversized single UTF-8 multi-byte line must not split a codepoint
+        let utf8_path = dir.path().join("utf8.log");
+        let utf8_store = LogStore::with_max_bytes(&utf8_path, 10);
+        utf8_store.append_line("😀😀😀😀😀")?; // 20 bytes + '\n' = 21 bytes
+        let raw = fs::read_to_string(&utf8_path)?;
+        assert!(raw.len() <= 10);
+        assert_eq!(utf8_store.read_lines()?, vec!["😀😀"]);
+
+        // Zero max_bytes keeps empty 0o600 file
+        let zero_path = dir.path().join("zero.log");
+        let zero_store = LogStore::with_max_bytes(&zero_path, 0);
+        zero_store.append_line("discarded")?;
+        assert_eq!(zero_store.file_size(), 0);
+        assert!(zero_store.read_lines()?.is_empty());
+        assert_eq!(fs::metadata(&zero_path)?.permissions().mode() & 0o777, 0o600);
+        Ok(())
+    }
+
+    #[test]
+    fn log_store_clear_empties_file_and_preserves_permissions() -> Result<()> {
+        let dir = tempdir()?;
+        let log_dir = dir.path().join("logs");
+        let log_path = log_dir.join("bab.log");
+        let store = LogStore::new(&log_path);
+
+        store.append_lines(&["entry 1".to_string(), "entry 2".to_string()])?;
+        assert!(store.file_size() > 0);
+
+        store.clear()?;
+        assert_eq!(store.file_size(), 0);
+        assert!(store.read_lines()?.is_empty());
+        assert_eq!(fs::metadata(&log_path)?.permissions().mode() & 0o777, 0o600);
+
+        // Clear on a missing file creates 0o700 parent and empty 0o600 file
+        let fresh_dir = dir.path().join("fresh");
+        let fresh_path = fresh_dir.join("bab.log");
+        let fresh_store = LogStore::new(&fresh_path);
+        fresh_store.clear()?;
+        assert_eq!(fs::metadata(&fresh_dir)?.permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(&fresh_path)?.permissions().mode() & 0o777, 0o600);
+        assert_eq!(fresh_store.file_size(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn format_utc_timestamp_and_append_timestamped_lines() -> Result<()> {
+        assert_eq!(format_utc_timestamp_from_secs(0), "[1970-01-01T00:00:00Z]");
+        // 2024-02-29T23:59:59Z
+        assert_eq!(
+            format_utc_timestamp_from_secs(1_709_251_199),
+            "[2024-02-29T23:59:59Z]"
+        );
+
+        let now = format_utc_timestamp();
+        assert_eq!(now.len(), 22);
+        assert!(now.starts_with('['));
+        assert!(now.ends_with("Z]"));
+
+        let dir = tempdir()?;
+        let store = LogStore::new(dir.path().join("stamped.log"));
+        store.append_timestamped_lines(&[])?;
+        assert!(!store.path().exists());
+
+        store.append_timestamped_lines(&[
+            "step one".to_string(),
+            String::new(),
+            "step two".to_string(),
+        ])?;
+        let lines = store.read_lines()?;
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with('[') && lines[0].ends_with("Z] step one"));
+        assert_eq!(lines[1], "");
+        assert!(lines[2].starts_with('[') && lines[2].ends_with("Z] step two"));
         Ok(())
     }
 }

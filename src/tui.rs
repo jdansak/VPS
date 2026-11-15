@@ -15,7 +15,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::config::{default_config_dir, SessionData, SessionState, Settings};
+use crate::config::{
+    default_config_dir, format_utc_timestamp, LogStore, SessionData, SessionState, Settings,
+    MAX_LOG_FILE_BYTES,
+};
 use crate::dns::{build_cloudflare_dns_stub_plan, CloudflareDnsConfig};
 use crate::providers::{
     build_cloud_provider_with_key, clear_destroyed_session_if_matches, default_images_for,
@@ -42,7 +45,7 @@ const ALL_PROVIDERS: [ProviderKind; 5] = [
     ProviderKind::ManualCloudInit,
 ];
 
-const HOME_MENU_ITEMS: [&str; 9] = [
+const HOME_MENU_ITEMS: [&str; 10] = [
     "Select Provider, Location & Size",
     "Select Server Role",
     "Access, User & Transport",
@@ -51,6 +54,7 @@ const HOME_MENU_ITEMS: [&str; 9] = [
     "API Key Settings",
     "Build Box with Current Options",
     "Running Systems & Destroy",
+    "View Log",
     "Quit",
 ];
 
@@ -63,11 +67,12 @@ const API_KEY_LABELS: [&str; 6] = [
     "GITHUB_TOKEN",
 ];
 
-const ACCESS_FIELD_LABELS: [&str; 4] = [
+const ACCESS_FIELD_LABELS: [&str; 5] = [
     "Transport Mode",
     "Sudo Username",
     "SSH Key Path",
     "Hostname",
+    "Passwordless Sudo",
 ];
 
 const CF_DNS_FIELD_LABELS: [&str; 5] = [
@@ -121,15 +126,17 @@ pub enum Screen {
     ApiKeys,
     BuildBox,
     RunningInstances,
+    ViewLog,
 }
 
-/// Editable form state for access transport, sudo admin user, SSH key path, and hostname.
+/// Editable form state for access transport, sudo admin user, SSH key path, hostname, and passwordless sudo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccessForm {
     pub tailscale_mode: bool,
     pub username: String,
     pub ssh_key_path: String,
     pub hostname: String,
+    pub sudo_nopasswd: bool,
     pub active_field: usize,
     pub editing: bool,
 }
@@ -141,6 +148,7 @@ impl Default for AccessForm {
             username: "deploy".to_string(),
             ssh_key_path: default_ssh_key_path_string(),
             hostname: "bab-node".to_string(),
+            sudo_nopasswd: true,
             active_field: 0,
             editing: false,
         }
@@ -176,12 +184,23 @@ impl AccessForm {
             .filter(|s| !s.is_empty())
             .unwrap_or("bab-node")
             .to_string();
+        let sudo_nopasswd = match session
+            .sudo_nopasswd
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("false" | "0" | "no" | "off") => false,
+            Some("true" | "1" | "yes" | "on") | None => true,
+            Some(_) => true,
+        };
 
         Self {
             tailscale_mode,
             username,
             ssh_key_path,
             hostname,
+            sudo_nopasswd,
             active_field: 0,
             editing: false,
         }
@@ -193,6 +212,18 @@ impl AccessForm {
         } else {
             "ssh"
         }
+    }
+
+    fn sudo_nopasswd_label(&self) -> &'static str {
+        if self.sudo_nopasswd {
+            "ON (NOPASSWD:ALL)"
+        } else {
+            "OFF (password required)"
+        }
+    }
+
+    fn toggle_sudo_nopasswd(&mut self) {
+        self.sudo_nopasswd = !self.sudo_nopasswd;
     }
 
     fn toggle_transport(&mut self) {
@@ -549,6 +580,9 @@ pub struct TuiApp {
     pub status_message: String,
     pub settings_path: Option<PathBuf>,
     pub state_path: Option<PathBuf>,
+    pub log_path: Option<PathBuf>,
+    pub log_view_lines: Vec<String>,
+    pub log_scroll: usize,
     pub build_dry_run: bool,
     pub last_dry_run_target: Option<String>,
     pub running_instances: Vec<ProviderInstance>,
@@ -656,6 +690,9 @@ impl TuiApp {
             status_message: "Ready".to_string(),
             settings_path: None,
             state_path: None,
+            log_path: None,
+            log_view_lines: Vec::new(),
+            log_scroll: 0,
             build_dry_run: false,
             last_dry_run_target: None,
             running_instances: Vec::new(),
@@ -681,10 +718,105 @@ impl TuiApp {
 
         let session = state.load_session()?;
         let api_keys = ApiKeyForm::from_settings(&settings)?;
+        let resolved_log_path = match std::env::var("BAB_LOG_FILE") {
+            Ok(v) if !v.trim().is_empty() => PathBuf::from(v.trim()),
+            _ => {
+                let from_state = resolved_state_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.join("bab.log"));
+                let from_settings = resolved_settings_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .map(|p| p.join("bab.log"));
+                match from_state.or(from_settings) {
+                    Some(p) => p,
+                    None => LogStore::default_path()?,
+                }
+            }
+        };
+
         let mut app = Self::new(session, api_keys);
         app.settings_path = Some(resolved_settings_path);
         app.state_path = Some(resolved_state_path);
+        app.log_path = Some(resolved_log_path);
+        app.reload_log_view();
         Ok(app)
+    }
+
+    /// Returns the resolved persistent log path string, or the default tilde path when unset.
+    pub fn resolved_log_display(&self) -> String {
+        self.log_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "~/.config/bab/bab.log".to_string())
+    }
+
+    fn append_persistent_lines(&mut self, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(ref path) = self.log_path {
+            let _ = LogStore::new(path).append_timestamped_lines(&lines);
+        }
+        let ts = format_utc_timestamp();
+        for line in lines {
+            let clean = line.trim_end_matches(['\r', '\n']);
+            if clean.is_empty() {
+                self.log_view_lines.push(String::new());
+            } else {
+                self.log_view_lines.push(format!("{} {}", ts, clean));
+            }
+        }
+    }
+
+    /// Appends a single timestamped line to the persistent log store and view buffer.
+    pub fn append_persistent_log(&mut self, line: impl AsRef<str>) {
+        let trimmed = line.as_ref().trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            return;
+        }
+        self.append_persistent_lines(vec![trimmed.to_string()]);
+    }
+
+    /// Appends a header line and non-empty trimmed body lines to the persistent log store and view buffer.
+    pub fn append_persistent_log_block(&mut self, header: &str, body: &str) {
+        let mut lines = Vec::new();
+        let clean_header = header.trim_end_matches(['\r', '\n']);
+        if !clean_header.is_empty() {
+            lines.push(clean_header.to_string());
+        }
+        for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            lines.push(format!("  {}", line));
+        }
+        self.append_persistent_lines(lines);
+    }
+
+    fn push_log(&mut self, line: impl Into<String>) {
+        let entry = line.into();
+        self.append_persistent_log(&entry);
+        self.logs.push(entry);
+    }
+
+    /// Reloads `log_view_lines` from disk (`bab.log`), falling back to in-memory `logs` when empty.
+    pub fn reload_log_view(&mut self) {
+        let loaded = match self.log_path {
+            Some(ref path) => match LogStore::new(path).read_lines() {
+                Ok(lines) if !lines.is_empty() => lines,
+                Ok(_) if !self.logs.is_empty() => self.logs.clone(),
+                Ok(lines) => lines,
+                Err(_) => self.logs.clone(),
+            },
+            None => {
+                if !self.logs.is_empty() {
+                    self.logs.clone()
+                } else {
+                    self.log_view_lines.clone()
+                }
+            }
+        };
+        self.log_view_lines = loaded;
+        self.log_scroll = self.log_view_lines.len().saturating_sub(1);
     }
 
     /// Records the outcome of a setup step into progress state and logs.
@@ -707,12 +839,15 @@ impl TuiApp {
         } else {
             "FAIL"
         };
-        if report.dry_run {
-            self.logs
-                .push(format!("[DRY-RUN] {} (simulated)", report.step.title()));
+        let header = if report.dry_run {
+            format!("[DRY-RUN] {} (simulated)", report.step.title())
         } else {
-            self.logs
-                .push(format!("[{}] {}", tag, report.step.title()));
+            format!("[{}] {}", tag, report.step.title())
+        };
+        if report.dry_run {
+            self.logs.push(header.clone());
+        } else {
+            self.logs.push(header.clone());
             let lines: Vec<&str> = report
                 .output
                 .lines()
@@ -725,6 +860,7 @@ impl TuiApp {
                 self.logs.push(format!("  {}", line));
             }
         }
+        self.append_persistent_log_block(&header, &report.output);
         self.status_message = format!("{}: {}", report.step.title(), tag);
     }
 
@@ -794,6 +930,29 @@ impl TuiApp {
             Screen::ApiKeys => self.handle_api_keys_nav_key(key),
             Screen::BuildBox => self.handle_build_box_key_with_ui(key, on_update),
             Screen::RunningInstances => self.handle_running_instances_key(key),
+            Screen::ViewLog => self.handle_view_log_key(key.code),
+        }
+    }
+
+    fn activate_home_selection(&mut self) {
+        match self.home_index {
+            0 => self.screen = Screen::SelectProvider,
+            1 => self.screen = Screen::SelectRole,
+            2 => self.screen = Screen::AccessConfig,
+            3 => self.screen = Screen::CloudflareDns,
+            4 => self.screen = Screen::GithubDeploy,
+            5 => self.screen = Screen::ApiKeys,
+            6 => self.screen = Screen::BuildBox,
+            7 => {
+                self.screen = Screen::RunningInstances;
+                self.refresh_running_instances();
+            }
+            8 => {
+                self.reload_log_view();
+                self.screen = Screen::ViewLog;
+            }
+            9 => self.should_quit = true,
+            _ => {}
         }
     }
 
@@ -805,57 +964,55 @@ impl TuiApp {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.home_index = next_index(self.home_index, HOME_MENU_ITEMS.len());
             }
-            KeyCode::Enter => match self.home_index {
-                0 => self.screen = Screen::SelectProvider,
-                1 => self.screen = Screen::SelectRole,
-                2 => self.screen = Screen::AccessConfig,
-                3 => self.screen = Screen::CloudflareDns,
-                4 => self.screen = Screen::GithubDeploy,
-                5 => self.screen = Screen::ApiKeys,
-                6 => self.screen = Screen::BuildBox,
-                7 => {
-                    self.screen = Screen::RunningInstances;
-                    self.refresh_running_instances();
+            KeyCode::Enter => self.activate_home_selection(),
+            KeyCode::Char(c @ '1'..='9') => {
+                self.home_index = (c as usize) - ('1' as usize);
+                self.activate_home_selection();
+            }
+            KeyCode::Char('0') => {
+                self.home_index = 9;
+                self.activate_home_selection();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_view_log_key(&mut self, code: KeyCode) {
+        let max_scroll = self.log_view_lines.len().saturating_sub(1);
+        match code {
+            KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('q') => {
+                self.screen = Screen::Home;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.log_scroll = self.log_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.log_scroll = (self.log_scroll + 1).min(max_scroll);
+            }
+            KeyCode::PageUp | KeyCode::Char('u') => {
+                self.log_scroll = self.log_scroll.saturating_sub(15);
+            }
+            KeyCode::PageDown | KeyCode::Char('d') => {
+                self.log_scroll = self.log_scroll.saturating_add(15).min(max_scroll);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.log_scroll = 0;
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.log_scroll = max_scroll;
+            }
+            KeyCode::Char('r') => {
+                self.reload_log_view();
+                self.status_message = "Reloaded log file from disk".to_string();
+            }
+            KeyCode::Char('c') => {
+                if let Some(ref path) = self.log_path {
+                    let _ = LogStore::new(path).clear();
                 }
-                8 => self.should_quit = true,
-                _ => {}
-            },
-            KeyCode::Char('1') => {
-                self.home_index = 0;
-                self.screen = Screen::SelectProvider;
-            }
-            KeyCode::Char('2') => {
-                self.home_index = 1;
-                self.screen = Screen::SelectRole;
-            }
-            KeyCode::Char('3') => {
-                self.home_index = 2;
-                self.screen = Screen::AccessConfig;
-            }
-            KeyCode::Char('4') => {
-                self.home_index = 3;
-                self.screen = Screen::CloudflareDns;
-            }
-            KeyCode::Char('5') => {
-                self.home_index = 4;
-                self.screen = Screen::GithubDeploy;
-            }
-            KeyCode::Char('6') => {
-                self.home_index = 5;
-                self.screen = Screen::ApiKeys;
-            }
-            KeyCode::Char('7') => {
-                self.home_index = 6;
-                self.screen = Screen::BuildBox;
-            }
-            KeyCode::Char('8') => {
-                self.home_index = 7;
-                self.screen = Screen::RunningInstances;
-                self.refresh_running_instances();
-            }
-            KeyCode::Char('9') => {
-                self.home_index = 8;
-                self.should_quit = true;
+                self.log_view_lines.clear();
+                self.logs.clear();
+                self.log_scroll = 0;
+                self.status_message = "Cleared bab.log".to_string();
             }
             _ => {}
         }
@@ -937,28 +1094,54 @@ impl TuiApp {
                 self.access.active_field =
                     next_index(self.access.active_field, ACCESS_FIELD_LABELS.len());
             }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right if self.access.active_field == 0 => {
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                if self.access.active_field == 0 =>
+            {
                 self.access.toggle_transport();
                 self.status_message = format!(
                     "Transport mode set to {} (press 's' to save)",
                     self.access.transport_mode_str()
                 );
             }
-            KeyCode::Enter => {
-                if self.access.active_field == 0 {
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                if self.access.active_field == 4 =>
+            {
+                self.access.toggle_sudo_nopasswd();
+                self.status_message = format!(
+                    "Passwordless sudo set to {} (press 's' to save)",
+                    self.access.sudo_nopasswd_label()
+                );
+            }
+            KeyCode::Char('p') => {
+                self.access.toggle_sudo_nopasswd();
+                self.status_message = format!(
+                    "Passwordless sudo set to {} (press 's' to save)",
+                    self.access.sudo_nopasswd_label()
+                );
+            }
+            KeyCode::Enter => match self.access.active_field {
+                0 => {
                     self.access.toggle_transport();
                     self.status_message = format!(
                         "Transport mode set to {} (press 's' to save)",
                         self.access.transport_mode_str()
                     );
-                } else {
-                    self.access.editing = true;
-                    let label = ACCESS_FIELD_LABELS[self.access.active_field];
-                    self.status_message =
-                        format!("Editing {} (Enter/Esc to finish)", label);
                 }
-            }
-            KeyCode::Char('e') if self.access.active_field > 0 => {
+                4 => {
+                    self.access.toggle_sudo_nopasswd();
+                    self.status_message = format!(
+                        "Passwordless sudo set to {} (press 's' to save)",
+                        self.access.sudo_nopasswd_label()
+                    );
+                }
+                idx if matches!(idx, 1..=3) => {
+                    self.access.editing = true;
+                    let label = ACCESS_FIELD_LABELS[idx];
+                    self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
+                }
+                _ => {}
+            },
+            KeyCode::Char('e') if matches!(self.access.active_field, 1..=3) => {
                 self.access.editing = true;
                 let label = ACCESS_FIELD_LABELS[self.access.active_field];
                 self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
@@ -1259,6 +1442,14 @@ impl TuiApp {
                     }
                 );
             }
+            KeyCode::Char('p') => {
+                self.access.toggle_sudo_nopasswd();
+                self.save_access_config();
+                self.status_message = format!(
+                    "Passwordless Sudo toggled {}",
+                    self.access.sudo_nopasswd_label()
+                );
+            }
             KeyCode::Char('n') => {
                 self.build_dry_run = !self.build_dry_run;
                 self.status_message = format!(
@@ -1280,79 +1471,77 @@ impl TuiApp {
         }
     }
 
+    fn destroy_selected_instance(&mut self) {
+        let Some(inst) = self.running_instances.get(self.running_index).cloned() else {
+            return;
+        };
+        let api_key = match inst.provider {
+            ProviderKind::Vultr => self.resolve_api_key(&self.api_keys.vultr, "VULTR_API_KEY"),
+            ProviderKind::UpCloud => {
+                self.resolve_api_key(&self.api_keys.upcloud, "UPCLOUD_API_TOKEN")
+            }
+            ProviderKind::Linode => {
+                self.resolve_api_key(&self.api_keys.linode, "LINODE_API_TOKEN")
+            }
+            ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => None,
+        };
+        let Some(key_str) = api_key else {
+            let msg = format!("API key for {} is not configured", inst.provider.label());
+            self.push_log(format!("[ERROR] {}", msg));
+            self.status_message = msg;
+            return;
+        };
+        match destroy_provider_instance_with_key(inst.provider, &key_str, &inst.id, None) {
+            Ok(()) => {
+                self.running_instances.remove(self.running_index);
+                if self.running_index >= self.running_instances.len() {
+                    self.running_index = self.running_instances.len().saturating_sub(1);
+                }
+                if let Some(ref path) = self.state_path {
+                    let state = SessionState::new(path);
+                    if let Err(err) = clear_destroyed_session_if_matches(&state, &inst.id) {
+                        self.push_log(format!(
+                            "[WARN] Failed to clear session state for {}: {}",
+                            inst.id, err
+                        ));
+                    }
+                }
+                if self
+                    .session
+                    .vps_instance_id
+                    .as_deref()
+                    .map(str::trim)
+                    == Some(inst.id.trim())
+                {
+                    self.session.vps_provider = None;
+                    self.session.vps_instance_id = None;
+                    self.session.vps_ip = None;
+                    self.session.public_ip = None;
+                    self.session.tailscale_ip = None;
+                }
+                let msg = format!(
+                    "Destroyed {} instance {} ({})",
+                    inst.provider.label(),
+                    inst.name,
+                    inst.id
+                );
+                self.push_log(format!("[DESTROY] {}", msg));
+                self.status_message = msg;
+            }
+            Err(err) => {
+                let msg = format!("Destroy failed for {}: {}", inst.id, err);
+                self.push_log(format!("[ERROR] {}", msg));
+                self.status_message = msg;
+            }
+        }
+    }
+
     fn handle_running_instances_key(&mut self, key: KeyEvent) {
         if self.running_confirm_destroy {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.running_confirm_destroy = false;
-                    let Some(inst) = self.running_instances.get(self.running_index).cloned() else {
-                        return;
-                    };
-                    let api_key = match inst.provider {
-                        ProviderKind::Vultr => self.resolve_api_key(&self.api_keys.vultr, "VULTR_API_KEY"),
-                        ProviderKind::UpCloud => {
-                            self.resolve_api_key(&self.api_keys.upcloud, "UPCLOUD_API_TOKEN")
-                        }
-                        ProviderKind::Linode => {
-                            self.resolve_api_key(&self.api_keys.linode, "LINODE_API_TOKEN")
-                        }
-                        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => None,
-                    };
-                    let Some(key_str) = api_key else {
-                        let msg = format!("API key for {} is not configured", inst.provider.label());
-                        self.logs.push(format!("[ERROR] {}", msg));
-                        self.status_message = msg;
-                        return;
-                    };
-                    match destroy_provider_instance_with_key(
-                        inst.provider,
-                        &key_str,
-                        &inst.id,
-                        None,
-                    ) {
-                        Ok(()) => {
-                            self.running_instances.remove(self.running_index);
-                            if self.running_index >= self.running_instances.len() {
-                                self.running_index = self.running_instances.len().saturating_sub(1);
-                            }
-                            if let Some(ref path) = self.state_path {
-                                let state = SessionState::new(path);
-                                if let Err(err) = clear_destroyed_session_if_matches(&state, &inst.id)
-                                {
-                                    self.logs.push(format!(
-                                        "[WARN] Failed to clear session state for {}: {}",
-                                        inst.id, err
-                                    ));
-                                }
-                            }
-                            if self
-                                .session
-                                .vps_instance_id
-                                .as_deref()
-                                .map(str::trim)
-                                == Some(inst.id.trim())
-                            {
-                                self.session.vps_provider = None;
-                                self.session.vps_instance_id = None;
-                                self.session.vps_ip = None;
-                                self.session.public_ip = None;
-                                self.session.tailscale_ip = None;
-                            }
-                            let msg = format!(
-                                "Destroyed {} instance {} ({})",
-                                inst.provider.label(),
-                                inst.name,
-                                inst.id
-                            );
-                            self.logs.push(format!("[DESTROY] {}", msg));
-                            self.status_message = msg;
-                        }
-                        Err(err) => {
-                            let msg = format!("Destroy failed for {}: {}", inst.id, err);
-                            self.logs.push(format!("[ERROR] {}", msg));
-                            self.status_message = msg;
-                        }
-                    }
+                    self.destroy_selected_instance();
                 }
                 KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('q') => {
                     self.running_confirm_destroy = false;
@@ -1608,10 +1797,16 @@ impl TuiApp {
             }
         };
 
+        let sudo_nopasswd_str = if self.access.sudo_nopasswd {
+            "true"
+        } else {
+            "false"
+        };
         self.session.transport_mode = Some(mode.clone());
         self.session.username = Some(username.clone());
         self.session.ssh_key = Some(ssh_key.clone());
         self.session.tailscale_hostname = Some(hostname.clone());
+        self.session.sudo_nopasswd = Some(sudo_nopasswd_str.to_string());
 
         if let Some(ref path) = self.state_path {
             let state = SessionState::new(path);
@@ -1619,7 +1814,8 @@ impl TuiApp {
                 .set_transport_mode(&mode)
                 .and_then(|()| state.set_username(&username))
                 .and_then(|()| state.set_ssh_key(&ssh_key))
-                .and_then(|()| state.set_tailscale_hostname(&hostname));
+                .and_then(|()| state.set_tailscale_hostname(&hostname))
+                .and_then(|()| state.set_sudo_nopasswd(sudo_nopasswd_str));
             if let Err(err) = res {
                 self.status_message = format!("Failed to save access settings: {}", err);
                 return;
@@ -1627,8 +1823,8 @@ impl TuiApp {
         }
 
         self.status_message = format!(
-            "Saved access settings (mode: {}, user: {}, host: {})",
-            mode, username, hostname
+            "Saved access settings (mode: {}, user: {}, host: {}, sudo_nopasswd: {})",
+            mode, username, hostname, sudo_nopasswd_str
         );
     }
 
@@ -1839,10 +2035,12 @@ impl TuiApp {
         } else if self.running_index >= self.running_instances.len() {
             self.running_index = self.running_instances.len() - 1;
         }
-        self.status_message = format!(
+        let msg = format!(
             "Found {} running instance(s) across configured providers",
             self.running_instances.len()
         );
+        self.push_log(format!("[QUERY] {}", msg));
+        self.status_message = msg;
     }
 
     /// Executes the full provision + 6-step setup + optional Cloudflare DNS plan using current options.
@@ -1867,12 +2065,13 @@ impl TuiApp {
             .collect();
         self.last_dry_run_target = None;
         let mode_tag = if self.build_dry_run { "DRY-RUN" } else { "LIVE" };
-        self.logs.push(format!(
-            "[BUILD] Starting {} build (provider={}, role={}, transport={}, dns={}, github={})",
+        self.push_log(format!(
+            "[BUILD] Starting {} build (provider={}, role={}, transport={}, sudo_nopasswd={}, dns={}, github={})",
             mode_tag,
             provider_display_label(self.selected_provider),
             self.selected_role,
             self.access.transport_mode_str(),
+            if self.access.sudo_nopasswd { "ON" } else { "OFF" },
             if self.cf_dns.enabled { "ON" } else { "OFF" },
             if self.github_deploy.enabled { "ON" } else { "OFF" }
         ));
@@ -1885,7 +2084,7 @@ impl TuiApp {
                 Ok(cred) => Some(cred),
                 Err(err) => {
                     let msg = format!("Failed to resolve SSH key: {}", err);
-                    self.logs.push(format!("[ERROR] {}", msg));
+                    self.push_log(format!("[ERROR] {}", msg));
                     self.status_message = msg;
                     on_update(self);
                     return;
@@ -1903,7 +2102,7 @@ impl TuiApp {
                     let Some(ts_key) = self.resolve_api_key(&self.api_keys.tailscale, "TAILSCALE_API_KEY")
                     else {
                         let msg = "TAILSCALE_API_KEY is not configured for Manual Cloud-Init".to_string();
-                        self.logs.push(format!("[ERROR] {}", msg));
+                        self.push_log(format!("[ERROR] {}", msg));
                         self.status_message = msg;
                         on_update(self);
                         return;
@@ -1914,7 +2113,7 @@ impl TuiApp {
                         Ok(k) => k,
                         Err(err) => {
                             let msg = format!("Failed to create Tailscale auth key: {}", err);
-                            self.logs.push(format!("[ERROR] {}", msg));
+                            self.push_log(format!("[ERROR] {}", msg));
                             self.status_message = msg;
                             on_update(self);
                             return;
@@ -1937,12 +2136,12 @@ impl TuiApp {
 
             match script_res {
                 Ok(script) => {
-                    self.logs.push(format!(
+                    self.push_log(format!(
                         "[CLOUD-INIT] Generated cloud-init script ({} bytes)",
                         script.len()
                     ));
                     for line in script.lines().take(20) {
-                        self.logs.push(format!("  {}", line));
+                        self.push_log(format!("  {}", line));
                     }
                     self.status_message = if self.build_dry_run {
                         "Dry-run cloud-init generated (see logs)".to_string()
@@ -1952,7 +2151,7 @@ impl TuiApp {
                 }
                 Err(err) => {
                     let msg = format!("Cloud-init generation failed: {}", err);
-                    self.logs.push(format!("[ERROR] {}", msg));
+                    self.push_log(format!("[ERROR] {}", msg));
                     self.status_message = msg;
                 }
             }
@@ -1978,7 +2177,7 @@ impl TuiApp {
                             }
                         });
                     self.last_dry_run_target = Some(sim_ip.clone());
-                    self.logs.push(format!(
+                    self.push_log(format!(
                         "[DRY-RUN] Simulated {} provision -> {}",
                         provider_display_label(self.selected_provider),
                         sim_ip
@@ -1998,7 +2197,7 @@ impl TuiApp {
                     };
                     let Some(provider_key) = self.resolve_api_key(form_val, env_name) else {
                         let msg = format!("{} is not configured", env_name);
-                        self.logs.push(format!("[ERROR] {}", msg));
+                        self.push_log(format!("[ERROR] {}", msg));
                         self.status_message = msg;
                         on_update(self);
                         return;
@@ -2011,7 +2210,7 @@ impl TuiApp {
                         Ok(p) => p,
                         Err(err) => {
                             let msg = format!("Failed to initialize provider: {}", err);
-                            self.logs.push(format!("[ERROR] {}", msg));
+                            self.push_log(format!("[ERROR] {}", msg));
                             self.status_message = msg;
                             on_update(self);
                             return;
@@ -2022,7 +2221,7 @@ impl TuiApp {
                             self.resolve_api_key(&self.api_keys.tailscale, "TAILSCALE_API_KEY")
                         else {
                             let msg = "TAILSCALE_API_KEY is not configured".to_string();
-                            self.logs.push(format!("[ERROR] {}", msg));
+                            self.push_log(format!("[ERROR] {}", msg));
                             self.status_message = msg;
                             on_update(self);
                             return;
@@ -2031,7 +2230,7 @@ impl TuiApp {
                             Ok(c) => Some(c),
                             Err(err) => {
                                 let msg = format!("Failed to initialize Tailscale client: {}", err);
-                                self.logs.push(format!("[ERROR] {}", msg));
+                                self.push_log(format!("[ERROR] {}", msg));
                                 self.status_message = msg;
                                 on_update(self);
                                 return;
@@ -2051,7 +2250,7 @@ impl TuiApp {
                             active && inst.name.trim().eq_ignore_ascii_case(&desired_hostname)
                         }),
                         Err(err) => {
-                            self.logs.push(format!(
+                            self.push_log(format!(
                                 "[PROVISION] Warning: failed to list existing {} instances ({}); creating new",
                                 provider_display_label(self.selected_provider),
                                 err
@@ -2069,7 +2268,7 @@ impl TuiApp {
                             .filter(|s| !s.is_empty())
                             .unwrap_or("")
                             .to_string();
-                        self.logs.push(format!(
+                        self.push_log(format!(
                             "[PROVISION] Reusing existing {} instance '{}' (id={}, public_ip={})",
                             provider_display_label(self.selected_provider),
                             desired_hostname,
@@ -2091,7 +2290,7 @@ impl TuiApp {
                         on_update(self);
 
                         let resolved_ip = if tailscale_mode {
-                            self.logs.push(format!(
+                            self.push_log(format!(
                                 "[PROVISION] Waiting for Tailscale device '{}'...",
                                 desired_hostname
                             ));
@@ -2112,7 +2311,7 @@ impl TuiApp {
                                         "Failed to find Tailscale device '{}': {}",
                                         desired_hostname, err
                                     );
-                                    self.logs.push(format!("[ERROR] {}", msg));
+                                    self.push_log(format!("[ERROR] {}", msg));
                                     self.status_message = msg;
                                     on_update(self);
                                     return;
@@ -2125,7 +2324,7 @@ impl TuiApp {
                                     provider_display_label(self.selected_provider),
                                     desired_hostname
                                 );
-                                self.logs.push(format!("[ERROR] {}", msg));
+                                self.push_log(format!("[ERROR] {}", msg));
                                 self.status_message = msg;
                                 on_update(self);
                                 return;
@@ -2170,7 +2369,7 @@ impl TuiApp {
                             })
                             .unwrap_or_default();
 
-                        self.logs.push(format!(
+                        self.push_log(format!(
                             "[PROVISION] Creating {} instance '{}' (region={}, plan={})...",
                             provider_display_label(self.selected_provider),
                             self.access.hostname,
@@ -2222,7 +2421,7 @@ impl TuiApp {
                                     Some(res.tailscale_ip.clone())
                                 };
                                 self.session.vps_ip = Some(res.ip.clone());
-                                self.logs.push(format!(
+                                self.push_log(format!(
                                     "[PROVISION] {} ready: instance={}, ip={}",
                                     provider_display_label(self.selected_provider),
                                     res.instance_id,
@@ -2233,7 +2432,7 @@ impl TuiApp {
                             }
                             Err(err) => {
                                 let msg = format!("Provision failed: {}", err);
-                                self.logs.push(format!("[ERROR] {}", msg));
+                                self.push_log(format!("[ERROR] {}", msg));
                                 self.status_message = msg;
                                 on_update(self);
                                 return;
@@ -2258,7 +2457,7 @@ impl TuiApp {
                         "203.0.113.10".to_string()
                     };
                     self.last_dry_run_target = Some(sim_ip.clone());
-                    self.logs.push(format!(
+                    self.push_log(format!(
                         "[DRY-RUN] Simulated Existing Tailscale target -> {}",
                         sim_ip
                     ));
@@ -2266,7 +2465,7 @@ impl TuiApp {
                     sim_ip
                 } else {
                     let msg = "No target IP (VPS_IP) configured for Existing Tailscale".to_string();
-                    self.logs.push(format!("[ERROR] {}", msg));
+                    self.push_log(format!("[ERROR] {}", msg));
                     self.status_message = msg;
                     on_update(self);
                     return;
@@ -2276,9 +2475,9 @@ impl TuiApp {
         };
 
         let github_deploy = if self.github_deploy.enabled {
-            let repo = self.github_deploy.repo.trim();
+            let repo = self.github_deploy.repo.trim().to_string();
             if repo.is_empty() {
-                self.logs.push(
+                self.push_log(
                     "[GITHUB] Warning: GitHub Deploy is ON but GITHUB_REPO is empty".to_string(),
                 );
                 None
@@ -2308,12 +2507,12 @@ impl TuiApp {
                     }
                 };
                 let github_token = self.resolve_api_key(&self.api_keys.github, "GITHUB_TOKEN");
-                self.logs.push(format!(
+                self.push_log(format!(
                     "[GITHUB] Deploying '{}' (branch: {})",
                     repo, branch
                 ));
                 Some(GithubDeployConfig {
-                    repo: repo.to_string(),
+                    repo,
                     branch,
                     deploy_path,
                     deploy_cmd,
@@ -2322,8 +2521,7 @@ impl TuiApp {
                 })
             }
         } else {
-            self.logs
-                .push("[GITHUB] GitHub Repo Deploy is OFF (skipped)".to_string());
+            self.push_log("[GITHUB] GitHub Repo Deploy is OFF (skipped)".to_string());
             None
         };
 
@@ -2336,6 +2534,7 @@ impl TuiApp {
             provider_name: self.selected_provider.to_string(),
             tailscale_mode,
             ssh_pubkey: ssh_cred.as_ref().map(|(_, pk)| pk.clone()),
+            sudo_nopasswd: self.access.sudo_nopasswd,
             dry_run: self.build_dry_run,
             github_deploy,
         };
@@ -2357,7 +2556,7 @@ impl TuiApp {
         };
 
         if !self.build_dry_run {
-            self.logs.push(format!(
+            self.push_log(format!(
                 "[SSH] Waiting for SSH readiness on {}...",
                 target_ip
             ));
@@ -2403,7 +2602,7 @@ impl TuiApp {
                         target_ip,
                         candidates.join(", ")
                     );
-                    self.logs.push(format!("[ERROR] {}", msg));
+                    self.push_log(format!("[ERROR] {}", msg));
                     self.status_message = msg;
                     on_update(self);
                     return;
@@ -2411,7 +2610,7 @@ impl TuiApp {
                 std::thread::sleep(poll_interval);
             };
 
-            self.logs.push(format!(
+            self.push_log(format!(
                 "[SSH] Connected to {}@{}",
                 connected_user, target_ip
             ));
@@ -2425,7 +2624,7 @@ impl TuiApp {
             on_update(self);
         }) {
             let msg = format!("Build failed: {}", err);
-            self.logs.push(format!("[ERROR] {}", msg));
+            self.push_log(format!("[ERROR] {}", msg));
             self.status_message = msg;
             on_update(self);
             return;
@@ -2457,23 +2656,20 @@ impl TuiApp {
                     .resolve_api_key(&self.api_keys.cloudflare, "CLOUDFLARE_API_TOKEN")
                     .is_some();
                 match build_cloudflare_dns_stub_plan(&dns_cfg, has_token) {
-                    Ok(plan) => self.logs.push(format!("[DNS] {}", plan)),
-                    Err(err) => self.logs.push(format!("[DNS] Error: {}", err)),
+                    Ok(plan) => self.push_log(format!("[DNS] {}", plan)),
+                    Err(err) => self.push_log(format!("[DNS] Error: {}", err)),
                 }
             } else {
-                self.logs
-                    .push("[DNS] Warning: DNS is ON but CF_ZONE is empty".to_string());
+                self.push_log("[DNS] Warning: DNS is ON but CF_ZONE is empty".to_string());
             }
         } else {
-            self.logs
-                .push("[DNS] Cloudflare DNS is OFF (skipped)".to_string());
+            self.push_log("[DNS] Cloudflare DNS is OFF (skipped)".to_string());
         }
 
         if !self.build_dry_run {
             if let Some(ref st) = state_opt {
                 if let Err(err) = st.save_session(&self.session) {
-                    self.logs
-                        .push(format!("[WARN] Failed to save session state: {}", err));
+                    self.push_log(format!("[WARN] Failed to save session state: {}", err));
                 }
             }
         }
@@ -2509,6 +2705,7 @@ impl TuiApp {
             Screen::ApiKeys => self.render_api_keys(frame, chunks[1]),
             Screen::BuildBox => self.render_build_box(frame, chunks[1]),
             Screen::RunningInstances => self.render_running_instances(frame, chunks[1]),
+            Screen::ViewLog => self.render_view_log(frame, chunks[1]),
         }
         self.render_bottom_pane(frame, chunks[2]);
         self.render_footer(frame, chunks[3]);
@@ -2525,6 +2722,7 @@ impl TuiApp {
             Screen::ApiKeys => "API Key Settings",
             Screen::BuildBox => "Build Box with Current Options",
             Screen::RunningInstances => "Running Systems & Destroy",
+            Screen::ViewLog => "View Log",
         };
         let header = Paragraph::new(Line::from(vec![
             Span::styled(
@@ -2542,7 +2740,7 @@ impl TuiApp {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect) {
         let hints = match self.screen {
-            Screen::Home => "Up/Down or j/k: Navigate | 1-9/Enter: Open | q: Quit",
+            Screen::Home => "Up/Down or j/k: Navigate | 1-9/0/Enter: Open | q: Quit",
             Screen::SelectProvider => {
                 "Up/Down or j/k: Provider | r: Region | p: Plan | i: Image | 1-5/Enter/s: Save | Esc/b/q: Back"
             }
@@ -2553,7 +2751,7 @@ impl TuiApp {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::AccessConfig => {
-                "Up/Down or j/k: Field | Space/Enter/Left/Right: Toggle/Edit | s: Save | Esc/b/q: Back"
+                "Up/Down or j/k: Field | Space/Enter/Left/Right: Toggle/Edit | p: Sudo | s: Save | Esc/b/q: Back"
             }
             Screen::CloudflareDns if self.cf_dns.editing => {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
@@ -2574,13 +2772,16 @@ impl TuiApp {
                 "Up/Down or j/k: Field | Enter/e: Edit (Auto-Saves) | s: Save | Esc/b/q: Back"
             }
             Screen::BuildBox => {
-                "Enter/x: Start Build | d/Space: Toggle DNS | g: Toggle GitHub | n: Toggle Dry-Run | Esc/b/q: Back"
+                "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | n: Dry-Run | Esc/b/q: Back"
             }
             Screen::RunningInstances if self.running_confirm_destroy => {
                 "y/Enter: Confirm Destroy | n/Esc/b/q: Cancel"
             }
             Screen::RunningInstances => {
                 "Up/Down or j/k: Select | r: Refresh | d/x/Del: Destroy | Esc/b/q: Back"
+            }
+            Screen::ViewLog => {
+                "Up/Down/j/k/PgUp/PgDn/g/G: Scroll | r: Reload | c: Clear Log | Esc/b/q: Back"
             }
         };
         let footer = Paragraph::new(vec![
@@ -2603,7 +2804,10 @@ impl TuiApp {
         let items: Vec<ListItem> = HOME_MENU_ITEMS
             .iter()
             .enumerate()
-            .map(|(i, label)| ListItem::new(format!("[{}] {}", i + 1, label)))
+            .map(|(i, label)| {
+                let key_num = if i == 9 { 0 } else { i + 1 };
+                ListItem::new(format!("[{}] {}", key_num, label))
+            })
             .collect();
         let menu = List::new(items)
             .block(
@@ -2729,9 +2933,17 @@ impl TuiApp {
                 server_role
             )),
             Line::from(format!(
-                "Transport Mode: {} | User: {} | Host: {}",
-                transport_mode, username, hostname
+                "Transport Mode: {} | Host: {}",
+                transport_mode, hostname
             )),
+            Line::from(vec![
+                Span::raw(format!("Sudo User: {} (passwordless: ", username)),
+                Span::styled(
+                    if self.access.sudo_nopasswd { "ON" } else { "OFF" },
+                    toggle_style(self.access.sudo_nopasswd),
+                ),
+                Span::raw(")"),
+            ]),
             Line::from(format!("SSH Key (SSH_KEY): {}", ssh_key)),
             Line::from(format!(
                 "Target IP: {} | Public IP: {} | Tailscale IP: {}",
@@ -2761,6 +2973,11 @@ impl TuiApp {
                 Span::raw(format!(", branch={})", github_branch)),
             ]),
             Line::from(format!("API Keys: {}", key_ready)),
+            Line::from(format!(
+                "Log File: {} (max {} MB)",
+                self.resolved_log_display(),
+                MAX_LOG_FILE_BYTES / (1024 * 1024)
+            )),
         ];
         let summary = Paragraph::new(summary_lines)
             .block(
@@ -3081,6 +3298,14 @@ impl TuiApp {
                 self.access.hostname,
                 edit_tag(3)
             )),
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{} (SUDO_NOPASSWD): ", ACCESS_FIELD_LABELS[4])),
+                Span::styled(
+                    self.access.sudo_nopasswd_label(),
+                    toggle_style(self.access.sudo_nopasswd),
+                ),
+                Span::raw(" (Space/Enter/Left/Right or 'p' to toggle)"),
+            ])),
         ];
 
         let list = List::new(items)
@@ -3106,10 +3331,24 @@ impl TuiApp {
             self.access.ssh_key_path.as_str()
         };
         let preview = Paragraph::new(vec![
-            Line::from(format!("TRANSPORT_MODE: {}", self.access.transport_mode_str())),
+            Line::from(format!(
+                "TRANSPORT_MODE: {}  |  TAILSCALE_HOSTNAME: {}",
+                self.access.transport_mode_str(),
+                self.access.hostname
+            )),
             Line::from(format!("USERNAME:       {}", self.access.username)),
             Line::from(format!("SSH_KEY:        {}", effective_ssh_key)),
-            Line::from(format!("TAILSCALE_HOSTNAME: {}", self.access.hostname)),
+            Line::from(vec![
+                Span::raw("SUDO_NOPASSWD:  "),
+                Span::styled(
+                    if self.access.sudo_nopasswd {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                    toggle_style(self.access.sudo_nopasswd),
+                ),
+            ]),
         ])
         .block(
             Block::default()
@@ -3643,6 +3882,14 @@ impl TuiApp {
             )),
             Line::from(format!("SSH Key Path: {}", ssh_key_display)),
             Line::from(vec![
+                Span::raw("Passwordless Sudo: "),
+                Span::styled(
+                    self.access.sudo_nopasswd_label(),
+                    toggle_style(self.access.sudo_nopasswd),
+                ),
+                Span::raw("  ['p': Toggle Passwordless Sudo]"),
+            ]),
+            Line::from(vec![
                 Span::raw("Cloudflare DNS: "),
                 Span::styled(dns_state, toggle_style(self.cf_dns.enabled)),
                 Span::raw(format!(
@@ -3682,7 +3929,7 @@ impl TuiApp {
         frame.render_widget(overview, rows[0]);
 
         let actions = Paragraph::new(Line::from(Span::styled(
-            "Enter/'x': Start Build | d/Space: Toggle DNS | g: Toggle GitHub | n: Dry-Run | Esc/b/q: Back",
+            "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | n: Dry-Run | Esc/b/q: Back",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )))
         .block(Block::default().borders(Borders::ALL));
@@ -3797,10 +4044,65 @@ impl TuiApp {
         frame.render_widget(banner, rows[2]);
     }
 
+    fn render_view_log(&self, frame: &mut Frame, area: Rect) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Min(4)])
+            .split(area);
+
+        let viewport_block = Block::default()
+            .title(" Log Contents (bab.log) ")
+            .borders(Borders::ALL);
+        let inner = viewport_block.inner(rows[1]);
+        let visible_rows = inner.height.max(1) as usize;
+        let total_lines = self.log_view_lines.len();
+        let start = self
+            .log_scroll
+            .min(total_lines.saturating_sub(visible_rows));
+        let end = (start + visible_rows).min(total_lines);
+
+        let size_bytes = self
+            .log_path
+            .as_ref()
+            .map(|p| LogStore::new(p).file_size())
+            .unwrap_or(0);
+        let max_mb = MAX_LOG_FILE_BYTES as f64 / (1024.0 * 1024.0);
+        let summary_lines = vec![
+            Line::from(format!(
+                "Log File: {} (0600 permissions)",
+                self.resolved_log_display()
+            )),
+            Line::from(format!(
+                "Size: {} / {:.2} MB max (auto-trimmed)",
+                format_log_bytes(size_bytes),
+                max_mb
+            )),
+            Line::from(format!("Entries: {} lines | Offset: {}", total_lines, start)),
+        ];
+        let summary = Paragraph::new(summary_lines)
+            .block(Block::default().title(" Log Summary ").borders(Borders::ALL))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(summary, rows[0]);
+
+        let content_lines: Vec<Line> = if self.log_view_lines.is_empty() {
+            vec![Line::from(Span::styled(
+                "No log entries recorded yet. Run a build or setup to populate bab.log.",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            self.log_view_lines[start..end]
+                .iter()
+                .map(|line| Line::from(Span::styled(line.as_str(), style_log_line(line))))
+                .collect()
+        };
+        let viewport = Paragraph::new(content_lines).block(viewport_block);
+        frame.render_widget(viewport, rows[1]);
+    }
+
     fn render_bottom_pane(&self, frame: &mut Frame, area: Rect) {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
             .split(area);
 
         // Left half: Setup Progress & Logs
@@ -3923,11 +4225,12 @@ impl TuiApp {
             .as_deref()
             .or(self.selected_plan.as_deref())
             .unwrap_or("-");
+        let role_short = self.selected_role.to_string();
         let role = self
             .session
             .server_role
             .as_deref()
-            .unwrap_or(self.selected_role.label());
+            .unwrap_or(&role_short);
         let transport = self
             .session
             .transport_mode
@@ -3962,7 +4265,18 @@ impl TuiApp {
             Line::from(format!("Tailscale IP:  {}", tailscale_ip)),
             Line::from(format!("Target IP:     {}", target_ip)),
             Line::from(format!("Region/Plan:   {} / {} ({})", region, plan, provider)),
-            Line::from(format!("Role/Mode/Usr: {} / {} / {}", role, transport, username)),
+            Line::from(vec![
+                Span::raw(format!("Role/Mode/Usr: {}/{}/{} (", role, transport, username)),
+                Span::styled(
+                    if self.access.sudo_nopasswd {
+                        "nopasswd"
+                    } else {
+                        "passwd"
+                    },
+                    toggle_style(self.access.sudo_nopasswd),
+                ),
+                Span::raw(")"),
+            ]),
             Line::from(vec![
                 Span::raw("DNS / Repo:    "),
                 Span::styled(
@@ -4025,6 +4339,38 @@ fn yes_no(val: bool) -> &'static str {
         "ok"
     } else {
         "missing"
+    }
+}
+
+fn format_log_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn style_log_line(line: &str) -> Style {
+    if line.contains("[OK]") || line.contains("[DONE]") {
+        Style::default().fg(Color::Green)
+    } else if line.contains("[ERROR]") || line.contains("[FAIL]") {
+        Style::default().fg(Color::Red)
+    } else if line.contains("[DRY-RUN]") || line.contains("[WARN]") {
+        Style::default().fg(Color::Yellow)
+    } else if line.contains("[BUILD]")
+        || line.contains("[PROVISION]")
+        || line.contains("[SSH]")
+        || line.contains("[GITHUB]")
+        || line.contains("[DNS]")
+        || line.contains("[DESTROY]")
+        || line.contains("[QUERY]")
+        || line.contains("[CLOUD-INIT]")
+    {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
     }
 }
 
@@ -4191,7 +4537,9 @@ mod tests {
         assert!(text.contains("[6] API Key Settings"));
         assert!(text.contains("[7] Build Box with Current Options"));
         assert!(text.contains("[8] Running Systems & Destroy"));
-        assert!(text.contains("[9] Quit"));
+        assert!(text.contains("[9] View Log"));
+        assert!(text.contains("[0] Quit"));
+        assert!(text.contains("Log File: ~/.config/bab/bab.log (max 10 MB)"));
         assert!(!text.contains("Cloudflare DNS (Stub)"));
         assert!(!text.contains("API Key Settings (Encrypted)"));
         assert!(text.contains("Setup Progress & Logs"));
@@ -4857,6 +5205,7 @@ mod tests {
             Screen::ApiKeys,
             Screen::BuildBox,
             Screen::RunningInstances,
+            Screen::ViewLog,
         ] {
             app.screen = screen;
             let text = render_to_string(&app);
@@ -4929,8 +5278,16 @@ mod tests {
         assert_eq!(app.selected_provider, ProviderKind::UpCloud);
         assert_eq!(app.screen, Screen::Home);
 
-        // Shortcut '9' quits
+        // Shortcut '9' opens ViewLog and 'q' returns Home without quitting
         app.handle_key(key(KeyCode::Char('9')));
+        assert_eq!(app.screen, Screen::ViewLog);
+        assert!(!app.should_quit);
+        app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.should_quit);
+
+        // Shortcut '0' quits
+        app.handle_key(key(KeyCode::Char('0')));
         assert!(app.should_quit);
     }
 
@@ -4948,6 +5305,7 @@ mod tests {
             Screen::ApiKeys,
             Screen::BuildBox,
             Screen::RunningInstances,
+            Screen::ViewLog,
         ] {
             app.screen = screen;
             let rendered = render_to_string(&app);
@@ -4968,7 +5326,7 @@ mod tests {
         }
 
         let home_rendered = render_to_string(&app);
-        assert!(home_rendered.contains("1-9/Enter: Open | q: Quit"));
+        assert!(home_rendered.contains("1-9/0/Enter: Open | q: Quit"));
 
         app.handle_key(key(KeyCode::Char('q')));
         assert!(app.should_quit);
@@ -5504,6 +5862,7 @@ mod tests {
                 provider_name: app.selected_provider.to_string(),
                 tailscale_mode: true,
                 ssh_pubkey: None,
+                sudo_nopasswd: true,
                 dry_run: true,
                 github_deploy: Some(GithubDeployConfig {
                     repo: "octocat/my-app".to_string(),
@@ -5708,6 +6067,395 @@ esac"#
         assert!(app.logs.iter().any(|l| l == "  mock ok line 2"));
         assert!(app.logs.iter().any(|l| l == "  mock ok line 3"));
         assert!(!app.logs.iter().any(|l| l == "  mock ok line 1"));
+        // Persistent log retains full step output including line 1
+        let persisted = LogStore::new(app.log_path.as_ref().unwrap()).read_lines()?;
+        assert!(persisted.iter().any(|l| l.contains("mock ok line 1")));
+        Ok(())
+    }
+
+    #[test]
+    fn from_paths_resolves_bab_log_file_env_and_sibling_fallback() -> Result<()> {
+        struct EnvGuard(Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("BAB_LOG_FILE", v),
+                    None => std::env::remove_var("BAB_LOG_FILE"),
+                }
+            }
+        }
+
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard(std::env::var("BAB_LOG_FILE").ok());
+        std::env::remove_var("BAB_LOG_FILE");
+
+        let in_mem = TuiApp::new(SessionData::default(), ApiKeyForm::default());
+        assert_eq!(in_mem.log_path, None);
+        assert_eq!(in_mem.resolved_log_display(), "~/.config/bab/bab.log");
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let app_sibling = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert_eq!(app_sibling.log_path, Some(dir.path().join("bab.log")));
+
+        let custom_log = dir.path().join("nested").join("custom.log");
+        std::env::set_var("BAB_LOG_FILE", format!("  {}  ", custom_log.display()));
+        let app_env = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert_eq!(app_env.log_path, Some(custom_log));
+        Ok(())
+    }
+
+    #[test]
+    fn view_log_persists_dry_run_build_reloads_scrolls_and_clears() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+        let log_path = dir.path().join("bab.log");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert_eq!(app.log_path.as_ref(), Some(&log_path));
+
+        // Open ViewLog before any entries and verify helpful empty message
+        app.handle_key(key(KeyCode::Char('9')));
+        assert_eq!(app.screen, Screen::ViewLog);
+        let empty_view = render_to_string(&app);
+        assert!(empty_view.contains("View Log"));
+        assert!(empty_view.contains("Log Contents (bab.log)"));
+        assert!(empty_view.contains("0600 permissions"));
+        assert!(empty_view.contains("10.00 MB max (auto-trimmed)"));
+        assert!(empty_view.contains("No log entries recorded yet."));
+        app.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.should_quit);
+
+        // Run a dry-run build and verify bab.log persists entries on disk
+        app.build_dry_run = true;
+        app.execute_build();
+        let disk_lines = LogStore::new(&log_path).read_lines()?;
+        assert!(!disk_lines.is_empty());
+        assert!(disk_lines.iter().any(|l| l.contains("[BUILD] Starting DRY-RUN build")));
+        assert!(disk_lines.iter().any(|l| l.contains("[DRY-RUN] Simulated")));
+        assert!(disk_lines.iter().any(|l| l.contains("[DRY-RUN] System Update & Base Packages")));
+        assert!(disk_lines.iter().any(|l| l.contains("[DNS] Cloudflare DNS is OFF (skipped)")));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&log_path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // Open ViewLog via '9' and verify contents + scrolling
+        app.handle_key(key(KeyCode::Char('9')));
+        assert_eq!(app.screen, Screen::ViewLog);
+        assert_eq!(app.log_scroll, app.log_view_lines.len().saturating_sub(1));
+
+        let view = render_to_string(&app);
+        assert!(view.contains("Entries:"));
+        assert!(view.contains("Log Contents (bab.log)"));
+
+        // Home ('g'), Down ('j'), PageDown ('d'), PageUp ('u'), End ('G'), Up ('k')
+        app.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(app.log_scroll, 0);
+        let top_view = render_to_string(&app);
+        assert!(top_view.contains("[BUILD] Starting DRY-RUN build"));
+        assert!(top_view.contains("Offset: 0"));
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.log_scroll, 1);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.log_scroll, 0);
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.log_scroll > 0);
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.log_scroll, 0);
+        app.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(app.log_scroll, app.log_view_lines.len().saturating_sub(1));
+
+        // External write to bab.log + 'r' reloads it
+        LogStore::new(&log_path).append_line("[2026-11-15T20:00:00Z] [OK] External reload marker")?;
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(app
+            .log_view_lines
+            .iter()
+            .any(|l| l.contains("External reload marker")));
+        assert_eq!(app.status_message, "Reloaded log file from disk");
+        let reloaded_view = render_to_string(&app);
+        assert!(reloaded_view.contains("External reload marker"));
+
+        // 'c' clears bab.log, log_view_lines, and logs
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.log_view_lines.is_empty());
+        assert!(app.logs.is_empty());
+        assert_eq!(app.log_scroll, 0);
+        assert_eq!(app.status_message, "Cleared bab.log");
+        assert!(LogStore::new(&log_path).read_lines()?.is_empty());
+
+        // 'b' returns to Home without quitting
+        app.handle_key(key(KeyCode::Char('b')));
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.should_quit);
+        Ok(())
+    }
+
+    #[test]
+    fn access_config_sudo_nopasswd_toggles_saves_and_reloads() -> Result<()> {
+        let _lock = crate::env_lock();
+
+        // AccessForm::from_session parsing variants
+        for raw in ["false", " FALSE ", "0", "no", "OFF"] {
+            let form = AccessForm::from_session(&SessionData {
+                sudo_nopasswd: Some(raw.to_string()),
+                ..Default::default()
+            });
+            assert!(
+                !form.sudo_nopasswd,
+                "expected '{}' to disable sudo_nopasswd",
+                raw
+            );
+        }
+        for raw in ["true", " TRUE ", "1", "yes", "On", "unrecognized"] {
+            let form = AccessForm::from_session(&SessionData {
+                sudo_nopasswd: Some(raw.to_string()),
+                ..Default::default()
+            });
+            assert!(
+                form.sudo_nopasswd,
+                "expected '{}' to enable sudo_nopasswd",
+                raw
+            );
+        }
+        assert!(AccessForm::from_session(&SessionData::default()).sudo_nopasswd);
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert!(app.access.sudo_nopasswd);
+
+        app.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(app.screen, Screen::AccessConfig);
+        assert_eq!(app.access.active_field, 0);
+
+        // 'e' on field 0 (Transport Mode) must not enter text-editing mode
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(!app.access.editing);
+
+        // 'p' from field 0 toggles sudo_nopasswd OFF and updates status_message
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(!app.access.sudo_nopasswd);
+        assert!(app.status_message.contains("OFF (password required)"));
+
+        // Navigate to field 4 (Passwordless Sudo)
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.access.active_field, 4);
+
+        // 'e' on field 4 must not enter text-editing mode
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(!app.access.editing);
+
+        // Toggle via Space, Enter, Left, Right on field 4
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.access.sudo_nopasswd);
+        assert!(app.status_message.contains("ON (NOPASSWD:ALL)"));
+        assert!(!app.access.editing);
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.access.sudo_nopasswd);
+        assert!(!app.access.editing);
+
+        app.handle_key(key(KeyCode::Left));
+        assert!(app.access.sudo_nopasswd);
+
+        app.handle_key(key(KeyCode::Right));
+        assert!(!app.access.sudo_nopasswd);
+
+        // Preview pane shows SUDO_NOPASSWD:  false
+        let preview_off = render_to_string(&app);
+        assert!(preview_off.contains("SUDO_NOPASSWD:  false"));
+        assert!(preview_off.contains("Passwordless Sudo (SUDO_NOPASSWD): OFF (password required)"));
+
+        // Save with 's' -> persists SUDO_NOPASSWD="false"
+        app.handle_key(key(KeyCode::Char('s')));
+        let state = SessionState::new(&state_path);
+        assert_eq!(state.sudo_nopasswd()?, Some("false".to_string()));
+        assert_eq!(app.session.sudo_nopasswd.as_deref(), Some("false"));
+
+        // Reload via from_paths and verify false is restored
+        let mut reloaded = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert!(!reloaded.access.sudo_nopasswd);
+
+        // Toggle back ON via 'p' and save -> persists SUDO_NOPASSWD="true"
+        reloaded.screen = Screen::AccessConfig;
+        reloaded.handle_key(key(KeyCode::Char('p')));
+        assert!(reloaded.access.sudo_nopasswd);
+        reloaded.handle_key(key(KeyCode::Char('s')));
+        assert_eq!(state.sudo_nopasswd()?, Some("true".to_string()));
+
+        let reloaded_on = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert!(reloaded_on.access.sudo_nopasswd);
+        Ok(())
+    }
+
+    #[test]
+    fn build_box_sudo_nopasswd_syncs_renders_colors_and_fits_sizes() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.screen = Screen::BuildBox;
+
+        // Verify ON rendering & bright green color on BuildBox, AccessConfig, Home, and bottom pane
+        let bb_on_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(
+            &bb_on_buf,
+            "Passwordless Sudo: ON (NOPASSWD:ALL)",
+            "ON (NOPASSWD:ALL)",
+            Color::LightGreen,
+        );
+        assert_token_fg_in_row(&bb_on_buf, "(nopasswd)", "nopasswd", Color::LightGreen);
+
+        // Toggle OFF in BuildBox via 'p' -> persists immediately and syncs everywhere
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(!app.access.sudo_nopasswd);
+        assert!(app.status_message.contains("OFF (password required)"));
+
+        let state = SessionState::new(&state_path);
+        assert_eq!(state.sudo_nopasswd()?, Some("false".to_string()));
+        assert_eq!(app.session.sudo_nopasswd.as_deref(), Some("false"));
+
+        let bb_off_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(
+            &bb_off_buf,
+            "Passwordless Sudo: OFF (password required)",
+            "OFF (password required)",
+            Color::LightRed,
+        );
+        assert_token_fg_in_row(&bb_off_buf, "(passwd)", "passwd", Color::LightRed);
+
+        // AccessConfig reflects BuildBox toggle and uses LightRed / LightGreen
+        app.screen = Screen::AccessConfig;
+        let ac_off_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(
+            &ac_off_buf,
+            "Passwordless Sudo (SUDO_NOPASSWD): OFF (password required)",
+            "OFF (password required)",
+            Color::LightRed,
+        );
+        assert_token_fg_in_row(&ac_off_buf, "SUDO_NOPASSWD:  false", "false", Color::LightRed);
+
+        app.access.toggle_sudo_nopasswd();
+        let ac_on_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(
+            &ac_on_buf,
+            "Passwordless Sudo (SUDO_NOPASSWD): ON (NOPASSWD:ALL)",
+            "ON (NOPASSWD:ALL)",
+            Color::LightGreen,
+        );
+        assert_token_fg_in_row(&ac_on_buf, "SUDO_NOPASSWD:  true", "true", Color::LightGreen);
+        app.access.toggle_sudo_nopasswd();
+
+        // Home reflects OFF (LightRed) and ON (LightGreen)
+        app.screen = Screen::Home;
+        let home_off_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(&home_off_buf, "(passwordless: OFF)", "OFF", Color::LightRed);
+
+        // Verify 120x40 frame and 80x24 render_build_box fit cleanly without clipping lines
+        app.screen = Screen::BuildBox;
+        let render_dims = |w: u16, h: u16, full_frame: bool| -> String {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    if full_frame {
+                        app.render_frame(frame);
+                    } else {
+                        app.render_build_box(frame, frame.area());
+                    }
+                })
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let mut out = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if let Some(cell) = buf.cell((x, y)) {
+                        out.push_str(cell.symbol());
+                    }
+                }
+                out.push('\n');
+            }
+            out
+        };
+
+        let large = render_dims(120, 40, true);
+        assert!(large.contains("Provider:"));
+        assert!(large.contains("Passwordless Sudo: OFF (password required)"));
+        assert!(large.contains("['p': Toggle Passwordless Sudo]"));
+        assert!(large.contains("Credentials:"));
+        assert!(large.contains("p: Sudo"));
+
+        let small = render_dims(80, 24, false);
+        assert!(small.contains("Provider:"));
+        assert!(small.contains("Passwordless Sudo: OFF (password required)"));
+        assert!(small.contains("Credentials:"));
+        assert!(small.contains("p: Sudo"));
+        Ok(())
+    }
+
+    #[test]
+    fn dry_run_build_with_sudo_nopasswd_false_propagates_to_setup_config() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.build_dry_run = true;
+        app.screen = Screen::BuildBox;
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(!app.access.sudo_nopasswd);
+
+        let log_path = dir.path().join("bab.log");
+        app.execute_build();
+
+        assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[BUILD] Starting DRY-RUN build") && l.contains("sudo_nopasswd=OFF")));
+
+        // Verify persisted log (which records full dry-run scripts) contains CreateUser without
+        // NOPASSWD:ALL and ConfigureMotd cleanup of /etc/sudoers.d/.
+        let disk_log = LogStore::new(&log_path).read_lines()?.join("\n");
+        assert!(!disk_log.contains("NOPASSWD:ALL"));
+        assert!(disk_log.contains("rm -f \"/etc/sudoers.d/${NEW_USER}\""));
+
+        // Also directly assert SetupConfig propagation semantics used by execute_build_with_ui
+        let cfg = SetupConfig {
+            host: "100.64.0.1".to_string(),
+            ssh_user: "root".to_string(),
+            new_username: app.access.username.clone(),
+            hostname: app.access.hostname.clone(),
+            role: app.selected_role,
+            provider_name: app.selected_provider.to_string(),
+            tailscale_mode: app.is_tailscale_mode(),
+            ssh_pubkey: None,
+            sudo_nopasswd: app.access.sudo_nopasswd,
+            dry_run: true,
+            github_deploy: None,
+        };
+        let create_user_script = crate::setup::build_step_script(SetupStepKind::CreateUser, &cfg);
+        assert!(!create_user_script.contains("NOPASSWD:ALL"));
+        let motd_script = crate::setup::build_step_script(SetupStepKind::ConfigureMotd, &cfg);
+        assert!(motd_script.contains("rm -f \"/etc/sudoers.d/${NEW_USER}\""));
         Ok(())
     }
 }

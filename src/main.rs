@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use bab::config::{default_config_dir, SessionData, SessionState, Settings};
+use bab::config::{
+    default_config_dir, LogStore, SessionData, SessionState, Settings, MAX_LOG_FILE_BYTES,
+};
 use bab::dns::{build_cloudflare_dns_stub_plan, CloudflareDnsConfig};
 use bab::providers::linode::LinodeProvider;
 use bab::providers::upcloud::UpCloudProvider;
@@ -184,6 +186,12 @@ struct SetupArgs {
     /// Non-root deploy user to create
     #[arg(long, default_value = "deploy")]
     user: String,
+    /// Grant passwordless sudo (NOPASSWD:ALL) to the created user (overrides saved state)
+    #[arg(long)]
+    sudo_nopasswd: bool,
+    /// Require a password for sudo instead of NOPASSWD:ALL (overrides saved state)
+    #[arg(long, conflicts_with = "sudo_nopasswd")]
+    no_sudo_nopasswd: bool,
     /// Initial SSH login user for remote setup
     #[arg(long, default_value = "root")]
     ssh_user: String,
@@ -758,6 +766,7 @@ struct SetupSessionUpdate<'a> {
     username: &'a str,
     hostname: &'a str,
     tailscale_mode: bool,
+    sudo_nopasswd: bool,
     key_path: Option<&'a Path>,
     catalog: (Option<&'a str>, Option<&'a str>, Option<&'a str>),
     provisioned_ips: Option<(Option<&'a str>, Option<&'a str>)>,
@@ -771,6 +780,7 @@ fn persist_setup_session(session: &SessionState, update: &SetupSessionUpdate<'_>
     data.vps_ip = Some(update.target.to_string());
     data.username = Some(update.username.to_string());
     data.tailscale_hostname = Some(update.hostname.to_string());
+    data.sudo_nopasswd = Some(if update.sudo_nopasswd { "true" } else { "false" }.to_string());
     data.vps_region = update.catalog.0.map(str::to_string);
     data.vps_plan = update.catalog.1.map(str::to_string);
     data.vps_image = update.catalog.2.map(str::to_string);
@@ -960,6 +970,27 @@ fn parse_truthy(val: Option<&str>) -> bool {
     })
 }
 
+fn parse_sudo_nopasswd(val: Option<&str>) -> bool {
+    !matches!(
+        val.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false" | "0" | "no" | "off")
+    )
+}
+
+fn resolve_sudo_nopasswd(
+    sudo_nopasswd: bool,
+    no_sudo_nopasswd: bool,
+    session: &SessionData,
+) -> bool {
+    if no_sudo_nopasswd {
+        false
+    } else if sudo_nopasswd {
+        true
+    } else {
+        parse_sudo_nopasswd(session.sudo_nopasswd.as_deref())
+    }
+}
+
 struct PlannedCloudflareDns {
     zone: String,
     record_name: String,
@@ -976,9 +1007,34 @@ fn persist_cf_session(session: &SessionState, dns: &CloudflareDnsConfig) -> Resu
     Ok(())
 }
 
+fn resolve_cli_log_store(settings: &Settings) -> LogStore {
+    if let Ok(val) = std::env::var("BAB_LOG_FILE") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return LogStore::new(PathBuf::from(trimmed));
+        }
+    }
+    if let Some(parent) = settings
+        .path()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        return LogStore::new(parent.join("bab.log"));
+    }
+    LogStore::load_default().unwrap_or_else(|_| LogStore::new("bab.log"))
+}
+
+fn append_cli_log(log: &LogStore, lines: &[String]) {
+    let _ = log.append_timestamped_lines(lines);
+}
+
 fn cmd_setup(args: SetupArgs) -> Result<()> {
     let settings = Settings::load_default()?;
     let session = SessionState::load_default()?;
+    let session_data = session.load_session().unwrap_or_else(|_| SessionData::default());
+    let sudo_nopasswd =
+        resolve_sudo_nopasswd(args.sudo_nopasswd, args.no_sudo_nopasswd, &session_data);
+    let log = resolve_cli_log_store(&settings);
     let tags = parse_tags(args.tags.as_deref());
     let tailscale_mode = args.transport == TransportArg::Tailscale;
 
@@ -1342,6 +1398,23 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         return Err(anyhow!("Invalid target IP or hostname: '{}'", target));
     }
 
+    append_cli_log(
+        &log,
+        &[format!(
+            "[BUILD] CLI setup start (provider={}, target={}, dry_run={})",
+            args.provider, target, args.dry_run
+        )],
+    );
+    if let Some(ref gh) = github_deploy {
+        append_cli_log(
+            &log,
+            &[format!(
+                "[GITHUB] Configured GitHub deploy: {} (branch: {})",
+                gh.repo, gh.branch
+            )],
+        );
+    }
+
     let ssh_pubkey_for_setup = resolved_ssh.as_ref().map(|s| s.pubkey.clone());
     let ssh_key_for_transport = resolved_ssh
         .as_ref()
@@ -1356,6 +1429,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         role: args.role,
         provider_name: args.provider.to_string(),
         tailscale_mode,
+        sudo_nopasswd,
         ssh_pubkey: ssh_pubkey_for_setup,
         dry_run: args.dry_run,
         github_deploy: github_deploy.clone(),
@@ -1406,10 +1480,19 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         } else {
             "FAIL"
         };
-        println!("[{}] {}", tag, report.step.title());
+        let header = format!("[{}] {}", tag, report.step.title());
+        println!("{}", header);
+        let mut log_lines = vec![header];
         if !report.output.trim().is_empty() {
-            println!("{}", report.output.trim_end());
+            let trimmed_out = report.output.trim_end();
+            println!("{}", trimmed_out);
+            for line in trimmed_out.lines() {
+                if !line.trim().is_empty() {
+                    log_lines.push(line.to_string());
+                }
+            }
         }
+        append_cli_log(&log, &log_lines);
     })?;
 
     let cf_dns_cfg = if let Some(planned) = planned_cf_dns {
@@ -1439,6 +1522,12 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         };
         let stub_plan = build_cloudflare_dns_stub_plan(&dns_cfg, has_cf_token)?;
         println!("{}", stub_plan);
+        let dns_lines: Vec<String> = stub_plan
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| format!("[DNS] {}", l))
+            .collect();
+        append_cli_log(&log, &dns_lines);
         Some(dns_cfg)
     } else {
         None
@@ -1462,6 +1551,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
                 username: &args.user,
                 hostname: &args.hostname,
                 tailscale_mode,
+                sudo_nopasswd,
                 key_path: key_path_opt,
                 catalog: (
                     resolved_region.as_deref(),
@@ -1479,57 +1569,79 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         }
     }
 
-    println!("\n=== Final Box Information ===");
-    println!(
-        "Public IP:             {}",
-        resolved_public_ip.as_deref().unwrap_or("(none)")
-    );
-    println!(
-        "Tailscale IP:          {}",
-        resolved_tailscale_ip.as_deref().unwrap_or("(none)")
-    );
-    println!("Active Target IP:      {}", target);
-    println!(
-        "Provider:              {} (region: {}, plan: {}, image: {})",
-        args.provider.label(),
-        resolved_region.as_deref().unwrap_or("N/A"),
-        resolved_plan.as_deref().unwrap_or("N/A"),
-        resolved_image.as_deref().unwrap_or("N/A")
-    );
-    println!("Role:                  {} ({})", args.role.label(), args.role);
-    println!(
-        "Transport Mode:        {}",
-        if tailscale_mode {
-            "Tailscale SSH"
-        } else {
-            "Standard SSH"
-        }
-    );
-    println!("Sudo User:             {}", args.user);
+    let max_log_mb = MAX_LOG_FILE_BYTES / (1024 * 1024);
+    let mut summary_lines = vec![
+        "=== Final Box Information ===".to_string(),
+        format!(
+            "Public IP:             {}",
+            resolved_public_ip.as_deref().unwrap_or("(none)")
+        ),
+        format!(
+            "Tailscale IP:          {}",
+            resolved_tailscale_ip.as_deref().unwrap_or("(none)")
+        ),
+        format!("Active Target IP:      {}", target),
+        format!(
+            "Provider:              {} (region: {}, plan: {}, image: {})",
+            args.provider.label(),
+            resolved_region.as_deref().unwrap_or("N/A"),
+            resolved_plan.as_deref().unwrap_or("N/A"),
+            resolved_image.as_deref().unwrap_or("N/A")
+        ),
+        format!("Role:                  {} ({})", args.role.label(), args.role),
+        format!(
+            "Transport Mode:        {}",
+            if tailscale_mode {
+                "Tailscale SSH"
+            } else {
+                "Standard SSH"
+            }
+        ),
+        format!(
+            "Sudo User:             {} (passwordless: {})",
+            args.user,
+            if sudo_nopasswd {
+                "ON (NOPASSWD:ALL)"
+            } else {
+                "OFF (password required)"
+            }
+        ),
+    ];
     if let Some(ref dns) = cf_dns_cfg {
-        println!(
+        summary_lines.push(format!(
             "Cloudflare DNS:        {} -> {} (zone: {}, proxied: {})",
             dns.record_name, dns.target_ip, dns.zone, dns.proxied
-        );
+        ));
     }
     if let Some(ref gh) = github_deploy {
-        println!(
+        summary_lines.push(format!(
             "GitHub Repo:           {} (branch: {}, path: {})",
             gh.repo,
             gh.branch,
             gh.deploy_path
                 .as_deref()
                 .unwrap_or("(default /home/<user>/apps/<repo>)")
-        );
+        ));
     }
-    println!(
+    summary_lines.push(format!(
         "Encrypted Credentials: {} (0600, ChaCha20-Poly1305)",
         settings.path().display()
-    );
-    println!(
+    ));
+    summary_lines.push(format!(
         "Master Key:            {} (0600)",
         settings.key_file_path().display()
-    );
+    ));
+    summary_lines.push(format!(
+        "Log File:              {} (0600, max {} MB)",
+        log.path().display(),
+        max_log_mb
+    ));
+
+    println!();
+    for line in &summary_lines {
+        println!("{}", line);
+    }
+    append_cli_log(&log, &summary_lines);
 
     Ok(())
 }
@@ -1588,6 +1700,7 @@ fn cmd_dns(args: DnsArgs) -> Result<()> {
 fn cmd_deploy(args: DeployArgs) -> Result<()> {
     let settings = Settings::load_default()?;
     let session = SessionState::load_default()?;
+    let log = resolve_cli_log_store(&settings);
 
     let tailscale_mode = match args.transport {
         Some(TransportArg::Tailscale) => true,
@@ -1689,13 +1802,34 @@ fn cmd_deploy(args: DeployArgs) -> Result<()> {
 
     let transport = SshTransport::from_env(mode);
     let runner = SetupRunner::new(&transport, Some(&session));
-    let output = runner.deploy_github(&ssh_user, &target, &gh_cfg, args.dry_run)?;
+    let output = match runner.deploy_github(&ssh_user, &target, &gh_cfg, args.dry_run) {
+        Ok(out) => out,
+        Err(err) => {
+            append_cli_log(
+                &log,
+                &[format!(
+                    "[FAIL] GitHub Deploy ({}) failed: {}",
+                    gh_cfg.repo, err
+                )],
+            );
+            return Err(err);
+        }
+    };
 
     let tag = if args.dry_run { "DRY-RUN" } else { "OK" };
-    println!("[{}] GitHub Deploy ({})", tag, gh_cfg.repo);
+    let header = format!("[{}] GitHub Deploy ({})", tag, gh_cfg.repo);
+    println!("{}", header);
+    let mut log_lines = vec![header];
     if !output.trim().is_empty() {
-        println!("{}", output.trim_end());
+        let trimmed_out = output.trim_end();
+        println!("{}", trimmed_out);
+        for line in trimmed_out.lines() {
+            if !line.trim().is_empty() {
+                log_lines.push(line.to_string());
+            }
+        }
     }
+    append_cli_log(&log, &log_lines);
 
     if !args.dry_run {
         persist_github_session(&session, &gh_cfg)?;
@@ -1816,6 +1950,9 @@ fn cmd_settings(args: SettingsArgs) -> Result<()> {
                 default_config_dir().unwrap_or_else(|_| PathBuf::from("~/.config/bab"))
             });
 
+        let log = resolve_cli_log_store(&settings);
+        let max_log_mb = MAX_LOG_FILE_BYTES / (1024 * 1024);
+
         println!("TAILSCALE_API_KEY: {}", ApiKeyForm::mask_key(&ts));
         println!("VULTR_API_KEY: {}", ApiKeyForm::mask_key(&vultr));
         println!("UPCLOUD_API_TOKEN: {}", ApiKeyForm::mask_key(&upcloud));
@@ -1828,6 +1965,11 @@ fn cmd_settings(args: SettingsArgs) -> Result<()> {
             settings.path().display()
         );
         println!("Master Key: {} (0600)", settings.key_file_path().display());
+        println!(
+            "Log File: {} (0600, max {} MB)",
+            log.path().display(),
+            max_log_mb
+        );
     }
 
     Ok(())
@@ -1876,9 +2018,14 @@ fn cmd_status() -> Result<()> {
         )
     };
 
+    let sudo_nopasswd_label = if parse_sudo_nopasswd(session.sudo_nopasswd()?.as_deref()) {
+        "ON"
+    } else {
+        "OFF"
+    };
     println!(
-        "Target: {} | User: {} | Transport: {}",
-        target, username, transport_label
+        "Target: {} | User: {} | Transport: {} | Passwordless Sudo: {}",
+        target, username, transport_label, sudo_nopasswd_label
     );
 
     let transport = SshTransport::from_env(mode);
@@ -2027,17 +2174,42 @@ fn execute_destroy(
     name: Option<&str>,
     skip_confirm: bool,
 ) -> Result<()> {
+    let log = resolve_cli_log_store(settings);
     if !skip_confirm && !confirm_destroy(kind, id, name)? {
         println!("Aborted.");
+        append_cli_log(
+            &log,
+            &[format!(
+                "[DESTROY] Aborted destroying {} instance '{}'.",
+                kind.label(),
+                id
+            )],
+        );
         return Ok(());
     }
 
-    destroy_provider_instance(settings, kind, id)?;
-    let cleared = clear_destroyed_session_if_matches(&SessionState::load_default()?, id)?;
-    println!("Destroyed {} instance '{}'.", kind.label(), id);
-    if cleared {
-        println!("Cleared matching active session state.");
+    if let Err(err) = destroy_provider_instance(settings, kind, id) {
+        append_cli_log(
+            &log,
+            &[format!(
+                "[DESTROY] Failed to destroy {} instance '{}': {}",
+                kind.label(),
+                id,
+                err
+            )],
+        );
+        return Err(err);
     }
+    let cleared = clear_destroyed_session_if_matches(&SessionState::load_default()?, id)?;
+    let msg = format!("Destroyed {} instance '{}'.", kind.label(), id);
+    println!("{}", msg);
+    let mut log_lines = vec![format!("[DESTROY] {}", msg)];
+    if cleared {
+        let cleared_msg = "Cleared matching active session state.";
+        println!("{}", cleared_msg);
+        log_lines.push(format!("[DESTROY] {}", cleared_msg));
+    }
+    append_cli_log(&log, &log_lines);
     Ok(())
 }
 
@@ -2130,17 +2302,23 @@ fn cmd_destroy(args: DestroyArgs) -> Result<()> {
                 })?
             }
         };
-        println!(
+        let log = resolve_cli_log_store(&settings);
+        let dry_msg = format!(
             "[DRY-RUN] Would destroy {} instance '{}'.",
             kind.label(),
             id
         );
+        println!("{}", dry_msg);
+        let mut log_lines = vec![dry_msg];
         if session_matches {
-            println!(
+            let clear_msg = format!(
                 "[DRY-RUN] Would clear matching active session state for '{}'.",
                 id
             );
+            println!("{}", clear_msg);
+            log_lines.push(clear_msg);
         }
+        append_cli_log(&log, &log_lines);
         return Ok(());
     }
 
@@ -2565,6 +2743,12 @@ mod tests {
             std::env::set_var(key, val);
             Self { key, prev }
         }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, prev }
+        }
     }
 
     impl Drop for EnvVarGuard {
@@ -2670,6 +2854,7 @@ mod tests {
                 username: "deploy",
                 hostname: "ts-box",
                 tailscale_mode: true,
+                sudo_nopasswd: true,
                 key_path: None,
                 catalog: (None, None, None),
                 provisioned_ips: None,
@@ -2677,6 +2862,7 @@ mod tests {
         )?;
         assert_eq!(state.transport_mode()?.as_deref(), Some("tailscale"));
         assert_eq!(state.ssh_key()?.as_deref(), Some("tailscale"));
+        assert_eq!(state.sudo_nopasswd()?.as_deref(), Some("true"));
 
         // Switch to SSH mode with --ssh-pubkey (key_path_opt == None): clears stale "tailscale".
         persist_setup_session(
@@ -2687,6 +2873,7 @@ mod tests {
                 username: "ops",
                 hostname: "ssh-box",
                 tailscale_mode: false,
+                sudo_nopasswd: false,
                 key_path: None,
                 catalog: (Some("ewr"), Some("vc2-1c-1gb"), Some("2284")),
                 provisioned_ips: None,
@@ -2695,6 +2882,7 @@ mod tests {
         assert_eq!(state.transport_mode()?.as_deref(), Some("ssh"));
         assert_eq!(state.ssh_key()?.as_deref(), Some(""));
         assert_eq!(state.vps_ip()?.as_deref(), Some("203.0.113.20"));
+        assert_eq!(state.sudo_nopasswd()?.as_deref(), Some("false"));
 
         // Explicit key path sets SSH_KEY.
         let key_path = PathBuf::from("/tmp/custom_ed25519");
@@ -2706,6 +2894,7 @@ mod tests {
                 username: "ops",
                 hostname: "ssh-box",
                 tailscale_mode: false,
+                sudo_nopasswd: true,
                 key_path: Some(&key_path),
                 catalog: (Some("ewr"), Some("vc2-1c-1gb"), Some("2284")),
                 provisioned_ips: None,
@@ -2722,6 +2911,7 @@ mod tests {
                 username: "ops",
                 hostname: "ssh-box",
                 tailscale_mode: false,
+                sudo_nopasswd: true,
                 key_path: None,
                 catalog: (Some("ewr"), Some("vc2-1c-1gb"), Some("2284")),
                 provisioned_ips: None,
@@ -2825,6 +3015,7 @@ mod tests {
                 username: "ops",
                 hostname: "ssh-box",
                 tailscale_mode: false,
+                sudo_nopasswd: true,
                 key_path: None,
                 catalog: (Some("ewr"), Some("vc2-1c-1gb"), Some("2284")),
                 provisioned_ips: None,
@@ -2845,6 +3036,7 @@ mod tests {
                 username: "deploy",
                 hostname: "ts-box",
                 tailscale_mode: true,
+                sudo_nopasswd: true,
                 key_path: None,
                 catalog: (None, None, None),
                 provisioned_ips: None,
@@ -2871,6 +3063,7 @@ mod tests {
                 username: "deploy",
                 hostname: "ts-box",
                 tailscale_mode: true,
+                sudo_nopasswd: true,
                 key_path: None,
                 catalog: (None, None, None),
                 provisioned_ips: None,
@@ -2891,6 +3084,7 @@ mod tests {
                 username: "deploy",
                 hostname: "ts-box",
                 tailscale_mode: true,
+                sudo_nopasswd: true,
                 key_path: None,
                 catalog: (None, None, None),
                 provisioned_ips: None,
@@ -2908,6 +3102,7 @@ mod tests {
                 username: "deploy",
                 hostname: "linode-box",
                 tailscale_mode: true,
+                sudo_nopasswd: true,
                 key_path: None,
                 catalog: (Some("us-east"), Some("g6-standard-1"), Some("linode/ubuntu24.04")),
                 provisioned_ips: Some((Some("203.0.113.42"), Some("100.64.1.2"))),
@@ -3219,5 +3414,238 @@ mod tests {
             msg
         );
         Ok(())
+    }
+
+    #[test]
+    fn resolve_cli_log_store_respects_bab_log_file_and_config_dir() -> Result<()> {
+        let _lock = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir()?;
+        let cfg_dir = dir.path().join("cfg");
+        let explicit_log = dir.path().join("custom.log");
+
+        let _g_cfg = EnvVarGuard::set("BAB_CONFIG_DIR", cfg_dir.as_os_str());
+        let _g_settings = EnvVarGuard::remove("BAB_SETTINGS_FILE");
+        let _g_log_clear = EnvVarGuard::remove("BAB_LOG_FILE");
+
+        let settings = Settings::load_default()?;
+        assert_eq!(resolve_cli_log_store(&settings).path(), cfg_dir.join("bab.log"));
+
+        // Whitespace-only BAB_LOG_FILE falls back to settings parent directory.
+        let _g_log_blank = EnvVarGuard::set("BAB_LOG_FILE", std::ffi::OsStr::new("   "));
+        assert_eq!(resolve_cli_log_store(&settings).path(), cfg_dir.join("bab.log"));
+
+        // Explicit BAB_LOG_FILE overrides settings parent directory.
+        let _g_log_set = EnvVarGuard::set("BAB_LOG_FILE", explicit_log.as_os_str());
+        assert_eq!(resolve_cli_log_store(&settings).path(), explicit_log);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_log_persistence_writes_0600_for_setup_deploy_destroy_and_settings() -> Result<()> {
+        let _lock = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir()?;
+        let cfg_dir = dir.path().join("bab-cfg");
+
+        let _g_cfg = EnvVarGuard::set("BAB_CONFIG_DIR", cfg_dir.as_os_str());
+        let _g_settings = EnvVarGuard::remove("BAB_SETTINGS_FILE");
+        let _g_state = EnvVarGuard::remove("BAB_STATE_FILE");
+        let _g_log = EnvVarGuard::remove("BAB_LOG_FILE");
+
+        let settings = Settings::load_default()?;
+        let log = resolve_cli_log_store(&settings);
+        append_cli_log(&log, &["[TEST] direct helper entry".to_string()]);
+
+        // Best-effort logging never panics or errors when log path cannot be created.
+        let bad_parent = dir.path().join("not-a-dir");
+        std::fs::write(&bad_parent, "file")?;
+        let unwritable_log = LogStore::new(bad_parent.join("bab.log"));
+        append_cli_log(&unwritable_log, &["[TEST] ignored failure".to_string()]);
+
+        // cmd_settings succeeds with resolved log file path.
+        let settings_args = match Cli::try_parse_from(["bab", "settings", "--show"])?.command {
+            Some(Commands::Settings(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        cmd_settings(settings_args)?;
+
+        // cmd_setup (--dry-run) logs start, steps, GitHub/DNS outcomes, and Final Box Information.
+        let setup_args = match Cli::try_parse_from([
+            "bab",
+            "setup",
+            "--provider",
+            "existing",
+            "--role",
+            "caddy",
+            "--github-repo",
+            "owner/app",
+            "--cf-zone",
+            "example.com",
+            "--cf-record",
+            "app",
+            "--dry-run",
+        ])?
+        .command
+        {
+            Some(Commands::Setup(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        cmd_setup(setup_args)?;
+
+        // cmd_deploy (--dry-run) logs GitHub Deploy lines.
+        let deploy_args = match Cli::try_parse_from([
+            "bab",
+            "deploy",
+            "--repo",
+            "owner/app",
+            "--branch",
+            "main",
+            "--ip",
+            "100.64.0.1",
+            "--dry-run",
+        ])?
+        .command
+        {
+            Some(Commands::Deploy(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        cmd_deploy(deploy_args)?;
+
+        // cmd_destroy (--dry-run) logs dry-run destroy outcome.
+        let destroy_args = match Cli::try_parse_from([
+            "bab",
+            "destroy",
+            "--id",
+            "vultr-123",
+            "--provider",
+            "vultr",
+            "--dry-run",
+        ])?
+        .command
+        {
+            Some(Commands::Destroy(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        cmd_destroy(destroy_args)?;
+
+        let log_path = cfg_dir.join("bab.log");
+        assert!(log_path.exists(), "expected {} to exist", log_path.display());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&log_path)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let lines = log.read_lines()?;
+        assert!(lines.iter().any(|l| l.contains("[TEST] direct helper entry")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[BUILD] CLI setup start (provider=existing_tailscale, target=100.64.0.1, dry_run=true)")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[DRY-RUN] Configure Server Role")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[GITHUB] Configured GitHub deploy: owner/app (branch: main)")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[DNS] [STUB] Cloudflare DNS: would upsert A record 'app'")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("=== Final Box Information ===")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Sudo User:") && l.contains("(passwordless: ON (NOPASSWD:ALL))")));
+        assert!(lines.iter().any(|l| l.contains("Log File:") && l.contains("bab.log")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[DRY-RUN] GitHub Deploy (owner/app)")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[DRY-RUN] Would destroy Vultr instance 'vultr-123'.")));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_setup_sudo_nopasswd_flags() {
+        let def = Cli::try_parse_from(["bab", "setup"]).unwrap();
+        match def.command {
+            Some(Commands::Setup(args)) => {
+                assert!(!args.sudo_nopasswd);
+                assert!(!args.no_sudo_nopasswd);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let on = Cli::try_parse_from(["bab", "setup", "--sudo-nopasswd"]).unwrap();
+        match on.command {
+            Some(Commands::Setup(args)) => {
+                assert!(args.sudo_nopasswd);
+                assert!(!args.no_sudo_nopasswd);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let off = Cli::try_parse_from(["bab", "setup", "--no-sudo-nopasswd"]).unwrap();
+        match off.command {
+            Some(Commands::Setup(args)) => {
+                assert!(!args.sudo_nopasswd);
+                assert!(args.no_sudo_nopasswd);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        assert!(
+            Cli::try_parse_from(["bab", "setup", "--sudo-nopasswd", "--no-sudo-nopasswd"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_sudo_nopasswd_precedence_and_defaults() {
+        let default_session = SessionData::default();
+        assert!(resolve_sudo_nopasswd(false, false, &default_session));
+        assert!(resolve_sudo_nopasswd(true, false, &default_session));
+        assert!(!resolve_sudo_nopasswd(false, true, &default_session));
+
+        for falsey in ["false", "FALSE", " 0 ", "no", "Off"] {
+            let s = SessionData {
+                sudo_nopasswd: Some(falsey.to_string()),
+                ..SessionData::default()
+            };
+            assert!(
+                !resolve_sudo_nopasswd(false, false, &s),
+                "expected '{}' to resolve false",
+                falsey
+            );
+            assert!(
+                resolve_sudo_nopasswd(true, false, &s),
+                "expected --sudo-nopasswd to override '{}'",
+                falsey
+            );
+        }
+
+        for truthy in ["true", "1", "yes", "ON", "unexpected"] {
+            let s = SessionData {
+                sudo_nopasswd: Some(truthy.to_string()),
+                ..SessionData::default()
+            };
+            assert!(
+                resolve_sudo_nopasswd(false, false, &s),
+                "expected '{}' to resolve true",
+                truthy
+            );
+            assert!(
+                !resolve_sudo_nopasswd(false, true, &s),
+                "expected --no-sudo-nopasswd to override '{}'",
+                truthy
+            );
+        }
     }
 }
