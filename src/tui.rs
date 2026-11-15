@@ -8,29 +8,34 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
+};
 use ratatui::{Frame, Terminal};
+use std::cell::RefCell;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
 use crate::config::{
-    default_config_dir, format_utc_timestamp, LogStore, SessionData, SessionState, Settings,
-    MAX_LOG_FILE_BYTES,
+    default_config_dir, format_utc_timestamp, generate_random_password, LogStore, SessionData,
+    SessionState, Settings, MAX_LOG_FILE_BYTES, SUDO_PASSWORD_LEN,
 };
 use crate::dns::{build_cloudflare_dns_stub_plan, CloudflareDnsConfig};
 use crate::providers::{
     build_cloud_provider_with_key, clear_destroyed_session_if_matches, default_images_for,
     default_plans_for, default_regions_for, destroy_provider_instance_with_key,
-    provision_full_flow, query_providers_with_keys, ProviderInstance, ProviderKind,
+    provision_full_flow_with_progress, query_providers_with_keys, ProviderInstance, ProviderKind,
     ProviderQueryStatus, ProvisionConfig,
 };
 use crate::roles::ServerRole;
 use crate::setup::{
     normalize_github_repo, GithubDeployConfig, SetupConfig, SetupRunner, SetupStepKind, StepReport,
 };
-use crate::tailscale::{generate_cloud_init, generate_ssh_cloud_init, TailscaleClient};
+use crate::tailscale::{
+    generate_cloud_init_with_password, generate_ssh_cloud_init_with_password, TailscaleClient,
+};
 use crate::transport::{
     default_ssh_key_path, ensure_ssh_keypair, read_public_key, SshTransport, TransportMode,
 };
@@ -137,6 +142,7 @@ pub struct AccessForm {
     pub ssh_key_path: String,
     pub hostname: String,
     pub sudo_nopasswd: bool,
+    pub sudo_password: String,
     pub active_field: usize,
     pub editing: bool,
 }
@@ -149,6 +155,7 @@ impl Default for AccessForm {
             ssh_key_path: default_ssh_key_path_string(),
             hostname: "bab-node".to_string(),
             sudo_nopasswd: true,
+            sudo_password: generate_random_password(SUDO_PASSWORD_LEN),
             active_field: 0,
             editing: false,
         }
@@ -194,6 +201,13 @@ impl AccessForm {
             Some("true" | "1" | "yes" | "on") | None => true,
             Some(_) => true,
         };
+        let sudo_password = session
+            .sudo_password
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| generate_random_password(SUDO_PASSWORD_LEN));
 
         Self {
             tailscale_mode,
@@ -201,6 +215,7 @@ impl AccessForm {
             ssh_key_path,
             hostname,
             sudo_nopasswd,
+            sudo_password,
             active_field: 0,
             editing: false,
         }
@@ -589,6 +604,7 @@ pub struct TuiApp {
     pub running_statuses: Vec<ProviderQueryStatus>,
     pub running_index: usize,
     pub running_confirm_destroy: bool,
+    pub show_password: bool,
 }
 
 impl TuiApp {
@@ -699,6 +715,7 @@ impl TuiApp {
             running_statuses: Vec::new(),
             running_index: 0,
             running_confirm_destroy: false,
+            show_password: false,
         }
     }
 
@@ -1119,6 +1136,9 @@ impl TuiApp {
                     self.access.sudo_nopasswd_label()
                 );
             }
+            KeyCode::Char('w') => {
+                self.toggle_show_password();
+            }
             KeyCode::Enter => match self.access.active_field {
                 0 => {
                     self.access.toggle_transport();
@@ -1450,6 +1470,16 @@ impl TuiApp {
                     self.access.sudo_nopasswd_label()
                 );
             }
+            KeyCode::Char('w') => {
+                self.toggle_show_password();
+            }
+            KeyCode::Char('r') => {
+                self.access.sudo_password = generate_random_password(SUDO_PASSWORD_LEN);
+                self.save_access_config();
+                if !self.status_message.starts_with("Failed to save") {
+                    self.status_message = "Regenerated 10-char sudo password (saved)".to_string();
+                }
+            }
             KeyCode::Char('n') => {
                 self.build_dry_run = !self.build_dry_run;
                 self.status_message = format!(
@@ -1491,6 +1521,14 @@ impl TuiApp {
             self.status_message = msg;
             return;
         };
+        let matches_session = self
+            .session
+            .vps_instance_id
+            .as_deref()
+            .map(str::trim)
+            == Some(inst.id.trim());
+        let session_ts_host = self.session.tailscale_hostname.clone();
+        let session_ts_ip = self.session.tailscale_ip.clone();
         match destroy_provider_instance_with_key(inst.provider, &key_str, &inst.id, None) {
             Ok(()) => {
                 self.running_instances.remove(self.running_index);
@@ -1506,27 +1544,89 @@ impl TuiApp {
                         ));
                     }
                 }
-                if self
-                    .session
-                    .vps_instance_id
-                    .as_deref()
-                    .map(str::trim)
-                    == Some(inst.id.trim())
-                {
+                if matches_session {
                     self.session.vps_provider = None;
                     self.session.vps_instance_id = None;
                     self.session.vps_ip = None;
                     self.session.public_ip = None;
                     self.session.tailscale_ip = None;
                 }
-                let msg = format!(
+
+                let mut ts_queries: Vec<String> = Vec::new();
+                let mut push_query = |raw: &str| {
+                    let trimmed = raw.trim();
+                    if !trimmed.is_empty()
+                        && !ts_queries.iter().any(|q| q.eq_ignore_ascii_case(trimmed))
+                    {
+                        ts_queries.push(trimmed.to_string());
+                    }
+                };
+                push_query(&inst.name);
+                if matches_session {
+                    if let Some(ref ts_host) = session_ts_host {
+                        push_query(ts_host);
+                    }
+                    if let Some(ref ts_ip) = session_ts_ip {
+                        push_query(ts_ip);
+                    }
+                }
+
+                let mut removed_devices: Vec<String> = Vec::new();
+                if let Some(ts_key) =
+                    self.resolve_api_key(&self.api_keys.tailscale, "TAILSCALE_API_KEY")
+                {
+                    match TailscaleClient::new(ts_key) {
+                        Ok(ts_client) => {
+                            for query in &ts_queries {
+                                match ts_client.delete_matching_devices(query) {
+                                    Ok(deleted) => {
+                                        for item in deleted {
+                                            if !removed_devices.contains(&item) {
+                                                removed_devices.push(item);
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        self.push_log(format!(
+                                            "[WARN] Tailscale device removal failed for '{}': {}",
+                                            query, err
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            self.push_log(format!(
+                                "[WARN] Tailscale client init failed during cleanup: {}",
+                                err
+                            ));
+                        }
+                    }
+                }
+                if !removed_devices.is_empty() {
+                    self.push_log(format!(
+                        "[TAILSCALE] Removed device(s) from tailnet: {}",
+                        removed_devices.join(", ")
+                    ));
+                }
+
+                let base_msg = format!(
                     "Destroyed {} instance {} ({})",
                     inst.provider.label(),
                     inst.name,
                     inst.id
                 );
-                self.push_log(format!("[DESTROY] {}", msg));
-                self.status_message = msg;
+                self.push_log(format!("[DESTROY] {}", base_msg));
+                self.status_message = if removed_devices.is_empty() {
+                    base_msg
+                } else {
+                    format!(
+                        "{}; removed Tailscale device(s): {}",
+                        base_msg,
+                        removed_devices.join(", ")
+                    )
+                };
             }
             Err(err) => {
                 let msg = format!("Destroy failed for {}: {}", inst.id, err);
@@ -1561,6 +1661,9 @@ impl TuiApp {
             }
             KeyCode::Char('r') => {
                 self.refresh_running_instances();
+            }
+            KeyCode::Char('w') => {
+                self.toggle_show_password();
             }
             KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
                 if let Some(inst) = self.running_instances.get(self.running_index) {
@@ -1760,6 +1863,105 @@ impl TuiApp {
         self.access.transport_mode_str() != "ssh"
     }
 
+    /// Returns `pw` in plain text when `show_password` is active, otherwise a bullet mask.
+    pub fn masked_or_plain_password(&self, pw: &str) -> String {
+        if self.show_password {
+            pw.to_string()
+        } else {
+            "•".repeat(pw.chars().count().max(10))
+        }
+    }
+
+    /// Looks up the recorded encrypted per-box sudo password for `inst`, falling back
+    /// to the active session/access password when `inst` matches the active box.
+    pub fn password_for_instance(&self, inst: &ProviderInstance) -> Option<String> {
+        let settings = self
+            .settings_path
+            .as_ref()
+            .map(Settings::new)
+            .or_else(|| Settings::load_default().ok());
+        if let Some(settings) = settings {
+            if let Ok(Some(pw)) = settings.lookup_instance_password(
+                Some(&inst.id),
+                Some(&inst.name),
+                inst.public_ip.as_deref(),
+            ) {
+                let trimmed = pw.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+
+        let id_matches = !inst.id.trim().is_empty()
+            && self
+                .session
+                .vps_instance_id
+                .as_deref()
+                .map(str::trim)
+                == Some(inst.id.trim());
+        let host_matches = !inst.name.trim().is_empty()
+            && inst
+                .name
+                .trim()
+                .eq_ignore_ascii_case(self.access.hostname.trim());
+        if id_matches || host_matches {
+            return self
+                .session
+                .sudo_password
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    let pw = self.access.sudo_password.trim();
+                    if pw.is_empty() {
+                        None
+                    } else {
+                        Some(pw.to_string())
+                    }
+                });
+        }
+        None
+    }
+
+    fn toggle_show_password(&mut self) {
+        self.show_password = !self.show_password;
+        self.status_message = if self.show_password {
+            "Sudo password visible".to_string()
+        } else {
+            "Sudo password hidden".to_string()
+        };
+    }
+
+    fn ensure_sudo_password(&mut self) -> String {
+        let trimmed = self.access.sudo_password.trim();
+        if trimmed.is_empty() {
+            let generated = generate_random_password(SUDO_PASSWORD_LEN);
+            self.access.sudo_password = generated.clone();
+            generated
+        } else {
+            let owned = trimmed.to_string();
+            self.access.sudo_password = owned.clone();
+            owned
+        }
+    }
+
+    fn record_current_instance_password(
+        &self,
+        instance_id: Option<&str>,
+        public_ip: Option<&str>,
+    ) {
+        if let Some(ref path) = self.settings_path {
+            let _ = Settings::new(path).record_instance_password(
+                instance_id,
+                Some(&self.access.hostname),
+                public_ip,
+                &self.access.sudo_password,
+            );
+        }
+    }
+
     fn save_access_config(&mut self) {
         let mode = self.access.transport_mode_str().to_string();
 
@@ -1802,11 +2004,13 @@ impl TuiApp {
         } else {
             "false"
         };
+        let sudo_password = self.ensure_sudo_password();
         self.session.transport_mode = Some(mode.clone());
         self.session.username = Some(username.clone());
         self.session.ssh_key = Some(ssh_key.clone());
         self.session.tailscale_hostname = Some(hostname.clone());
         self.session.sudo_nopasswd = Some(sudo_nopasswd_str.to_string());
+        self.session.sudo_password = Some(sudo_password.clone());
 
         if let Some(ref path) = self.state_path {
             let state = SessionState::new(path);
@@ -1815,12 +2019,17 @@ impl TuiApp {
                 .and_then(|()| state.set_username(&username))
                 .and_then(|()| state.set_ssh_key(&ssh_key))
                 .and_then(|()| state.set_tailscale_hostname(&hostname))
-                .and_then(|()| state.set_sudo_nopasswd(sudo_nopasswd_str));
+                .and_then(|()| state.set_sudo_nopasswd(sudo_nopasswd_str))
+                .and_then(|()| state.set_sudo_password(&sudo_password));
             if let Err(err) = res {
                 self.status_message = format!("Failed to save access settings: {}", err);
                 return;
             }
         }
+        self.record_current_instance_password(
+            self.session.vps_instance_id.as_deref(),
+            self.session.public_ip.as_deref(),
+        );
 
         self.status_message = format!(
             "Saved access settings (mode: {}, user: {}, host: {}, sudo_nopasswd: {})",
@@ -2053,6 +2262,7 @@ impl TuiApp {
     where
         F: FnMut(&Self),
     {
+        self.ensure_sudo_password();
         self.save_provider_selection();
         self.save_access_config();
         self.save_cf_dns();
@@ -2120,17 +2330,19 @@ impl TuiApp {
                         }
                     }
                 };
-                Ok(generate_cloud_init(
+                Ok(generate_cloud_init_with_password(
                     &auth_key,
                     &self.access.hostname,
                     &self.access.username,
+                    Some(&self.access.sudo_password),
                 ))
             } else {
                 let (_, ref pubkey) = ssh_cred.as_ref().expect("resolved above");
-                Ok(generate_ssh_cloud_init(
+                Ok(generate_ssh_cloud_init_with_password(
                     pubkey,
                     &self.access.hostname,
                     &self.access.username,
+                    Some(&self.access.sudo_password),
                 ))
             };
 
@@ -2335,6 +2547,10 @@ impl TuiApp {
                         if let Some(ref path) = self.state_path {
                             let _ = SessionState::new(path).save_session(&self.session);
                         }
+                        self.record_current_instance_password(
+                            Some(&existing.id),
+                            self.session.public_ip.as_deref(),
+                        );
                         on_update(self);
                         resolved_ip
                     } else {
@@ -2369,6 +2585,29 @@ impl TuiApp {
                             })
                             .unwrap_or_default();
 
+                        if tailscale_mode {
+                            if let Some(ref ts) = ts_client {
+                                match ts.delete_matching_offline_devices(&desired_hostname) {
+                                    Ok(removed) if !removed.is_empty() => {
+                                        self.push_log(format!(
+                                            "[TAILSCALE] Removed stale offline device(s) for '{}': {}",
+                                            desired_hostname,
+                                            removed.join(", ")
+                                        ));
+                                        on_update(self);
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
+                                        self.push_log(format!(
+                                            "[WARN] Failed to prune offline Tailscale devices for '{}': {}",
+                                            desired_hostname, err
+                                        ));
+                                        on_update(self);
+                                    }
+                                }
+                            }
+                        }
+
                         self.push_log(format!(
                             "[PROVISION] Creating {} instance '{}' (region={}, plan={})...",
                             provider_display_label(self.selected_provider),
@@ -2400,14 +2639,24 @@ impl TuiApp {
                             ssh_key_path: ssh_cred
                                 .as_ref()
                                 .map(|(p, _)| p.to_string_lossy().into_owned()),
+                            sudo_password: Some(self.access.sudo_password.clone()),
                         };
                         let prov_state = self.state_path.as_ref().map(SessionState::new);
-                        match provision_full_flow(
-                            provider.as_ref(),
-                            ts_client.as_ref(),
-                            &prov_cfg,
-                            prov_state.as_ref(),
-                        ) {
+                        let prov_res = {
+                            let mut progress_cb = |msg: &str| {
+                                self.push_log(msg.to_string());
+                                self.status_message = msg.to_string();
+                                on_update(self);
+                            };
+                            provision_full_flow_with_progress(
+                                provider.as_ref(),
+                                ts_client.as_ref(),
+                                &prov_cfg,
+                                prov_state.as_ref(),
+                                &mut progress_cb,
+                            )
+                        };
+                        match prov_res {
                             Ok(res) => {
                                 self.session.vps_instance_id = Some(res.instance_id.clone());
                                 self.session.public_ip = if res.public_ip.is_empty() {
@@ -2421,6 +2670,10 @@ impl TuiApp {
                                     Some(res.tailscale_ip.clone())
                                 };
                                 self.session.vps_ip = Some(res.ip.clone());
+                                self.record_current_instance_password(
+                                    Some(&res.instance_id),
+                                    self.session.public_ip.as_deref(),
+                                );
                                 self.push_log(format!(
                                     "[PROVISION] {} ready: instance={}, ip={}",
                                     provider_display_label(self.selected_provider),
@@ -2535,6 +2788,7 @@ impl TuiApp {
             tailscale_mode,
             ssh_pubkey: ssh_cred.as_ref().map(|(_, pk)| pk.clone()),
             sudo_nopasswd: self.access.sudo_nopasswd,
+            sudo_password: Some(self.access.sudo_password.clone()),
             dry_run: self.build_dry_run,
             github_deploy,
         };
@@ -2556,13 +2810,6 @@ impl TuiApp {
         };
 
         if !self.build_dry_run {
-            self.push_log(format!(
-                "[SSH] Waiting for SSH readiness on {}...",
-                target_ip
-            ));
-            self.status_message = format!("Waiting for SSH on {}...", target_ip);
-            on_update(self);
-
             let poll_ms = std::env::var("BAB_SSH_POLL_MS")
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
@@ -2570,17 +2817,29 @@ impl TuiApp {
                 .unwrap_or(3000);
             let timeout = Duration::from_secs(120);
             let poll_interval = Duration::from_millis(poll_ms);
+            let max_attempts = ((timeout.as_millis() / poll_interval.as_millis().max(1)) as u64).max(1);
             let start = std::time::Instant::now();
+            let mut attempt = 0u64;
 
-            let mut candidates: Vec<&str> = vec!["root"];
-            let trimmed_user = self.access.username.trim();
+            let mut candidates: Vec<String> = vec!["root".to_string()];
+            let trimmed_user = self.access.username.trim().to_string();
             if !trimmed_user.is_empty() && trimmed_user != "root" {
                 candidates.push(trimmed_user);
             }
 
             let connected_user = loop {
+                attempt += 1;
+                let elapsed_secs = start.elapsed().as_secs();
+                let wait_msg = format!(
+                    "[SSH] Waiting for SSH readiness on {} (attempt {}/{}, {}s elapsed)...",
+                    target_ip, attempt, max_attempts, elapsed_secs
+                );
+                self.push_log(wait_msg.clone());
+                self.status_message = wait_msg;
+                on_update(self);
+
                 let mut found: Option<String> = None;
-                for &user in &candidates {
+                for user in &candidates {
                     let probe = if user == "root" {
                         "if [ -d /var/lib/cloud ]; then test -f /var/lib/cloud/instance/boot-finished; fi"
                     } else {
@@ -2588,7 +2847,7 @@ impl TuiApp {
                     };
                     if let Ok(out) = transport.exec(user, &target_ip, probe) {
                         if out.success() {
-                            found = Some(user.to_string());
+                            found = Some(user.clone());
                             break;
                         }
                     }
@@ -2619,10 +2878,31 @@ impl TuiApp {
             on_update(self);
         }
 
-        if let Err(err) = SetupRunner::new(&transport, state_opt.as_ref()).run_all(&setup_cfg, |report| {
-            self.record_step(report);
-            on_update(self);
-        }) {
+        let runner = SetupRunner::new(&transport, state_opt.as_ref());
+        let app_cell = RefCell::new((&mut *self, &mut on_update));
+        if let Err(err) = runner.run_all_with_callbacks(
+            &setup_cfg,
+            |idx, total, step| {
+                let mut guard = app_cell.borrow_mut();
+                let (app, cb) = &mut *guard;
+                let msg = format!(
+                    "[STEP {}/{}] Running {} on {}...",
+                    idx + 1,
+                    total,
+                    step.title(),
+                    target_ip
+                );
+                app.push_log(msg.clone());
+                app.status_message = msg;
+                cb(app);
+            },
+            |report| {
+                let mut guard = app_cell.borrow_mut();
+                let (app, cb) = &mut *guard;
+                app.record_step(report);
+                cb(app);
+            },
+        ) {
             let msg = format!("Build failed: {}", err);
             self.push_log(format!("[ERROR] {}", msg));
             self.status_message = msg;
@@ -2751,7 +3031,7 @@ impl TuiApp {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::AccessConfig => {
-                "Up/Down or j/k: Field | Space/Enter/Left/Right: Toggle/Edit | p: Sudo | s: Save | Esc/b/q: Back"
+                "Up/Down/j/k: Field | Space/Enter: Toggle/Edit | p: Sudo | w: Pass | s: Save | Esc/b/q: Back"
             }
             Screen::CloudflareDns if self.cf_dns.editing => {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
@@ -2772,13 +3052,13 @@ impl TuiApp {
                 "Up/Down or j/k: Field | Enter/e: Edit (Auto-Saves) | s: Save | Esc/b/q: Back"
             }
             Screen::BuildBox => {
-                "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | n: Dry-Run | Esc/b/q: Back"
+                "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | w: Pass | r: New Pass | n: Dry | Esc/b/q: Back"
             }
             Screen::RunningInstances if self.running_confirm_destroy => {
                 "y/Enter: Confirm Destroy | n/Esc/b/q: Cancel"
             }
             Screen::RunningInstances => {
-                "Up/Down or j/k: Select | r: Refresh | d/x/Del: Destroy | Esc/b/q: Back"
+                "Up/Down/j/k: Select | r: Refresh | w: Show/Hide Pass | d/x/Del: Destroy | Esc/b/q: Back"
             }
             Screen::ViewLog => {
                 "Up/Down/j/k/PgUp/PgDn/g/G: Scroll | r: Reload | c: Clear Log | Esc/b/q: Back"
@@ -3336,7 +3616,11 @@ impl TuiApp {
                 self.access.transport_mode_str(),
                 self.access.hostname
             )),
-            Line::from(format!("USERNAME:       {}", self.access.username)),
+            Line::from(format!(
+                "USERNAME:       {}  |  SUDO_PASSWORD:  {} ('w': Show/Hide)",
+                self.access.username,
+                self.masked_or_plain_password(&self.access.sudo_password)
+            )),
             Line::from(format!("SSH_KEY:        {}", effective_ssh_key)),
             Line::from(vec![
                 Span::raw("SUDO_NOPASSWD:  "),
@@ -3779,10 +4063,24 @@ impl TuiApp {
     }
 
     fn render_build_box(&self, frame: &mut Frame, area: Rect) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(10), Constraint::Length(3)])
-            .split(area);
+        let actions_height = if area.width < 118 { 4 } else { 3 };
+        let show_activity = area.height >= 21;
+        let rows = if show_activity {
+            let overview_height = if area.width < 96 { 15 } else { 12 };
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(overview_height),
+                    Constraint::Min(5),
+                    Constraint::Length(actions_height),
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(10), Constraint::Length(actions_height)])
+                .split(area)
+        };
 
         let tailscale_mode = self.is_tailscale_mode();
         let ports = self
@@ -3881,6 +4179,10 @@ impl TuiApp {
                 self.access.hostname
             )),
             Line::from(format!("SSH Key Path: {}", ssh_key_display)),
+            Line::from(format!(
+                "Sudo Password: {} (random 10-char — 'w': Show/Hide, 'r': New Password)",
+                self.masked_or_plain_password(&self.access.sudo_password)
+            )),
             Line::from(vec![
                 Span::raw("Passwordless Sudo: "),
                 Span::styled(
@@ -3928,12 +4230,42 @@ impl TuiApp {
             .wrap(Wrap { trim: true });
         frame.render_widget(overview, rows[0]);
 
+        let actions_area = if show_activity {
+            let activity_block = Block::default()
+                .title("Live Build Activity")
+                .borders(Borders::ALL);
+            let max_activity = activity_block
+                .inner(rows[1])
+                .height
+                .clamp(1, 8) as usize;
+            let activity_lines: Vec<Line> = if self.logs.is_empty() {
+                vec![Line::from(Span::styled(
+                    "(waiting to start — press Enter or 'x' to build)",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                let skip = self.logs.len().saturating_sub(max_activity);
+                self.logs[skip..]
+                    .iter()
+                    .map(|l| Line::from(Span::styled(l.as_str(), style_log_line(l))))
+                    .collect()
+            };
+            let activity = Paragraph::new(activity_lines)
+                .block(activity_block)
+                .wrap(Wrap { trim: false });
+            frame.render_widget(activity, rows[1]);
+            rows[2]
+        } else {
+            rows[1]
+        };
+
         let actions = Paragraph::new(Line::from(Span::styled(
-            "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | n: Dry-Run | Esc/b/q: Back",
+            "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | w: Show/Hide Password | r: New Password | n: Dry-Run | Esc/b/q: Back",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )))
-        .block(Block::default().borders(Borders::ALL));
-        frame.render_widget(actions, rows[1]);
+        .block(Block::default().borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(actions, actions_area);
     }
 
     fn render_running_instances(&self, frame: &mut Frame, area: Rect) {
@@ -3942,7 +4274,7 @@ impl TuiApp {
             .constraints([
                 Constraint::Length(5),
                 Constraint::Min(6),
-                Constraint::Length(3),
+                Constraint::Length(4),
             ])
             .split(area);
 
@@ -3986,41 +4318,71 @@ impl TuiApp {
                 );
             frame.render_widget(empty, rows[1]);
         } else {
-            let items: Vec<ListItem> = self
+            let header = Row::new([
+                "PROVIDER",
+                "NAME",
+                "ID",
+                "STATUS",
+                "IP",
+                "REGION",
+                "PLAN",
+                "SUDO PASS",
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let table_rows: Vec<Row> = self
                 .running_instances
                 .iter()
                 .map(|inst| {
                     let ip = inst.public_ip.as_deref().unwrap_or("-");
                     let region = inst.region.as_deref().unwrap_or("-");
                     let plan = inst.plan.as_deref().unwrap_or("-");
-                    ListItem::new(format!(
-                        "[{}] {} ({}) | {} | ip={} | {} | {}",
-                        inst.provider.label(),
-                        inst.name,
-                        inst.id,
-                        inst.status,
-                        ip,
-                        region,
-                        plan
-                    ))
+                    let pass_display = self
+                        .password_for_instance(inst)
+                        .map(|pw| self.masked_or_plain_password(&pw))
+                        .unwrap_or_else(|| "-".to_string());
+                    Row::new([
+                        inst.provider.label().to_string(),
+                        inst.name.clone(),
+                        inst.id.clone(),
+                        inst.status.clone(),
+                        ip.to_string(),
+                        region.to_string(),
+                        plan.to_string(),
+                        pass_display,
+                    ])
                 })
                 .collect();
-            let list = List::new(items)
+            let widths = [
+                Constraint::Length(9),
+                Constraint::Min(14),
+                Constraint::Min(10),
+                Constraint::Length(8),
+                Constraint::Length(16),
+                Constraint::Length(7),
+                Constraint::Length(11),
+                Constraint::Length(12),
+            ];
+            let table = Table::new(table_rows, widths)
+                .header(header)
                 .block(
                     Block::default()
                         .title("Running Instances")
                         .borders(Borders::ALL),
                 )
-                .highlight_style(
+                .row_highlight_style(
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("> ");
-            let mut state = ListState::default();
+            let mut state = TableState::default();
             state.select(Some(self.running_index));
-            frame.render_stateful_widget(list, rows[1], &mut state);
+            frame.render_stateful_widget(table, rows[1], &mut state);
         }
 
         let banner = if self.running_confirm_destroy {
@@ -4038,7 +4400,24 @@ impl TuiApp {
                 Paragraph::new("Confirm destroy? y/Enter: Yes | n/Esc/b/q: Cancel")
             }
         } else {
-            Paragraph::new("r: Refresh | d/x/Del: Destroy Selected | Esc/b/q: Back")
+            let selected_summary = if let Some(inst) = self.running_instances.get(self.running_index) {
+                let pw_display = self
+                    .password_for_instance(inst)
+                    .map(|pw| self.masked_or_plain_password(&pw))
+                    .unwrap_or_else(|| "-".to_string());
+                format!(
+                    "Selected: {} ({}) | Sudo Password: {}",
+                    inst.name, inst.id, pw_display
+                )
+            } else {
+                "Selected: (none)".to_string()
+            };
+            Paragraph::new(vec![
+                Line::from(selected_summary),
+                Line::from(
+                    "r: Refresh | w: Show/Hide Pass | d/x/Del: Destroy Selected | Esc/b/q: Back",
+                ),
+            ])
         }
         .block(Block::default().borders(Borders::ALL));
         frame.render_widget(banner, rows[2]);
@@ -4261,9 +4640,8 @@ impl TuiApp {
             .unwrap_or("credentials.enc");
 
         let info_lines = vec![
-            Line::from(format!("Public IP:     {}", public_ip)),
+            Line::from(format!("Public IP:     {} | Target: {}", public_ip, target_ip)),
             Line::from(format!("Tailscale IP:  {}", tailscale_ip)),
-            Line::from(format!("Target IP:     {}", target_ip)),
             Line::from(format!("Region/Plan:   {} / {} ({})", region, plan, provider)),
             Line::from(vec![
                 Span::raw(format!("Role/Mode/Usr: {}/{}/{} (", role, transport, username)),
@@ -4277,6 +4655,10 @@ impl TuiApp {
                 ),
                 Span::raw(")"),
             ]),
+            Line::from(format!(
+                "Sudo Pass:     {} ('w': Show/Hide)",
+                self.masked_or_plain_password(&self.access.sudo_password)
+            )),
             Line::from(vec![
                 Span::raw("DNS / Repo:    "),
                 Span::styled(
@@ -4362,6 +4744,8 @@ fn style_log_line(line: &str) -> Style {
     } else if line.contains("[BUILD]")
         || line.contains("[PROVISION]")
         || line.contains("[SSH]")
+        || line.contains("[STEP ")
+        || line.contains("[TAILSCALE]")
         || line.contains("[GITHUB]")
         || line.contains("[DNS]")
         || line.contains("[DESTROY]")
@@ -5863,6 +6247,7 @@ mod tests {
                 tailscale_mode: true,
                 ssh_pubkey: None,
                 sudo_nopasswd: true,
+                sudo_password: None,
                 dry_run: true,
                 github_deploy: Some(GithubDeployConfig {
                     repo: "octocat/my-app".to_string(),
@@ -6449,6 +6834,7 @@ esac"#
             tailscale_mode: app.is_tailscale_mode(),
             ssh_pubkey: None,
             sudo_nopasswd: app.access.sudo_nopasswd,
+            sudo_password: Some(app.access.sudo_password.clone()),
             dry_run: true,
             github_deploy: None,
         };
@@ -6456,6 +6842,544 @@ esac"#
         assert!(!create_user_script.contains("NOPASSWD:ALL"));
         let motd_script = crate::setup::build_step_script(SetupStepKind::ConfigureMotd, &cfg);
         assert!(motd_script.contains("rm -f \"/etc/sudoers.d/${NEW_USER}\""));
+        Ok(())
+    }
+
+    #[test]
+    fn build_box_random_password_show_hide_and_regenerate_persist() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        // Empty/default session generates a 10-char ASCII alphanumeric password
+        let form = AccessForm::default();
+        assert_eq!(form.sudo_password.len(), SUDO_PASSWORD_LEN);
+        assert!(form.sudo_password.chars().all(|c| c.is_ascii_alphanumeric()));
+
+        let from_empty = AccessForm::from_session(&SessionData {
+            sudo_password: Some("   ".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(from_empty.sudo_password.len(), SUDO_PASSWORD_LEN);
+        assert!(from_empty
+            .sudo_password
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric()));
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        let initial_pw = app.access.sudo_password.clone();
+        assert_eq!(initial_pw.len(), SUDO_PASSWORD_LEN);
+        assert!(initial_pw.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(!app.show_password);
+
+        app.screen = Screen::BuildBox;
+        let masked_render = {
+            let backend = TestBackend::new(120, 40);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal.draw(|frame| app.render_frame(frame)).unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let mut out = String::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    out.push_str(buf.cell((x, y)).unwrap().symbol());
+                }
+                out.push('\n');
+            }
+            out
+        };
+        assert!(masked_render.contains("Sudo Password: ••••••••••"));
+        assert!(masked_render.contains("Sudo Pass:     •••••••••• ('w': Show/Hide)"));
+        assert!(masked_render.contains("Live Build Activity"));
+        assert!(masked_render.contains("w: Show/Hide Password | r: New Password"));
+        assert!(!masked_render.contains(&initial_pw));
+
+        // 'w' toggles plain password visibility
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.show_password);
+        assert_eq!(app.status_message, "Sudo password visible");
+        let plain_render = render_to_string(&app);
+        assert!(plain_render.contains(&initial_pw));
+
+        // 'r' regenerates a new 10-char password and persists to state.conf & credentials.enc
+        let mut regenerated = initial_pw.clone();
+        for _ in 0..3 {
+            app.handle_key(key(KeyCode::Char('r')));
+            regenerated = app.access.sudo_password.clone();
+            if regenerated != initial_pw {
+                break;
+            }
+        }
+        assert_ne!(regenerated, initial_pw);
+        assert_eq!(regenerated.len(), SUDO_PASSWORD_LEN);
+        assert!(regenerated.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_eq!(
+            SessionState::new(&state_path).sudo_password()?.as_deref(),
+            Some(regenerated.as_str())
+        );
+        assert_eq!(
+            Settings::new(&settings_path)
+                .lookup_instance_password(None, Some(&app.access.hostname), None)?
+                .as_deref(),
+            Some(regenerated.as_str())
+        );
+
+        // 'w' hides password again
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(!app.show_password);
+        assert_eq!(app.status_message, "Sudo password hidden");
+
+        // Reloading from_paths restores the persisted password
+        let reloaded = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert_eq!(reloaded.access.sudo_password, regenerated);
+        Ok(())
+    }
+
+    #[test]
+    fn running_instances_shows_masked_sudo_pass_toggles_w_and_cleans_up_tailscale_on_destroy(
+    ) -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+        use std::thread;
+
+        struct EnvGuard {
+            saved: Vec<(String, Option<String>)>,
+        }
+        impl EnvGuard {
+            fn new(keys: &[&str]) -> Self {
+                Self {
+                    saved: keys
+                        .iter()
+                        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+                        .collect(),
+                }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in self.saved.drain(..) {
+                    match v {
+                        Some(val) => std::env::set_var(&k, val),
+                        None => std::env::remove_var(&k),
+                    }
+                }
+            }
+        }
+
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard::new(&[
+            "VULTR_API_BASE_URL",
+            "UPCLOUD_API_BASE_URL",
+            "LINODE_API_BASE_URL",
+            "TAILSCALE_API_BASE",
+        ]);
+
+        let vultr_listener = TcpListener::bind("127.0.0.1:0")?;
+        let vultr_addr = vultr_listener.local_addr()?;
+        let ts_listener = TcpListener::bind("127.0.0.1:0")?;
+        let ts_addr = ts_listener.local_addr()?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let vultr_destroyed = Arc::new(AtomicBool::new(false));
+        let ts_deleted_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let stop_v = Arc::clone(&stop);
+        let vultr_destroyed_bg = Arc::clone(&vultr_destroyed);
+        let vultr_handle = thread::spawn(move || {
+            for stream_res in vultr_listener.incoming() {
+                if stop_v.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream_res else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                let (status, body) = if method == "GET" && path.starts_with("/v2/instances") {
+                    (
+                        "200 OK",
+                        r#"{"instances":[{"id":"vultr-pw-1","label":"edge-pw-box","status":"active","power_status":"running","main_ip":"203.0.113.88","region":"ewr","plan":"vc2-1c-1gb"}],"meta":{"links":{"next":""}}}"#,
+                    )
+                } else if method == "DELETE" && path == "/v2/instances/vultr-pw-1" {
+                    vultr_destroyed_bg.store(true, Ordering::SeqCst);
+                    ("204 No Content", "")
+                } else {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let stop_t = Arc::clone(&stop);
+        let ts_deleted_bg = Arc::clone(&ts_deleted_ids);
+        let ts_handle = thread::spawn(move || {
+            for stream_res in ts_listener.incoming() {
+                if stop_t.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream_res else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                let (status, body) = if method == "GET" && path == "/tailnet/-/devices" {
+                    let deleted = ts_deleted_bg.lock().unwrap();
+                    if deleted.iter().any(|id| id == "ts-dev-1") {
+                        ("200 OK", r#"{"devices":[]}"#)
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"devices":[{"id":"ts-dev-1","hostname":"edge-pw-box","name":"edge-pw-box.tailnet.ts.net","addresses":["100.64.5.5"],"online":true}]}"#,
+                        )
+                    }
+                } else if method == "DELETE" && path == "/device/ts-dev-1" {
+                    ts_deleted_bg.lock().unwrap().push("ts-dev-1".to_string());
+                    ("200 OK", "{}")
+                } else {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        std::env::set_var("VULTR_API_BASE_URL", format!("http://{}/v2", vultr_addr));
+        std::env::set_var("TAILSCALE_API_BASE", format!("http://{}", ts_addr));
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let state = SessionState::new(&state_path);
+        state.save_session(&SessionData {
+            vps_provider: Some("vultr".to_string()),
+            vps_instance_id: Some("vultr-pw-1".to_string()),
+            vps_ip: Some("100.64.5.5".to_string()),
+            public_ip: Some("203.0.113.88".to_string()),
+            tailscale_ip: Some("100.64.5.5".to_string()),
+            tailscale_hostname: Some("edge-pw-box".to_string()),
+            username: Some("deploy".to_string()),
+            sudo_password: Some("AbCdEf1234".to_string()),
+            ..Default::default()
+        })?;
+
+        let settings = Settings::new(&settings_path);
+        settings.set_vultr_api_key("vultr-test-key")?;
+        settings.set_tailscale_api_key("ts-test-key")?;
+        settings.record_instance_password(
+            Some("vultr-pw-1"),
+            Some("edge-pw-box"),
+            Some("203.0.113.88"),
+            "AbCdEf1234",
+        )?;
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.handle_key(key(KeyCode::Char('8')));
+        assert_eq!(app.screen, Screen::RunningInstances);
+        assert_eq!(app.running_instances.len(), 1);
+
+        let masked = render_to_string(&app);
+        assert!(masked.contains("SUDO PASS"));
+        assert!(masked.contains("••••••••••"));
+        assert!(masked.contains("w: Show/Hide Pass"));
+        assert!(!masked.contains("AbCdEf1234"));
+
+        // Press 'w' to show password in table and selected summary
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.show_password);
+        let plain = render_to_string(&app);
+        assert!(plain.contains("AbCdEf1234"));
+
+        // Destroy instance -> deletes cloud VM AND removes matching Tailscale device
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(vultr_destroyed.load(Ordering::SeqCst));
+        assert_eq!(ts_deleted_ids.lock().unwrap().as_slice(), &["ts-dev-1"]);
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[TAILSCALE] Removed device(s) from tailnet: edge-pw-box (ts-dev-1)")));
+        assert!(app.status_message.contains("removed Tailscale device(s): edge-pw-box (ts-dev-1)"));
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(vultr_addr);
+        let _ = std::net::TcpStream::connect(ts_addr);
+        vultr_handle.join().unwrap();
+        ts_handle.join().unwrap();
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_build_with_ui_fires_provision_and_step_callbacks_with_mock_servers() -> Result<()> {
+        use std::fs::{self, File};
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        use std::thread;
+
+        struct EnvGuard {
+            saved: Vec<(String, Option<String>)>,
+        }
+        impl EnvGuard {
+            fn new(keys: &[&str]) -> Self {
+                Self {
+                    saved: keys
+                        .iter()
+                        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+                        .collect(),
+                }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in self.saved.drain(..) {
+                    match v {
+                        Some(val) => std::env::set_var(&k, val),
+                        None => std::env::remove_var(&k),
+                    }
+                }
+            }
+        }
+
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard::new(&[
+            "VULTR_API_BASE_URL",
+            "TAILSCALE_API_BASE",
+            "BAB_SSH_BIN",
+            "BAB_SSH_POLL_MS",
+        ]);
+
+        let vultr_listener = TcpListener::bind("127.0.0.1:0")?;
+        let vultr_addr = vultr_listener.local_addr()?;
+        let ts_listener = TcpListener::bind("127.0.0.1:0")?;
+        let ts_addr = ts_listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let ts_stale_deleted = Arc::new(AtomicBool::new(false));
+        let ts_key_created = Arc::new(AtomicBool::new(false));
+
+        let stop_v = Arc::clone(&stop);
+        let vultr_polls = Arc::new(AtomicUsize::new(0));
+        let vultr_polls_bg = Arc::clone(&vultr_polls);
+        let vultr_handle = thread::spawn(move || {
+            for stream_res in vultr_listener.incoming() {
+                if stop_v.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream_res else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                let (status, body) = if method == "GET" && path == "/v2/instances" {
+                    ("200 OK", r#"{"instances":[],"meta":{"links":{"next":""}}}"#)
+                } else if method == "POST" && path == "/v2/instances" {
+                    (
+                        "202 Accepted",
+                        r#"{"instance":{"id":"vultr-new-9","label":"cb-node","status":"pending","power_status":"stopped","main_ip":"0.0.0.0"}}"#,
+                    )
+                } else if method == "GET" && path == "/v2/instances/vultr-new-9" {
+                    let n = vultr_polls_bg.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        (
+                            "200 OK",
+                            r#"{"instance":{"id":"vultr-new-9","label":"cb-node","status":"pending","power_status":"stopped","main_ip":"0.0.0.0"}}"#,
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"instance":{"id":"vultr-new-9","label":"cb-node","status":"active","power_status":"running","main_ip":"203.0.113.99"}}"#,
+                        )
+                    }
+                } else {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let stop_t = Arc::clone(&stop);
+        let ts_stale_bg = Arc::clone(&ts_stale_deleted);
+        let ts_key_bg = Arc::clone(&ts_key_created);
+        let ts_handle = thread::spawn(move || {
+            for stream_res in ts_listener.incoming() {
+                if stop_t.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream_res else {
+                    break;
+                };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut parts = req_line.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let path = parts.next().unwrap_or("");
+                let (status, body) = if method == "GET" && path == "/tailnet/-/devices" {
+                    if !ts_key_bg.load(Ordering::SeqCst) {
+                        (
+                            "200 OK",
+                            r#"{"devices":[{"id":"ts-stale-1","hostname":"cb-node","name":"cb-node.tailnet.ts.net","addresses":["100.64.1.2"],"online":false}]}"#,
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"devices":[{"id":"ts-live-9","hostname":"cb-node","name":"cb-node.tailnet.ts.net","addresses":["100.64.8.9"],"online":true}]}"#,
+                        )
+                    }
+                } else if method == "DELETE" && path == "/device/ts-stale-1" {
+                    ts_stale_bg.store(true, Ordering::SeqCst);
+                    ("200 OK", "{}")
+                } else if method == "POST" && path == "/tailnet/-/keys" {
+                    ts_key_bg.store(true, Ordering::SeqCst);
+                    ("200 OK", r#"{"id":"key-1","key":"tskey-auth-mock"}"#)
+                } else {
+                    ("404 Not Found", r#"{"error":"not found"}"#)
+                };
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+        let mock_ssh = dir.path().join("mock-ssh.sh");
+        {
+            let mut f = File::create(&mock_ssh)?;
+            writeln!(f, "#!/bin/sh\ncat >/dev/null\necho ok\nexit 0")?;
+        }
+        fs::set_permissions(&mock_ssh, fs::Permissions::from_mode(0o755))?;
+
+        std::env::set_var("VULTR_API_BASE_URL", format!("http://{}/v2", vultr_addr));
+        std::env::set_var("TAILSCALE_API_BASE", format!("http://{}", ts_addr));
+        std::env::set_var("BAB_SSH_BIN", &mock_ssh);
+        std::env::set_var("BAB_SSH_POLL_MS", "5");
+
+        let settings = Settings::new(&settings_path);
+        settings.set_vultr_api_key("vultr-test-key")?;
+        settings.set_tailscale_api_key("ts-test-key")?;
+
+        let state = SessionState::new(&state_path);
+        state.save_session(&SessionData {
+            vps_provider: Some("vultr".to_string()),
+            tailscale_hostname: Some("cb-node".to_string()),
+            transport_mode: Some("tailscale".to_string()),
+            username: Some("deploy".to_string()),
+            sudo_password: Some("MyPass1234".to_string()),
+            ..Default::default()
+        })?;
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.build_dry_run = false;
+
+        let mut saw_logs: Vec<String> = Vec::new();
+        app.execute_build_with_ui(|snapshot| {
+            if let Some(last) = snapshot.logs.last() {
+                saw_logs.push(last.clone());
+            }
+        });
+
+        assert!(ts_stale_deleted.load(Ordering::SeqCst));
+        assert!(saw_logs.iter().any(|l| l.contains("[PROVISION]")));
+        assert!(saw_logs.iter().any(|l| l.contains("[SSH] Waiting for SSH readiness on 100.64.8.9")));
+        assert!(saw_logs.iter().any(|l| l.contains("[STEP 1/6] Running")));
+        assert!(saw_logs.iter().any(|l| l.contains("[STEP 6/6] Running")));
+        assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
+        assert_eq!(
+            settings
+                .lookup_instance_password(
+                    Some("vultr-new-9"),
+                    Some("cb-node"),
+                    Some("203.0.113.99")
+                )?
+                .as_deref(),
+            Some("MyPass1234")
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(vultr_addr);
+        let _ = std::net::TcpStream::connect(ts_addr);
+        vultr_handle.join().unwrap();
+        ts_handle.join().unwrap();
         Ok(())
     }
 }

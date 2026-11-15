@@ -3,10 +3,12 @@
 
 use anyhow::{anyhow, Result};
 use base64::Engine;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, RequestBuilder, Response};
 use reqwest::header::{HeaderMap, AUTHORIZATION, USER_AGENT};
+use reqwest::StatusCode;
 use serde::{Deserialize, Deserializer};
 use std::env;
+use std::net::{IpAddr, Ipv4Addr};
 use std::str::FromStr;
 
 use super::{
@@ -18,6 +20,7 @@ use super::{
 pub struct VultrProvider {
     base_url: String,
     http: Client,
+    http_fallback: Client,
 }
 
 impl VultrProvider {
@@ -39,12 +42,60 @@ impl VultrProvider {
         let bearer = format!("Bearer {}", api_key);
         headers.insert(AUTHORIZATION, bearer.parse()?);
         headers.insert(USER_AGENT, "bab/0.1".parse()?);
-        let http = Client::builder().default_headers(headers).build()?;
-        Ok(Self { base_url, http })
+
+        // Prefer IPv4 egress on dual-stack hosts (e.g. macOS temporary IPv6 privacy
+        // addresses often fail Vultr IP ACL checks), unless targeting an explicit IPv6 literal.
+        let mut primary_builder = Client::builder().default_headers(headers.clone());
+        if !base_url.contains("[::") {
+            primary_builder =
+                primary_builder.local_address(Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        }
+        let http = primary_builder.build()?;
+        let http_fallback = Client::builder().default_headers(headers).build()?;
+        Ok(Self {
+            base_url,
+            http,
+            http_fallback,
+        })
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.base_url.trim_end_matches('/'), path.trim_start_matches('/'))
+    }
+
+    fn read_status_and_body(resp: Response) -> Result<(StatusCode, String)> {
+        let status = resp.status();
+        let body = if status.is_success() {
+            resp.text()?
+        } else {
+            resp.text().unwrap_or_default()
+        };
+        Ok((status, body))
+    }
+
+    /// Execute a Vultr request with the IPv4-first client, retrying once with the
+    /// dual-stack fallback client on connect errors or `401/403 Unauthorized IP address`.
+    fn execute_vultr_request<F>(&self, mut build_req: F) -> Result<(StatusCode, String)>
+    where
+        F: FnMut(&Client) -> RequestBuilder,
+    {
+        match build_req(&self.http).send() {
+            Ok(resp) => {
+                let (status, body) = Self::read_status_and_body(resp)?;
+                if matches!(status.as_u16(), 401 | 403)
+                    && body.to_ascii_lowercase().contains("unauthorized ip address")
+                {
+                    let fallback_resp = build_req(&self.http_fallback).send()?;
+                    return Self::read_status_and_body(fallback_resp);
+                }
+                Ok((status, body))
+            }
+            Err(err) if err.is_connect() => {
+                let fallback_resp = build_req(&self.http_fallback).send()?;
+                Self::read_status_and_body(fallback_resp)
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -248,34 +299,28 @@ impl VpsProvider for VultrProvider {
 
     fn validate_key(&self) -> Result<bool> {
         let url = self.url("account");
-        let resp = self.http.get(&url).send()?;
-        let status = resp.status();
+        let (status, body) = self.execute_vultr_request(|client| client.get(&url))?;
         match status.as_u16() {
             200..=299 => {
-                let data: AccountResponse = resp.json()?;
+                let data: AccountResponse = serde_json::from_str(&body)?;
                 Ok(!data.account.is_null())
             }
             401 | 403 => Ok(false),
-            _ => {
-                let body = resp.text().unwrap_or_default();
-                Err(anyhow!(
-                    "Unexpected status {} when validating Vultr API key: {}",
-                    status,
-                    body
-                ))
-            }
+            _ => Err(anyhow!(
+                "Unexpected status {} when validating Vultr API key: {}",
+                status,
+                body
+            )),
         }
     }
 
     fn list_regions(&self) -> Result<Vec<ProviderRegion>> {
         let url = self.url("regions");
-        let resp = self.http.get(&url).send()?;
-        let status = resp.status();
+        let (status, body) = self.execute_vultr_request(|client| client.get(&url))?;
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
             return Err(anyhow!("Failed to list regions ({}): {}", status, body));
         }
-        let data: RegionsResponse = resp.json()?;
+        let data: RegionsResponse = serde_json::from_str(&body)?;
         let regions = data
             .regions
             .into_iter()
@@ -290,13 +335,11 @@ impl VpsProvider for VultrProvider {
 
     fn list_plans(&self) -> Result<Vec<ProviderPlan>> {
         let url = self.url("plans?type=vc2");
-        let resp = self.http.get(&url).send()?;
-        let status = resp.status();
+        let (status, body) = self.execute_vultr_request(|client| client.get(&url))?;
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
             return Err(anyhow!("Failed to list plans ({}): {}", status, body));
         }
-        let data: PlansResponse = resp.json()?;
+        let data: PlansResponse = serde_json::from_str(&body)?;
         let plans = data
             .plans
             .into_iter()
@@ -316,13 +359,11 @@ impl VpsProvider for VultrProvider {
 
     fn list_images(&self) -> Result<Vec<ProviderImage>> {
         let url = self.url("os");
-        let resp = self.http.get(&url).send()?;
-        let status = resp.status();
+        let (status, body) = self.execute_vultr_request(|client| client.get(&url))?;
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
             return Err(anyhow!("Failed to list images ({}): {}", status, body));
         }
-        let data: OsResponse = resp.json()?;
+        let data: OsResponse = serde_json::from_str(&body)?;
         let allowed = [
             "ubuntu",
             "debian",
@@ -372,25 +413,22 @@ impl VpsProvider for VultrProvider {
         });
 
         let url = self.url("instances");
-        let resp = self.http.post(&url).json(&payload).send()?;
-        let status = resp.status();
+        let (status, body) =
+            self.execute_vultr_request(|client| client.post(&url).json(&payload))?;
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
             return Err(anyhow!("Failed to create instance ({}): {}", status, body));
         }
-        let data: CreateInstanceResponse = resp.json()?;
+        let data: CreateInstanceResponse = serde_json::from_str(&body)?;
         Ok(data.instance.id)
     }
 
     fn get_instance_status(&self, instance_id: &str) -> Result<InstanceStatus> {
         let url = self.url(&format!("instances/{}", instance_id));
-        let resp = self.http.get(&url).send()?;
-        let status = resp.status();
+        let (status, body) = self.execute_vultr_request(|client| client.get(&url))?;
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
             return Err(anyhow!("Failed to get instance status ({}): {}", status, body));
         }
-        let data: InstanceDetailResponse = resp.json()?;
+        let data: InstanceDetailResponse = serde_json::from_str(&body)?;
         let inst = data.instance;
         let ready = inst.status == "active" && inst.power_status == "running";
         let public_ipv4 = if !inst.main_ip.is_empty() && inst.main_ip != "0.0.0.0" {
@@ -413,21 +451,21 @@ impl VpsProvider for VultrProvider {
 
         for _ in 0..MAX_PAGES {
             let url = self.url("instances");
-            let mut req = self.http.get(&url).query(&[("per_page", "500")]);
-            if let Some(ref c) = cursor {
-                req = req.query(&[("cursor", c.as_str())]);
-            }
-            let resp = req.send()?;
-            let status = resp.status();
+            let (status, body) = self.execute_vultr_request(|client| {
+                let mut req = client.get(&url).query(&[("per_page", "500")]);
+                if let Some(ref c) = cursor {
+                    req = req.query(&[("cursor", c.as_str())]);
+                }
+                req
+            })?;
             if !status.is_success() {
-                let body = resp.text().unwrap_or_default();
                 return Err(anyhow!(
                     "Failed to list Vultr instances ({}): {}",
                     status,
                     body
                 ));
             }
-            let data: ListInstancesResponse = resp.json()?;
+            let data: ListInstancesResponse = serde_json::from_str(&body)?;
             for item in data.instances {
                 let name = non_empty_trimmed(&item.label)
                     .or_else(|| non_empty_trimmed(&item.hostname))
@@ -472,10 +510,8 @@ impl VpsProvider for VultrProvider {
     fn destroy_instance(&self, instance_id: &str) -> Result<()> {
         let id = validate_instance_id(instance_id)?;
         let url = self.url(&format!("instances/{}", id));
-        let resp = self.http.delete(&url).send()?;
-        let status = resp.status();
+        let (status, body) = self.execute_vultr_request(|client| client.delete(&url))?;
         if !status.is_success() {
-            let body = resp.text().unwrap_or_default();
             return Err(anyhow!(
                 "Failed to destroy Vultr instance {} ({}): {}",
                 id,
@@ -630,6 +666,60 @@ mod tests {
 
         let req_line = handle.join().unwrap();
         assert!(req_line.starts_with("DELETE /v2/instances/vultr-123 "));
+        Ok(())
+    }
+
+    #[test]
+    fn with_base_url_works_on_loopback_and_retries_on_unauthorized_ip() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let handle = thread::spawn(move || {
+            let responses = [
+                (
+                    "401 Unauthorized",
+                    r#"{"error":"Unauthorized IP address","status":401}"#,
+                ),
+                ("200 OK", r#"{"account":{"name":"fallback-ok"}}"#),
+                ("401 Unauthorized", r#"{"error":"Invalid API token","status":401}"#),
+            ];
+            let mut seen_paths = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                seen_paths.push(req_line.trim().to_string());
+                let resp = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            seen_paths
+        });
+
+        let provider = VultrProvider::with_base_url("test-key", format!("http://{}/v2", addr))?;
+        assert!(provider.validate_key()?);
+        assert!(!provider.validate_key()?);
+
+        let seen = handle.join().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|l| l.starts_with("GET /v2/account ")));
         Ok(())
     }
 }

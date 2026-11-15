@@ -29,6 +29,7 @@ pub struct SetupConfig {
     pub dry_run: bool,
     pub github_deploy: Option<GithubDeployConfig>,
     pub sudo_nopasswd: bool,
+    pub sudo_password: Option<String>,
 }
 
 /// Ordered stages of the remote server setup workflow.
@@ -419,6 +420,13 @@ esac"#
                     .map(str::trim)
                     .unwrap_or(""),
             );
+            let quoted_sudo_password = shell_quote(
+                cfg.sudo_password
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(""),
+            );
             let sudoers_block = if cfg.sudo_nopasswd {
                 r#"if [ ! -f "/etc/sudoers.d/${NEW_USER}" ]; then
     echo "${NEW_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${NEW_USER}"
@@ -436,6 +444,7 @@ fi"#
 NEW_USER={quoted_new_user}
 SSH_USER={quoted_ssh_user}
 SSH_PUBKEY={quoted_ssh_pubkey}
+SUDO_PASSWORD={quoted_sudo_password}
 
 case "${{DISTRO_FAMILY}}" in
     debian) SUDO_GRP="sudo" ;;
@@ -455,6 +464,10 @@ fi
 
 if ! id -nG "${{NEW_USER}}" | grep -qw "${{SUDO_GRP}}"; then
     usermod -aG "${{SUDO_GRP}}" "${{NEW_USER}}"
+fi
+
+if [ -n "${{SUDO_PASSWORD}}" ]; then
+    printf '%s:%s\n' "${{NEW_USER}}" "${{SUDO_PASSWORD}}" | chpasswd
 fi
 
 {sudoers_block}
@@ -791,18 +804,37 @@ impl<'a> SetupRunner<'a> {
 
     /// Runs all 6 setup steps in order, invoking `on_progress` after each step.
     /// When `cfg.dry_run` is true, collects generated scripts without invoking SSH.
-    pub fn run_all<F>(&self, cfg: &SetupConfig, mut on_progress: F) -> Result<Vec<StepReport>>
+    pub fn run_all<F>(&self, cfg: &SetupConfig, on_progress: F) -> Result<Vec<StepReport>>
     where
         F: FnMut(&StepReport),
+    {
+        self.run_all_with_callbacks(cfg, |_, _, _| {}, on_progress)
+    }
+
+    /// Runs all 6 setup steps in order, invoking `on_start` before each step and
+    /// `on_done` after each step finishes.
+    /// When `cfg.dry_run` is true, collects generated scripts without invoking SSH.
+    pub fn run_all_with_callbacks<FStart, FDone>(
+        &self,
+        cfg: &SetupConfig,
+        mut on_start: FStart,
+        mut on_done: FDone,
+    ) -> Result<Vec<StepReport>>
+    where
+        FStart: FnMut(usize, usize, SetupStepKind),
+        FDone: FnMut(&StepReport),
     {
         if let Some(ref gh) = cfg.github_deploy {
             build_github_deploy_script(gh)?;
         }
 
-        let mut reports = Vec::with_capacity(SetupStepKind::all().len());
+        let steps = SetupStepKind::all();
+        let mut reports = Vec::with_capacity(steps.len());
         let mut active_ssh_user = cfg.ssh_user.clone();
 
-        for &step in SetupStepKind::all() {
+        for (idx, &step) in steps.iter().enumerate() {
+            on_start(idx, steps.len(), step);
+
             if cfg.dry_run {
                 let script = build_step_script(step, cfg);
                 let report = StepReport {
@@ -811,7 +843,7 @@ impl<'a> SetupRunner<'a> {
                     dry_run: true,
                     output: script,
                 };
-                on_progress(&report);
+                on_done(&report);
                 reports.push(report);
                 continue;
             }
@@ -844,7 +876,7 @@ impl<'a> SetupRunner<'a> {
                 dry_run: false,
                 output: combined_output.clone(),
             };
-            on_progress(&report);
+            on_done(&report);
             reports.push(report);
 
             if !success {
@@ -927,6 +959,7 @@ mod tests {
             dry_run,
             github_deploy: None,
             sudo_nopasswd: true,
+            sudo_password: None,
         }
     }
 
@@ -1535,5 +1568,68 @@ mod tests {
             assert!(script_false.contains("NEW_USER='deploy'"));
             assert!(script_false.contains("rm -f \"/etc/sudoers.d/${NEW_USER}\""));
         }
+    }
+
+    #[test]
+    fn create_user_sets_sudo_password_with_chpasswd_when_configured() {
+        let mut cfg_pw = sample_config(ServerRole::Vanilla, "root", false);
+        cfg_pw.sudo_password = Some("  s3cr'et$(pw)  ".to_string());
+        let script_pw = build_step_script(SetupStepKind::CreateUser, &cfg_pw);
+        assert_bash_syntax_ok(&script_pw, "create-user-sudo-password");
+        assert!(script_pw.contains("SUDO_PASSWORD='s3cr'\\''et$(pw)'"));
+        assert!(script_pw.contains("if [ -n \"${SUDO_PASSWORD}\" ]; then"));
+        assert!(script_pw.contains("printf '%s:%s\\n' \"${NEW_USER}\" \"${SUDO_PASSWORD}\" | chpasswd"));
+
+        let cfg_none = sample_config(ServerRole::Vanilla, "root", false);
+        let script_none = build_step_script(SetupStepKind::CreateUser, &cfg_none);
+        assert_bash_syntax_ok(&script_none, "create-user-sudo-password-none");
+        assert!(script_none.contains("SUDO_PASSWORD=''"));
+
+        let mut cfg_blank = sample_config(ServerRole::Vanilla, "root", false);
+        cfg_blank.sudo_password = Some("   \t ".to_string());
+        let script_blank = build_step_script(SetupStepKind::CreateUser, &cfg_blank);
+        assert_bash_syntax_ok(&script_blank, "create-user-sudo-password-blank");
+        assert!(script_blank.contains("SUDO_PASSWORD=''"));
+    }
+
+    #[test]
+    fn run_all_with_callbacks_fires_on_start_before_on_done_for_each_step() -> Result<()> {
+        let dir = tempdir()?;
+        let log_file = dir.path().join("ssh_calls.log");
+        let mock_ssh = write_mock_ssh(dir.path(), &log_file)?;
+        let transport = SshTransport::with_bins(TransportMode::Tailscale, &mock_ssh, &mock_ssh);
+        let runner = SetupRunner::new(&transport, None);
+
+        for dry_run in [true, false] {
+            let cfg = sample_config(ServerRole::Vanilla, "root", dry_run);
+            let events = std::cell::RefCell::new(Vec::new());
+            let reports = runner.run_all_with_callbacks(
+                &cfg,
+                |idx, total, step| {
+                    events
+                        .borrow_mut()
+                        .push(format!("start:{}:{}:{:?}", idx, total, step));
+                },
+                |report| {
+                    events
+                        .borrow_mut()
+                        .push(format!("done:{:?}:{}", report.step, report.success));
+                },
+            )?;
+            assert_eq!(reports.len(), 6);
+            let expected: Vec<String> = SetupStepKind::all()
+                .iter()
+                .enumerate()
+                .flat_map(|(idx, step)| {
+                    [
+                        format!("start:{}:6:{:?}", idx, step),
+                        format!("done:{:?}:true", step),
+                    ]
+                })
+                .collect();
+            assert_eq!(*events.borrow(), expected);
+        }
+
+        Ok(())
     }
 }

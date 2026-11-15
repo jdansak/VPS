@@ -297,6 +297,52 @@ impl TailscaleClient {
             .error_for_status()?;
         Ok(())
     }
+
+    /// Delete every device matching `query` across hostname, id, name, short name, or IPv4.
+    pub fn delete_matching_devices(&self, query: &str) -> Result<Vec<String>> {
+        self.delete_matching_devices_filtered(query, false)
+    }
+
+    /// Delete every offline device matching `query` across hostname, id, name, short name, or IPv4.
+    pub fn delete_matching_offline_devices(&self, query: &str) -> Result<Vec<String>> {
+        self.delete_matching_devices_filtered(query, true)
+    }
+
+    fn delete_matching_devices_filtered(
+        &self,
+        query: &str,
+        offline_only: bool,
+    ) -> Result<Vec<String>> {
+        let devices = self.list_devices()?;
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut deleted = Vec::new();
+        for dev in devices {
+            if offline_only && dev.online {
+                continue;
+            }
+            if device_matches_query(&dev, q) {
+                self.delete_device(&dev.id)?;
+                deleted.push(format!("{} ({})", dev.hostname, dev.id));
+            }
+        }
+        Ok(deleted)
+    }
+}
+
+fn device_matches_query(dev: &TailscaleDevice, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return false;
+    }
+    let name_part = dev.name.split('.').next().unwrap_or("");
+    dev.hostname.eq_ignore_ascii_case(q)
+        || dev.id.eq_ignore_ascii_case(q)
+        || dev.name.eq_ignore_ascii_case(q)
+        || name_part.eq_ignore_ascii_case(q)
+        || dev.ipv4.eq_ignore_ascii_case(q)
 }
 
 fn shell_quote(s: &str) -> String {
@@ -305,10 +351,28 @@ fn shell_quote(s: &str) -> String {
 
 /// Generate an idempotent cloud-init script that installs Tailscale and brings the node up.
 pub fn generate_cloud_init(auth_key: &str, hostname: &str, username: &str) -> String {
+    generate_cloud_init_with_password(auth_key, hostname, username, None)
+}
+
+/// Generate an idempotent cloud-init script that installs Tailscale, optionally sets the
+/// user's password, and brings the node up.
+pub fn generate_cloud_init_with_password(
+    auth_key: &str,
+    hostname: &str,
+    username: &str,
+    password: Option<&str>,
+) -> String {
     let q_hostname = shell_quote(hostname);
     let q_username = shell_quote(username);
     let q_auth_key = shell_quote(auth_key);
     let q_sudoers = shell_quote(&format!("/etc/sudoers.d/{}", username));
+    let password_block = match password.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pw) => {
+            let q_password = shell_quote(pw);
+            format!("\nprintf '%s:%s\\n' {q_username} {q_password} | chpasswd\n")
+        }
+        None => String::new(),
+    };
     format!(
         r#"#!/bin/bash
 set -euo pipefail
@@ -339,7 +403,7 @@ if ! id -u {q_username} >/dev/null 2>&1; then
   printf '%s ALL=(ALL) NOPASSWD:ALL\n' {q_username} > {q_sudoers}
   chmod 440 {q_sudoers}
 fi
-
+{password_block}
 # Install Tailscale if needed
 if ! command -v tailscale >/dev/null 2>&1; then
   curl -fsSL https://tailscale.com/install.sh | sh
@@ -356,7 +420,8 @@ tailscale up --authkey={q_auth_key} --ssh --hostname={q_hostname}
         q_hostname = q_hostname,
         q_username = q_username,
         q_auth_key = q_auth_key,
-        q_sudoers = q_sudoers
+        q_sudoers = q_sudoers,
+        password_block = password_block,
     )
 }
 
@@ -364,9 +429,27 @@ tailscale up --authkey={q_auth_key} --ssh --hostname={q_hostname}
 /// Configures hostname, creates a non-root sudo/wheel user with NOPASSWD sudoers,
 /// and installs the SSH public key for root and the user.
 pub fn generate_ssh_cloud_init(ssh_pubkey: &str, hostname: &str, username: &str) -> String {
+    generate_ssh_cloud_init_with_password(ssh_pubkey, hostname, username, None)
+}
+
+/// Generate an idempotent cloud-init script for Standard SSH mode (no Tailscale),
+/// optionally setting the non-root user's password.
+pub fn generate_ssh_cloud_init_with_password(
+    ssh_pubkey: &str,
+    hostname: &str,
+    username: &str,
+    password: Option<&str>,
+) -> String {
     let q_ssh_pubkey = shell_quote(ssh_pubkey.trim());
     let q_hostname = shell_quote(hostname);
     let q_username = shell_quote(username);
+    let password_block = match password.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(pw) => {
+            let q_password = shell_quote(pw);
+            format!("\n  printf '%s:%s\\n' \"$NEW_USER\" {q_password} | chpasswd")
+        }
+        None => String::new(),
+    };
     format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -403,7 +486,7 @@ if [ "$NEW_USER" != "root" ]; then
   fi
   mkdir -p /etc/sudoers.d
   printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$NEW_USER" > "/etc/sudoers.d/${{NEW_USER}}"
-  chmod 0440 "/etc/sudoers.d/${{NEW_USER}}"
+  chmod 0440 "/etc/sudoers.d/${{NEW_USER}}"{password_block}
 fi
 
 # Install SSH key for root
@@ -431,6 +514,7 @@ fi
         q_hostname = q_hostname,
         q_username = q_username,
         q_ssh_pubkey = q_ssh_pubkey,
+        password_block = password_block,
     )
 }
 
@@ -855,5 +939,165 @@ mod tests {
             "SSH_PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest o'\\''connor $(whoami) `id`'"
         ));
         assert_valid_bash(&script);
+    }
+
+    #[test]
+    fn delete_matching_devices_deletes_all_matches_across_fields() {
+        let devices_body = r#"{
+            "devices": [
+                {
+                    "id": "dev-1",
+                    "hostname": "Edge-VPS",
+                    "name": "edge-vps.tail1.ts.net",
+                    "addresses": ["100.64.0.1"],
+                    "os": "linux",
+                    "online": true
+                },
+                {
+                    "id": "dev-2",
+                    "hostname": "edge-vps-2",
+                    "name": "edge-vps.tail2.ts.net",
+                    "addresses": ["100.64.0.2"],
+                    "os": "linux",
+                    "online": false
+                },
+                {
+                    "id": "dev-3",
+                    "hostname": "other-box",
+                    "name": "other-box.tail1.ts.net",
+                    "addresses": ["100.64.0.3"],
+                    "os": "linux",
+                    "online": true
+                }
+            ]
+        }"#;
+        let (base_url, recorded, handle) = spawn_mock_server(vec![
+            MockResponse::json(200, "OK", devices_body),
+            MockResponse::json(200, "OK", "{}"),
+            MockResponse::json(200, "OK", "{}"),
+            MockResponse::json(200, "OK", devices_body),
+            MockResponse::json(200, "OK", "{}"),
+            MockResponse::json(200, "OK", devices_body),
+        ]);
+        let client = TailscaleClient::with_config("ts-key", &base_url, "-").unwrap();
+
+        let deleted = client.delete_matching_devices("  EDGE-VPS  ").unwrap();
+        assert_eq!(deleted, vec!["Edge-VPS (dev-1)", "edge-vps-2 (dev-2)"]);
+
+        let deleted_by_ip = client.delete_matching_devices("100.64.0.3").unwrap();
+        assert_eq!(deleted_by_ip, vec!["other-box (dev-3)"]);
+
+        let deleted_empty = client.delete_matching_devices("   ").unwrap();
+        assert!(deleted_empty.is_empty());
+
+        handle.join().unwrap();
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 6);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/tailnet/-/devices");
+        assert_eq!(reqs[1].method, "DELETE");
+        assert_eq!(reqs[1].path, "/device/dev-1");
+        assert_eq!(reqs[2].method, "DELETE");
+        assert_eq!(reqs[2].path, "/device/dev-2");
+        assert_eq!(reqs[3].method, "GET");
+        assert_eq!(reqs[3].path, "/tailnet/-/devices");
+        assert_eq!(reqs[4].method, "DELETE");
+        assert_eq!(reqs[4].path, "/device/dev-3");
+        assert_eq!(reqs[5].method, "GET");
+        assert_eq!(reqs[5].path, "/tailnet/-/devices");
+    }
+
+    #[test]
+    fn delete_matching_offline_devices_skips_online_devices() {
+        let devices_body = r#"{
+            "devices": [
+                {
+                    "id": "dev-online",
+                    "hostname": "web-node",
+                    "name": "web-node.tail1.ts.net",
+                    "addresses": ["100.64.1.10"],
+                    "os": "linux",
+                    "online": true
+                },
+                {
+                    "id": "dev-offline",
+                    "hostname": "web-node",
+                    "name": "web-node-1.tail1.ts.net",
+                    "addresses": ["100.64.1.11"],
+                    "os": "linux",
+                    "online": false
+                },
+                {
+                    "id": "dev-offline-other",
+                    "hostname": "db-node",
+                    "name": "db-node.tail1.ts.net",
+                    "addresses": ["100.64.1.12"],
+                    "os": "linux",
+                    "online": false
+                }
+            ]
+        }"#;
+        let (base_url, recorded, handle) = spawn_mock_server(vec![
+            MockResponse::json(200, "OK", devices_body),
+            MockResponse::json(200, "OK", "{}"),
+        ]);
+        let client = TailscaleClient::with_config("ts-key", &base_url, "-").unwrap();
+
+        let deleted = client.delete_matching_offline_devices("WEB-NODE").unwrap();
+        assert_eq!(deleted, vec!["web-node (dev-offline)"]);
+
+        handle.join().unwrap();
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/tailnet/-/devices");
+        assert_eq!(reqs[1].method, "DELETE");
+        assert_eq!(reqs[1].path, "/device/dev-offline");
+    }
+
+    #[test]
+    fn generate_cloud_init_with_password_sets_chpasswd_and_validates_bash() {
+        let with_pw = generate_cloud_init_with_password(
+            "tskey-auth-123",
+            "edge-vps",
+            "deploy",
+            Some("  p@ss'word$(1)  "),
+        );
+        assert!(with_pw.contains("printf '%s:%s\\n' 'deploy' 'p@ss'\\''word$(1)' | chpasswd"));
+        assert_valid_bash(&with_pw);
+
+        let without_pw = generate_cloud_init_with_password("tskey-auth-123", "edge-vps", "deploy", None);
+        assert!(!without_pw.contains("chpasswd"));
+        assert_eq!(without_pw, generate_cloud_init("tskey-auth-123", "edge-vps", "deploy"));
+        assert_valid_bash(&without_pw);
+
+        let blank_pw =
+            generate_cloud_init_with_password("tskey-auth-123", "edge-vps", "deploy", Some("   "));
+        assert!(!blank_pw.contains("chpasswd"));
+        assert_valid_bash(&blank_pw);
+    }
+
+    #[test]
+    fn generate_ssh_cloud_init_with_password_sets_chpasswd_for_non_root_and_validates_bash() {
+        let pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItestkey deploy@workstation";
+        let with_pw = generate_ssh_cloud_init_with_password(
+            pubkey,
+            "ssh-vps",
+            "deploy",
+            Some("  s3cr'et!  "),
+        );
+        assert!(with_pw.contains("if [ \"$NEW_USER\" != \"root\" ]; then"));
+        assert!(with_pw.contains("printf '%s:%s\\n' \"$NEW_USER\" 's3cr'\\''et!' | chpasswd"));
+        assert_valid_bash(&with_pw);
+
+        let without_pw = generate_ssh_cloud_init_with_password(pubkey, "ssh-vps", "deploy", None);
+        assert!(!without_pw.contains("chpasswd"));
+        assert_eq!(without_pw, generate_ssh_cloud_init(pubkey, "ssh-vps", "deploy"));
+        assert_valid_bash(&without_pw);
+
+        let blank_pw =
+            generate_ssh_cloud_init_with_password(pubkey, "ssh-vps", "deploy", Some("  \t "));
+        assert!(!blank_pw.contains("chpasswd"));
+        assert_valid_bash(&blank_pw);
     }
 }

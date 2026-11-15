@@ -8,7 +8,9 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use crate::config::{SessionData, SessionState, Settings};
-use crate::tailscale::{generate_cloud_init, generate_ssh_cloud_init, TailscaleClient};
+use crate::tailscale::{
+    generate_cloud_init_with_password, generate_ssh_cloud_init_with_password, TailscaleClient,
+};
 
 // Public sub-modules for concrete provider implementations.
 pub mod vultr;
@@ -341,6 +343,7 @@ pub struct ProvisionConfig {
     pub tailscale_mode: bool,
     pub ssh_pubkey: Option<String>,
     pub ssh_key_path: Option<String>,
+    pub sudo_password: Option<String>,
 }
 
 /// Result returned after a successful provisioning run.
@@ -395,12 +398,32 @@ pub fn provision_full_flow(
     cfg: &ProvisionConfig,
     session: Option<&SessionState>,
 ) -> Result<ProvisionResult> {
+    provision_full_flow_with_progress(provider, tailscale, cfg, session, |_| {})
+}
+
+/// Executes the full provisioning flow while emitting human-readable progress updates via `on_progress`.
+pub fn provision_full_flow_with_progress<F>(
+    provider: &dyn VpsProvider,
+    tailscale: Option<&TailscaleClient>,
+    cfg: &ProvisionConfig,
+    session: Option<&SessionState>,
+    mut on_progress: F,
+) -> Result<ProvisionResult>
+where
+    F: FnMut(&str),
+{
     let cloud_init = if cfg.tailscale_mode {
         let ts = tailscale.ok_or_else(|| {
             anyhow!("Tailscale client is required when tailscale_mode is enabled")
         })?;
+        on_progress("[PROVISION] Creating Tailscale auth key and cloud-init...");
         let auth_key = ts.create_auth_key("bab-bootstrap", &cfg.tags, false, true, 3600)?;
-        generate_cloud_init(&auth_key, &cfg.hostname, &cfg.username)
+        generate_cloud_init_with_password(
+            &auth_key,
+            &cfg.hostname,
+            &cfg.username,
+            cfg.sudo_password.as_deref(),
+        )
     } else {
         let ssh_pubkey = cfg
             .ssh_pubkey
@@ -410,7 +433,12 @@ pub fn provision_full_flow(
             .ok_or_else(|| {
                 anyhow!("SSH public key is required when tailscale_mode is disabled")
             })?;
-        generate_ssh_cloud_init(ssh_pubkey, &cfg.hostname, &cfg.username)
+        generate_ssh_cloud_init_with_password(
+            ssh_pubkey,
+            &cfg.hostname,
+            &cfg.username,
+            cfg.sudo_password.as_deref(),
+        )
     };
 
     let req = CreateInstanceRequest {
@@ -420,8 +448,40 @@ pub fn provision_full_flow(
         hostname: cfg.hostname.clone(),
         user_data_raw: cloud_init,
     };
+    on_progress(&format!(
+        "[PROVISION] Submitting {} create_instance request for '{}'...",
+        provider.kind().label(),
+        cfg.hostname
+    ));
     let instance_id = provider.create_instance(&req)?;
-    let status = provider.wait_active(&instance_id, cfg.provider_timeout, cfg.poll_interval)?;
+    on_progress(&format!(
+        "[PROVISION] Instance '{}' created; polling {} until active...",
+        instance_id,
+        provider.kind().label()
+    ));
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        let status = provider.get_instance_status(&instance_id)?;
+        if status.ready {
+            break status;
+        }
+        on_progress(&format!(
+            "[PROVISION] Polling VM '{}' (state={}, ip={}, elapsed={}s)...",
+            instance_id,
+            status.state,
+            status.public_ipv4.as_deref().unwrap_or("pending"),
+            start.elapsed().as_secs()
+        ));
+        if start.elapsed() >= cfg.provider_timeout {
+            return Err(anyhow!(
+                "Timed out waiting for instance {} to become ready",
+                instance_id
+            ));
+        }
+        std::thread::sleep(cfg.poll_interval);
+    };
+
     let discovered_public_ip = status
         .public_ipv4
         .map(|s| s.trim().to_string())
@@ -430,7 +490,23 @@ pub fn provision_full_flow(
     let (ip, tailscale_ip, public_ip, session_tailscale_ip, session_public_ip, ssh_key, transport_mode) =
         if cfg.tailscale_mode {
             let ts = tailscale.expect("validated above");
-            let ts_ip = ts.wait_for_device(&cfg.hostname, cfg.tailscale_timeout, cfg.poll_interval)?;
+            let ts_start = std::time::Instant::now();
+            let ts_ip = loop {
+                on_progress(&format!(
+                    "[PROVISION] VM '{}' is active (public IP: {}); waiting for '{}' on Tailscale (elapsed={}s)...",
+                    instance_id,
+                    discovered_public_ip.as_deref().unwrap_or("none"),
+                    cfg.hostname,
+                    ts_start.elapsed().as_secs()
+                ));
+                if let Some(found) = ts.find_device_ip(&cfg.hostname)? {
+                    break found;
+                }
+                if ts_start.elapsed() >= cfg.tailscale_timeout {
+                    return Err(anyhow!("Timed out waiting for device {}", cfg.hostname));
+                }
+                std::thread::sleep(cfg.poll_interval);
+            };
             let pub_ip_str = discovered_public_ip.clone().unwrap_or_default();
             (
                 ts_ip.clone(),
@@ -480,6 +556,14 @@ pub fn provision_full_flow(
         data.vps_region = Some(cfg.region.clone());
         data.vps_plan = Some(cfg.plan.clone());
         data.vps_image = Some(cfg.image_id.clone());
+        if let Some(pw) = cfg
+            .sudo_password
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            data.sudo_password = Some(pw.to_string());
+        }
         ss.save_session(&data)?;
     }
 
@@ -835,6 +919,7 @@ mod tests {
             tailscale_mode,
             ssh_pubkey: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest user@host".to_string()),
             ssh_key_path: Some("/tmp/bab_ed25519".to_string()),
+            sudo_password: None,
         }
     }
 
@@ -1311,6 +1396,155 @@ mod tests {
         assert!(build_cloud_provider_with_key(ProviderKind::ExistingTailscale, "k", None).is_err());
         assert!(destroy_provider_instance_with_key(ProviderKind::Vultr, "   ", "v-99", None).is_err());
         assert!(destroy_provider_instance(&settings, ProviderKind::Linode, "123").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn provision_full_flow_with_progress_emits_updates_and_preserves_or_sets_password() -> Result<()>
+    {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        struct PollingMockProvider {
+            polls: AtomicUsize,
+            captured_user_data: std::sync::Mutex<Option<String>>,
+        }
+
+        impl VpsProvider for PollingMockProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Vultr
+            }
+            fn validate_key(&self) -> Result<bool> {
+                Ok(true)
+            }
+            fn list_regions(&self) -> Result<Vec<ProviderRegion>> {
+                Ok(vec![])
+            }
+            fn list_plans(&self) -> Result<Vec<ProviderPlan>> {
+                Ok(vec![])
+            }
+            fn list_images(&self) -> Result<Vec<ProviderImage>> {
+                Ok(vec![])
+            }
+            fn create_instance(&self, req: &CreateInstanceRequest) -> Result<String> {
+                *self.captured_user_data.lock().unwrap() = Some(req.user_data_raw.clone());
+                Ok("inst-prog-1".to_string())
+            }
+            fn get_instance_status(&self, _instance_id: &str) -> Result<InstanceStatus> {
+                let count = self.polls.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Ok(InstanceStatus {
+                        state: "pending".to_string(),
+                        public_ipv4: None,
+                        ready: false,
+                    })
+                } else {
+                    Ok(InstanceStatus {
+                        state: "active".to_string(),
+                        public_ipv4: Some("203.0.113.77".to_string()),
+                        ready: true,
+                    })
+                }
+            }
+            fn list_instances(&self) -> Result<Vec<ProviderInstance>> {
+                Ok(vec![])
+            }
+            fn destroy_instance(&self, _instance_id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            let responses = [
+                r#"{"key":"tskey-auth-prog"}"#,
+                r#"{"devices":[]}"#,
+                r#"{"devices":[{"id":"dev-1","hostname":"bab-vps","name":"bab-vps.tail1.ts.net","addresses":["100.64.2.5"],"os":"linux","online":true}]}"#,
+            ];
+            for body in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&stream);
+                let mut req_line = String::new();
+                reader.read_line(&mut req_line).unwrap();
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = trimmed.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if content_len > 0 {
+                    let mut buf = vec![0u8; content_len];
+                    reader.read_exact(&mut buf).unwrap();
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let ts = TailscaleClient::with_config("ts-api-key", format!("http://{}", addr), "-")?;
+        let provider = PollingMockProvider {
+            polls: AtomicUsize::new(0),
+            captured_user_data: std::sync::Mutex::new(None),
+        };
+        let tmp = tempfile::NamedTempFile::new()?;
+        let session = SessionState::new(tmp.path());
+        let mut cfg = base_cfg(true);
+        cfg.sudo_password = Some("Abc1234567".to_string());
+
+        let mut progress = Vec::new();
+        let res =
+            provision_full_flow_with_progress(&provider, Some(&ts), &cfg, Some(&session), |msg| {
+                progress.push(msg.to_string());
+            })?;
+        handle.join().unwrap();
+
+        assert_eq!(res.instance_id, "inst-prog-1");
+        assert_eq!(res.ip, "100.64.2.5");
+        assert_eq!(res.public_ip, "203.0.113.77");
+
+        let ud = provider.captured_user_data.lock().unwrap().clone().unwrap();
+        assert!(ud.contains("chpasswd"));
+        assert!(ud.contains("Abc1234567"));
+
+        assert!(progress.iter().any(|m| m == "[PROVISION] Creating Tailscale auth key and cloud-init..."));
+        assert!(progress.iter().any(|m| m == "[PROVISION] Submitting Vultr create_instance request for 'bab-vps'..."));
+        assert!(progress.iter().any(|m| m == "[PROVISION] Instance 'inst-prog-1' created; polling Vultr until active..."));
+        assert!(progress.iter().any(|m| m.starts_with("[PROVISION] Polling VM 'inst-prog-1' (state=pending, ip=pending, elapsed=")));
+        assert_eq!(
+            progress
+                .iter()
+                .filter(|m| m.starts_with("[PROVISION] VM 'inst-prog-1' is active (public IP: 203.0.113.77); waiting for 'bab-vps' on Tailscale (elapsed="))
+                .count(),
+            2
+        );
+
+        let loaded = session.load_session()?;
+        assert_eq!(loaded.sudo_password.as_deref(), Some("Abc1234567"));
+
+        // Verify cfg.sudo_password = None does NOT overwrite existing session.sudo_password.
+        let ssh_provider = MockProvider::new(Some("203.0.113.88"));
+        let mut ssh_cfg = base_cfg(false);
+        ssh_cfg.sudo_password = None;
+        provision_full_flow_with_progress(&ssh_provider, None, &ssh_cfg, Some(&session), |_| {})?;
+        let after_none = session.load_session()?;
+        assert_eq!(after_none.sudo_password.as_deref(), Some("Abc1234567"));
+
         Ok(())
     }
 }

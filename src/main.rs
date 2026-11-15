@@ -5,7 +5,8 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use bab::config::{
-    default_config_dir, LogStore, SessionData, SessionState, Settings, MAX_LOG_FILE_BYTES,
+    default_config_dir, generate_random_password, LogStore, SessionData, SessionState, Settings,
+    MAX_LOG_FILE_BYTES, SUDO_PASSWORD_LEN,
 };
 use bab::dns::{build_cloudflare_dns_stub_plan, CloudflareDnsConfig};
 use bab::providers::linode::LinodeProvider;
@@ -767,6 +768,7 @@ struct SetupSessionUpdate<'a> {
     hostname: &'a str,
     tailscale_mode: bool,
     sudo_nopasswd: bool,
+    sudo_password: Option<&'a str>,
     key_path: Option<&'a Path>,
     catalog: (Option<&'a str>, Option<&'a str>, Option<&'a str>),
     provisioned_ips: Option<(Option<&'a str>, Option<&'a str>)>,
@@ -781,6 +783,13 @@ fn persist_setup_session(session: &SessionState, update: &SetupSessionUpdate<'_>
     data.username = Some(update.username.to_string());
     data.tailscale_hostname = Some(update.hostname.to_string());
     data.sudo_nopasswd = Some(if update.sudo_nopasswd { "true" } else { "false" }.to_string());
+    if let Some(pw) = update
+        .sudo_password
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        data.sudo_password = Some(pw.to_string());
+    }
     data.vps_region = update.catalog.0.map(str::to_string);
     data.vps_plan = update.catalog.1.map(str::to_string);
     data.vps_image = update.catalog.2.map(str::to_string);
@@ -1034,6 +1043,13 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     let session_data = session.load_session().unwrap_or_else(|_| SessionData::default());
     let sudo_nopasswd =
         resolve_sudo_nopasswd(args.sudo_nopasswd, args.no_sudo_nopasswd, &session_data);
+    let sudo_password = session_data
+        .sudo_password
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| generate_random_password(SUDO_PASSWORD_LEN));
     let log = resolve_cli_log_store(&settings);
     let tags = parse_tags(args.tags.as_deref());
     let tailscale_mode = args.transport == TransportArg::Tailscale;
@@ -1173,6 +1189,12 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
     let resolved_image: Option<String>;
     let mut resolved_public_ip: Option<String> = None;
     let mut resolved_tailscale_ip: Option<String> = None;
+    let mut resolved_instance_id: Option<String> = session_data
+        .vps_instance_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
 
     let target = match args.provider {
         ProviderKind::Vultr | ProviderKind::UpCloud | ProviderKind::Linode => {
@@ -1296,6 +1318,20 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
                 resolved_plan = Some(plan.clone());
                 resolved_image = Some(image_id.clone());
 
+                if let Some(ref ts) = ts_client {
+                    if let Ok(removed) = ts.delete_matching_offline_devices(&args.hostname) {
+                        if !removed.is_empty() {
+                            let msg = format!(
+                                "[TAILSCALE] Pruned stale offline device(s) matching '{}': {}",
+                                args.hostname,
+                                removed.join(", ")
+                            );
+                            println!("{}", msg);
+                            append_cli_log(&log, &[msg]);
+                        }
+                    }
+                }
+
                 let prov_cfg = ProvisionConfig {
                     provider: args.provider,
                     region,
@@ -1314,6 +1350,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
                         .as_ref()
                         .and_then(|s| s.key_path.as_ref())
                         .map(|p| p.to_string_lossy().into_owned()),
+                    sudo_password: Some(sudo_password.clone()),
                 };
 
                 let result = provision_full_flow(
@@ -1323,6 +1360,9 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
                     Some(&session),
                 )?;
                 was_provisioned = true;
+                if !result.instance_id.trim().is_empty() {
+                    resolved_instance_id = Some(result.instance_id.clone());
+                }
                 if !result.public_ip.is_empty() {
                     resolved_public_ip = Some(result.public_ip.clone());
                 }
@@ -1430,6 +1470,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         provider_name: args.provider.to_string(),
         tailscale_mode,
         sudo_nopasswd,
+        sudo_password: Some(sudo_password.clone()),
         ssh_pubkey: ssh_pubkey_for_setup,
         dry_run: args.dry_run,
         github_deploy: github_deploy.clone(),
@@ -1552,6 +1593,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
                 hostname: &args.hostname,
                 tailscale_mode,
                 sudo_nopasswd,
+                sudo_password: Some(&sudo_password),
                 key_path: key_path_opt,
                 catalog: (
                     resolved_region.as_deref(),
@@ -1561,6 +1603,12 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
                 provisioned_ips,
             },
         )?;
+        let _ = settings.record_instance_password(
+            resolved_instance_id.as_deref(),
+            Some(&args.hostname),
+            resolved_public_ip.as_deref(),
+            &sudo_password,
+        );
         if let Some(ref gh) = github_deploy {
             persist_github_session(&session, gh)?;
         }
@@ -1606,6 +1654,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
                 "OFF (password required)"
             }
         ),
+        format!("Sudo Password:         {}", sudo_password),
     ];
     if let Some(ref dns) = cf_dns_cfg {
         summary_lines.push(format!(
@@ -2188,6 +2237,14 @@ fn execute_destroy(
         return Ok(());
     }
 
+    let session_state = SessionState::load_default().ok();
+    let pre_destroy_session = session_state
+        .as_ref()
+        .and_then(|s| s.load_session().ok())
+        .unwrap_or_default();
+    let session_matches =
+        pre_destroy_session.vps_instance_id.as_deref().map(str::trim) == Some(id.trim());
+
     if let Err(err) = destroy_provider_instance(settings, kind, id) {
         append_cli_log(
             &log,
@@ -2200,7 +2257,11 @@ fn execute_destroy(
         );
         return Err(err);
     }
-    let cleared = clear_destroyed_session_if_matches(&SessionState::load_default()?, id)?;
+
+    let cleared = match session_state {
+        Some(ref s) => clear_destroyed_session_if_matches(s, id)?,
+        None => clear_destroyed_session_if_matches(&SessionState::load_default()?, id)?,
+    };
     let msg = format!("Destroyed {} instance '{}'.", kind.label(), id);
     println!("{}", msg);
     let mut log_lines = vec![format!("[DESTROY] {}", msg)];
@@ -2209,6 +2270,68 @@ fn execute_destroy(
         println!("{}", cleared_msg);
         log_lines.push(format!("[DESTROY] {}", cleared_msg));
     }
+
+    if let Ok(Some(ts_key)) = settings.tailscale_api_key() {
+        let ts_key = ts_key.trim().to_string();
+        if !ts_key.is_empty() {
+            let mut queries: Vec<String> = Vec::new();
+            let mut push_unique = |cand: Option<&str>| {
+                if let Some(c) = cand.map(str::trim).filter(|s| !s.is_empty()) {
+                    if !queries.iter().any(|existing| existing.eq_ignore_ascii_case(c)) {
+                        queries.push(c.to_string());
+                    }
+                }
+            };
+            push_unique(name);
+            if session_matches {
+                push_unique(pre_destroy_session.tailscale_hostname.as_deref());
+                push_unique(pre_destroy_session.tailscale_ip.as_deref());
+            }
+            push_unique(Some(id));
+
+            match TailscaleClient::new(ts_key) {
+                Ok(ts) => {
+                    let mut removed_all: Vec<String> = Vec::new();
+                    for q in &queries {
+                        match ts.delete_matching_devices(q) {
+                            Ok(removed) => {
+                                for item in removed {
+                                    if !removed_all.contains(&item) {
+                                        removed_all.push(item);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                let warn_msg = format!(
+                                    "[WARN] Failed to check/remove Tailscale device matching '{}': {}",
+                                    q, err
+                                );
+                                eprintln!("{}", warn_msg);
+                                log_lines.push(warn_msg);
+                            }
+                        }
+                    }
+                    if !removed_all.is_empty() {
+                        let ts_msg = format!(
+                            "[TAILSCALE] Removed device(s) from tailnet: {}",
+                            removed_all.join(", ")
+                        );
+                        println!("{}", ts_msg);
+                        log_lines.push(ts_msg);
+                    }
+                }
+                Err(err) => {
+                    let warn_msg = format!(
+                        "[WARN] Could not initialize Tailscale client for device cleanup: {}",
+                        err
+                    );
+                    eprintln!("{}", warn_msg);
+                    log_lines.push(warn_msg);
+                }
+            }
+        }
+    }
+
     append_cli_log(&log, &log_lines);
     Ok(())
 }
@@ -2318,6 +2441,10 @@ fn cmd_destroy(args: DestroyArgs) -> Result<()> {
             println!("{}", clear_msg);
             log_lines.push(clear_msg);
         }
+        let ts_dry_msg =
+            "[DRY-RUN] Would remove matching device from Tailscale network if present.".to_string();
+        println!("{}", ts_dry_msg);
+        log_lines.push(ts_dry_msg);
         append_cli_log(&log, &log_lines);
         return Ok(());
     }
@@ -2855,6 +2982,7 @@ mod tests {
                 hostname: "ts-box",
                 tailscale_mode: true,
                 sudo_nopasswd: true,
+                sudo_password: Some("Abc123XyZ9"),
                 key_path: None,
                 catalog: (None, None, None),
                 provisioned_ips: None,
@@ -2863,6 +2991,7 @@ mod tests {
         assert_eq!(state.transport_mode()?.as_deref(), Some("tailscale"));
         assert_eq!(state.ssh_key()?.as_deref(), Some("tailscale"));
         assert_eq!(state.sudo_nopasswd()?.as_deref(), Some("true"));
+        assert_eq!(state.sudo_password()?.as_deref(), Some("Abc123XyZ9"));
 
         // Switch to SSH mode with --ssh-pubkey (key_path_opt == None): clears stale "tailscale".
         persist_setup_session(
@@ -2874,6 +3003,7 @@ mod tests {
                 hostname: "ssh-box",
                 tailscale_mode: false,
                 sudo_nopasswd: false,
+                sudo_password: None,
                 key_path: None,
                 catalog: (Some("ewr"), Some("vc2-1c-1gb"), Some("2284")),
                 provisioned_ips: None,
@@ -2895,6 +3025,7 @@ mod tests {
                 hostname: "ssh-box",
                 tailscale_mode: false,
                 sudo_nopasswd: true,
+                sudo_password: None,
                 key_path: Some(&key_path),
                 catalog: (Some("ewr"), Some("vc2-1c-1gb"), Some("2284")),
                 provisioned_ips: None,
@@ -2912,6 +3043,7 @@ mod tests {
                 hostname: "ssh-box",
                 tailscale_mode: false,
                 sudo_nopasswd: true,
+                sudo_password: None,
                 key_path: None,
                 catalog: (Some("ewr"), Some("vc2-1c-1gb"), Some("2284")),
                 provisioned_ips: None,
@@ -3016,6 +3148,7 @@ mod tests {
                 hostname: "ssh-box",
                 tailscale_mode: false,
                 sudo_nopasswd: true,
+                sudo_password: None,
                 key_path: None,
                 catalog: (Some("ewr"), Some("vc2-1c-1gb"), Some("2284")),
                 provisioned_ips: None,
@@ -3037,6 +3170,7 @@ mod tests {
                 hostname: "ts-box",
                 tailscale_mode: true,
                 sudo_nopasswd: true,
+                sudo_password: None,
                 key_path: None,
                 catalog: (None, None, None),
                 provisioned_ips: None,
@@ -3064,6 +3198,7 @@ mod tests {
                 hostname: "ts-box",
                 tailscale_mode: true,
                 sudo_nopasswd: true,
+                sudo_password: None,
                 key_path: None,
                 catalog: (None, None, None),
                 provisioned_ips: None,
@@ -3085,6 +3220,7 @@ mod tests {
                 hostname: "ts-box",
                 tailscale_mode: true,
                 sudo_nopasswd: true,
+                sudo_password: None,
                 key_path: None,
                 catalog: (None, None, None),
                 provisioned_ips: None,
@@ -3103,6 +3239,7 @@ mod tests {
                 hostname: "linode-box",
                 tailscale_mode: true,
                 sudo_nopasswd: true,
+                sudo_password: None,
                 key_path: None,
                 catalog: (Some("us-east"), Some("g6-standard-1"), Some("linode/ubuntu24.04")),
                 provisioned_ips: Some((Some("203.0.113.42"), Some("100.64.1.2"))),
@@ -3562,6 +3699,7 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("Sudo User:") && l.contains("(passwordless: ON (NOPASSWD:ALL))")));
+        assert!(lines.iter().any(|l| l.contains("Sudo Password:")));
         assert!(lines.iter().any(|l| l.contains("Log File:") && l.contains("bab.log")));
         assert!(lines
             .iter()
@@ -3569,6 +3707,9 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.contains("[DRY-RUN] Would destroy Vultr instance 'vultr-123'.")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("[DRY-RUN] Would remove matching device from Tailscale network if present.")));
         Ok(())
     }
 
@@ -3647,5 +3788,254 @@ mod tests {
                 truthy
             );
         }
+    }
+
+    struct MockDestroyServer {
+        addr: std::net::SocketAddr,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    impl MockDestroyServer {
+        fn shutdown(self) -> Vec<(String, String)> {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.addr);
+            self.handle.join().unwrap();
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn spawn_destroy_mock_server(fail_tailscale: bool) -> MockDestroyServer {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock local_addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let reqs_clone = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = std::thread::spawn(move || {
+            let mut ts_device_present = true;
+            while !stop_clone.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                if stop_clone.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let mut reader = BufReader::new(&stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, val)) = trimmed.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("content-length") {
+                            content_length = val.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if content_length > 0 {
+                    let mut buf = vec![0u8; content_length];
+                    let _ = reader.read_exact(&mut buf);
+                }
+
+                reqs_clone
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), path.clone()));
+
+                let (status, reason, body): (u16, &str, String) =
+                    match (method.as_str(), path.as_str()) {
+                        ("DELETE", p) if p.starts_with("/v2/instances/") => {
+                            (204, "No Content", String::new())
+                        }
+                        ("GET", "/api/v2/tailnet/-/devices") => {
+                            if fail_tailscale {
+                                (
+                                    500,
+                                    "Internal Server Error",
+                                    r#"{"message":"tailscale api error"}"#.to_string(),
+                                )
+                            } else if ts_device_present {
+                                (
+                                    200,
+                                    "OK",
+                                    r#"{"devices":[{"id":"ts-dev-42","hostname":"ts-edge-box","name":"ts-edge-box.tail123.ts.net","addresses":["100.64.5.6"],"os":"linux","online":true}]}"#.to_string(),
+                                )
+                            } else {
+                                (200, "OK", r#"{"devices":[]}"#.to_string())
+                            }
+                        }
+                        ("DELETE", "/api/v2/device/ts-dev-42") => {
+                            ts_device_present = false;
+                            (200, "OK", "{}".to_string())
+                        }
+                        _ => (404, "Not Found", r#"{"error":"not found"}"#.to_string()),
+                    };
+
+                let resp = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        MockDestroyServer {
+            addr,
+            requests,
+            stop,
+            handle,
+        }
+    }
+
+    #[test]
+    fn cmd_destroy_removes_matching_tailscale_device_via_mock_servers() -> Result<()> {
+        let _lock = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir()?;
+        let cfg_dir = dir.path().join("cfg");
+        let server = spawn_destroy_mock_server(false);
+        let vultr_base = format!("http://{}/v2", server.addr);
+        let ts_base = format!("http://{}/api/v2", server.addr);
+
+        let _g_cfg = EnvVarGuard::set("BAB_CONFIG_DIR", cfg_dir.as_os_str());
+        let _g_settings = EnvVarGuard::remove("BAB_SETTINGS_FILE");
+        let _g_state = EnvVarGuard::remove("BAB_STATE_FILE");
+        let _g_log = EnvVarGuard::remove("BAB_LOG_FILE");
+        let _g_vultr_key = EnvVarGuard::set("VULTR_API_KEY", std::ffi::OsStr::new("vultr-test-key"));
+        let _g_ts_key = EnvVarGuard::set("TAILSCALE_API_KEY", std::ffi::OsStr::new("ts-test-key"));
+        let _g_vultr_base =
+            EnvVarGuard::set("VULTR_API_BASE", std::ffi::OsStr::new(&vultr_base));
+        let _g_vultr_base_url =
+            EnvVarGuard::set("VULTR_API_BASE_URL", std::ffi::OsStr::new(&vultr_base));
+        let _g_ts_base = EnvVarGuard::set("TAILSCALE_API_BASE", std::ffi::OsStr::new(&ts_base));
+
+        let session = SessionState::load_default()?;
+        session.save_session(&SessionData {
+            vps_provider: Some("vultr".to_string()),
+            vps_instance_id: Some("vultr-ts-1".to_string()),
+            vps_ip: Some("100.64.5.6".to_string()),
+            tailscale_ip: Some("100.64.5.6".to_string()),
+            tailscale_hostname: Some("ts-edge-box".to_string()),
+            ..SessionData::default()
+        })?;
+
+        let destroy_args = match Cli::try_parse_from([
+            "bab",
+            "destroy",
+            "--id",
+            "vultr-ts-1",
+            "--provider",
+            "vultr",
+            "--yes",
+        ])?
+        .command
+        {
+            Some(Commands::Destroy(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        let res = cmd_destroy(destroy_args);
+        let recorded = server.shutdown();
+        res?;
+
+        assert!(recorded
+            .iter()
+            .any(|(m, p)| m == "DELETE" && p == "/v2/instances/vultr-ts-1"));
+        assert!(recorded
+            .iter()
+            .any(|(m, p)| m == "GET" && p == "/api/v2/tailnet/-/devices"));
+        assert!(recorded
+            .iter()
+            .any(|(m, p)| m == "DELETE" && p == "/api/v2/device/ts-dev-42"));
+
+        assert_eq!(session.vps_instance_id()?, None);
+
+        let log_lines = LogStore::new(cfg_dir.join("bab.log")).read_lines()?;
+        assert!(log_lines
+            .iter()
+            .any(|l| l.contains("[DESTROY] Destroyed Vultr instance 'vultr-ts-1'.")));
+        assert!(log_lines.iter().any(|l| {
+            l.contains("[TAILSCALE] Removed device(s) from tailnet: ts-edge-box (ts-dev-42)")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_destroy_warns_without_failing_when_tailscale_api_fails() -> Result<()> {
+        let _lock = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir()?;
+        let cfg_dir = dir.path().join("cfg");
+        let server = spawn_destroy_mock_server(true);
+        let vultr_base = format!("http://{}/v2", server.addr);
+        let ts_base = format!("http://{}/api/v2", server.addr);
+
+        let _g_cfg = EnvVarGuard::set("BAB_CONFIG_DIR", cfg_dir.as_os_str());
+        let _g_settings = EnvVarGuard::remove("BAB_SETTINGS_FILE");
+        let _g_state = EnvVarGuard::remove("BAB_STATE_FILE");
+        let _g_log = EnvVarGuard::remove("BAB_LOG_FILE");
+        let _g_vultr_key = EnvVarGuard::set("VULTR_API_KEY", std::ffi::OsStr::new("vultr-test-key"));
+        let _g_ts_key = EnvVarGuard::set("TAILSCALE_API_KEY", std::ffi::OsStr::new("ts-test-key"));
+        let _g_vultr_base =
+            EnvVarGuard::set("VULTR_API_BASE", std::ffi::OsStr::new(&vultr_base));
+        let _g_vultr_base_url =
+            EnvVarGuard::set("VULTR_API_BASE_URL", std::ffi::OsStr::new(&vultr_base));
+        let _g_ts_base = EnvVarGuard::set("TAILSCALE_API_BASE", std::ffi::OsStr::new(&ts_base));
+
+        let destroy_args = match Cli::try_parse_from([
+            "bab",
+            "destroy",
+            "--id",
+            "vultr-warn-1",
+            "--provider",
+            "vultr",
+            "--yes",
+        ])?
+        .command
+        {
+            Some(Commands::Destroy(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        let res = cmd_destroy(destroy_args);
+        let _recorded = server.shutdown();
+        res?;
+
+        let log_lines = LogStore::new(cfg_dir.join("bab.log")).read_lines()?;
+        assert!(log_lines
+            .iter()
+            .any(|l| l.contains("[DESTROY] Destroyed Vultr instance 'vultr-warn-1'.")));
+        assert!(log_lines
+            .iter()
+            .any(|l| l.contains("[WARN] Failed to check/remove Tailscale device")));
+        Ok(())
     }
 }

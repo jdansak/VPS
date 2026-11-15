@@ -932,6 +932,7 @@ fn vultr_provider_lifecycle_and_full_provision_flow() -> Result<()> {
         tailscale_mode: true,
         ssh_pubkey: None,
         ssh_key_path: None,
+        sudo_password: None,
     };
 
     let res = provision_full_flow(&vultr, Some(&ts), &cfg, Some(&session))?;
@@ -1023,6 +1024,7 @@ fn upcloud_bearer_and_basic_auth_and_full_provision_flow() -> Result<()> {
         tailscale_mode: true,
         ssh_pubkey: None,
         ssh_key_path: None,
+        sudo_password: None,
     };
 
     let res = provision_full_flow(&basic_upcloud, Some(&ts), &cfg, Some(&session))?;
@@ -1125,6 +1127,7 @@ fn linode_provider_lifecycle_and_full_provision_flow() -> Result<()> {
         tailscale_mode: true,
         ssh_pubkey: None,
         ssh_key_path: None,
+        sudo_password: None,
     };
 
     let res = provision_full_flow(&linode, Some(&ts), &cfg, Some(&session))?;
@@ -1194,6 +1197,7 @@ fn setup_runner_all_roles_over_tailscale_transport_via_with_bins() -> Result<()>
             tailscale_mode: true,
             ssh_pubkey: None,
             ssh_key_path: None,
+            sudo_password: None,
         };
         let prov_res = provision_full_flow(&vultr, Some(&ts), &prov_cfg, Some(&session))?;
 
@@ -1229,6 +1233,7 @@ fn setup_runner_all_roles_over_tailscale_transport_via_with_bins() -> Result<()>
             dry_run: false,
             github_deploy: None,
             sudo_nopasswd: true,
+            sudo_password: None,
         };
         let runner = SetupRunner::new(&transport, Some(&session));
         let mut steps_seen = Vec::new();
@@ -1329,6 +1334,7 @@ fn setup_runner_respects_bab_ssh_bin_env_var_serialized() -> Result<()> {
         dry_run: false,
         github_deploy: None,
         sudo_nopasswd: true,
+        sudo_password: None,
     };
 
     let reports = runner.run_all(&cfg, |_| {})?;
@@ -1377,6 +1383,7 @@ fn standard_ssh_provisioning_flow_generates_key_and_skips_tailscale() -> Result<
         tailscale_mode: false,
         ssh_pubkey: Some(pubkey.clone()),
         ssh_key_path: Some(key_path.to_string_lossy().into_owned()),
+        sudo_password: None,
     };
 
     let res = provision_full_flow(&vultr, None, &cfg, Some(&session))?;
@@ -1465,6 +1472,7 @@ fn setup_runner_vanilla_both_transport_modes_end_to_end() -> Result<()> {
             dry_run: false,
             github_deploy: None,
             sudo_nopasswd: true,
+            sudo_password: None,
         };
 
         let reports = runner.run_all(&cfg, |_| {})?;
@@ -1549,6 +1557,7 @@ fn provision_records_dual_ips_and_setup_runner_deploy_github_executes_via_mock_s
         tailscale_mode: true,
         ssh_pubkey: None,
         ssh_key_path: None,
+        sudo_password: None,
     };
 
     let res = provision_full_flow(&vultr, Some(&ts), &prov_cfg, Some(&session))?;
@@ -1639,6 +1648,7 @@ fn query_all_providers_and_destroy_instances_lifecycle() -> Result<()> {
         tailscale_mode: true,
         ssh_pubkey: None,
         ssh_key_path: None,
+        sudo_password: None,
     };
     let up_res = provision_full_flow(&upcloud, Some(&ts), &up_cfg, None)?;
     assert_eq!(up_res.instance_id, "upcloud-uuid-1");
@@ -1658,6 +1668,7 @@ fn query_all_providers_and_destroy_instances_lifecycle() -> Result<()> {
         tailscale_mode: true,
         ssh_pubkey: None,
         ssh_key_path: None,
+        sudo_password: None,
     };
     let lin_res = provision_full_flow(&linode, Some(&ts), &lin_cfg, None)?;
     assert_eq!(lin_res.instance_id, "12345");
@@ -1677,6 +1688,7 @@ fn query_all_providers_and_destroy_instances_lifecycle() -> Result<()> {
         tailscale_mode: true,
         ssh_pubkey: None,
         ssh_key_path: None,
+        sudo_password: None,
     };
     let vultr_res = provision_full_flow(&vultr, Some(&ts), &vultr_cfg, Some(&session))?;
     assert_eq!(vultr_res.instance_id, "vultr-inst-1");

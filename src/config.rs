@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+use rand::Rng;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305, NONCE_LEN};
 use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -22,6 +23,36 @@ const MASTER_KEY_LEN: usize = 32;
 
 /// Maximum log file size retained by [`LogStore`] (10 MiB).
 pub const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Default length for generated random sudo passwords.
+pub const SUDO_PASSWORD_LEN: usize = 10;
+
+/// Generate a random ASCII alphanumeric password of exact length `len`.
+pub fn generate_random_password(len: usize) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+        .collect()
+}
+
+fn sanitize_box_key_part(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let sanitized: String = trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(sanitized)
+}
 
 /// Environment variable names for API keys supported by `Settings`.
 pub const API_KEY_ENV_NAMES: [&str; 6] = [
@@ -548,6 +579,61 @@ impl Settings {
     pub fn set_github_token(&self, v: &str) -> Result<()> {
         self.set("GITHUB_TOKEN", v)
     }
+
+    /// Record the sudo password encrypted in `credentials.enc` for the global
+    /// fallback key and any non-empty instance identifiers (ID, hostname, IP).
+    pub fn record_instance_password(
+        &self,
+        instance_id: Option<&str>,
+        hostname: Option<&str>,
+        public_ip: Option<&str>,
+        password: &str,
+    ) -> Result<()> {
+        let pw = password.trim();
+        if pw.is_empty() {
+            return Ok(());
+        }
+        self.set("SUDO_PASSWORD", pw)?;
+        if let Some(id) = instance_id.and_then(sanitize_box_key_part) {
+            self.set(&format!("BOX_PASS_ID_{}", id), pw)?;
+        }
+        if let Some(host) = hostname.and_then(sanitize_box_key_part) {
+            self.set(&format!("BOX_PASS_HOST_{}", host), pw)?;
+        }
+        if let Some(ip) = public_ip.and_then(sanitize_box_key_part) {
+            self.set(&format!("BOX_PASS_IP_{}", ip), pw)?;
+        }
+        Ok(())
+    }
+
+    /// Look up a previously recorded encrypted per-box sudo password, checking
+    /// instance ID, then public IP, then hostname.
+    pub fn lookup_instance_password(
+        &self,
+        instance_id: Option<&str>,
+        hostname: Option<&str>,
+        public_ip: Option<&str>,
+    ) -> Result<Option<String>> {
+        let candidates = [
+            instance_id
+                .and_then(sanitize_box_key_part)
+                .map(|id| format!("BOX_PASS_ID_{}", id)),
+            public_ip
+                .and_then(sanitize_box_key_part)
+                .map(|ip| format!("BOX_PASS_IP_{}", ip)),
+            hostname
+                .and_then(sanitize_box_key_part)
+                .map(|host| format!("BOX_PASS_HOST_{}", host)),
+        ];
+        for key in candidates.into_iter().flatten() {
+            if let Some(val) = self.get(&key)? {
+                if !val.trim().is_empty() {
+                    return Ok(Some(val));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// Session‑specific state.
@@ -736,6 +822,12 @@ impl SessionState {
     pub fn set_sudo_nopasswd(&self, v: &str) -> Result<()> {
         self.set_var("SUDO_NOPASSWD", v)
     }
+    pub fn sudo_password(&self) -> Result<Option<String>> {
+        self.get_var("SUDO_PASSWORD")
+    }
+    pub fn set_sudo_password(&self, v: &str) -> Result<()> {
+        self.set_var("SUDO_PASSWORD", v)
+    }
 
     pub fn save_session(&self, data: &SessionData) -> Result<()> {
         // Helper to write or remove based on Option
@@ -775,6 +867,10 @@ impl SessionState {
             Some(v) if !v.trim().is_empty() => self.set_var("SUDO_NOPASSWD", v)?,
             _ => self.remove_var("SUDO_NOPASSWD")?,
         }
+        match data.sudo_password.as_deref() {
+            Some(v) if !v.trim().is_empty() => self.set_var("SUDO_PASSWORD", v)?,
+            _ => self.remove_var("SUDO_PASSWORD")?,
+        }
         Ok(())
     }
 
@@ -804,6 +900,7 @@ impl SessionState {
             github_deploy_cmd: self.github_deploy_cmd()?,
             github_enabled: self.github_enabled()?,
             sudo_nopasswd: self.sudo_nopasswd()?,
+            sudo_password: self.sudo_password()?,
         })
     }
 }
@@ -834,6 +931,7 @@ pub struct SessionData {
     pub github_deploy_cmd: Option<String>,
     pub github_enabled: Option<String>,
     pub sudo_nopasswd: Option<String>,
+    pub sudo_password: Option<String>,
 }
 
 /// Persistent append-only log store with a maximum retained byte cap.
@@ -1349,6 +1447,7 @@ mod tests {
             github_deploy_cmd: Some("docker compose up -d".to_string()),
             github_enabled: Some("true".to_string()),
             sudo_nopasswd: Some("true".to_string()),
+            sudo_password: Some("Abc123Xyz9".to_string()),
         };
         ss.save_session(&data)?;
         assert_eq!(ss.load_session()?, data);
@@ -1362,12 +1461,15 @@ mod tests {
         assert_eq!(ss.github_enabled()?, Some("false".to_string()));
         ss.set_sudo_nopasswd("false")?;
         assert_eq!(ss.sudo_nopasswd()?, Some("false".to_string()));
+        ss.set_sudo_password("NewPass123")?;
+        assert_eq!(ss.sudo_password()?, Some("NewPass123".to_string()));
         let cleared = SessionData {
             cf_record: None,
             cf_enabled: None,
             github_deploy_cmd: None,
             github_enabled: None,
             sudo_nopasswd: None,
+            sudo_password: None,
             ..data
         };
         ss.save_session(&cleared)?;
@@ -1784,6 +1886,161 @@ mod tests {
         assert!(lines[0].starts_with('[') && lines[0].ends_with("Z] step one"));
         assert_eq!(lines[1], "");
         assert!(lines[2].starts_with('[') && lines[2].ends_with("Z] step two"));
+        Ok(())
+    }
+
+    #[test]
+    fn generate_random_password_length_and_charset() {
+        assert_eq!(SUDO_PASSWORD_LEN, 10);
+        let pw = generate_random_password(SUDO_PASSWORD_LEN);
+        assert_eq!(pw.len(), 10);
+        assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()));
+
+        assert_eq!(generate_random_password(0), "");
+        let pw2 = generate_random_password(SUDO_PASSWORD_LEN);
+        assert_eq!(pw2.len(), 10);
+        assert!(pw2.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn session_sudo_password_round_trip_and_clear() -> Result<()> {
+        let tmp = NamedTempFile::new()?;
+        let ss = SessionState::new(tmp.path());
+
+        assert_eq!(ss.sudo_password()?, None);
+        assert_eq!(ss.load_session()?.sudo_password, None);
+
+        ss.set_sudo_password("Pass123456")?;
+        assert_eq!(ss.sudo_password()?, Some("Pass123456".to_string()));
+        assert_eq!(
+            ss.load_session()?.sudo_password,
+            Some("Pass123456".to_string())
+        );
+
+        let saved = SessionData {
+            sudo_password: Some("AbCdEf1234".to_string()),
+            ..SessionData::default()
+        };
+        ss.save_session(&saved)?;
+        assert_eq!(
+            ss.load_session()?.sudo_password,
+            Some("AbCdEf1234".to_string())
+        );
+        assert!(fs::read_to_string(tmp.path())?.contains("SUDO_PASSWORD=\"AbCdEf1234\""));
+
+        let empty = SessionData {
+            sudo_password: Some(String::new()),
+            ..SessionData::default()
+        };
+        ss.save_session(&empty)?;
+        assert_eq!(ss.sudo_password()?, None);
+        assert_eq!(ss.load_session()?.sudo_password, None);
+        assert!(!fs::read_to_string(tmp.path())?.contains("SUDO_PASSWORD="));
+
+        ss.set_sudo_password("TempPass99")?;
+        let whitespace = SessionData {
+            sudo_password: Some("   ".to_string()),
+            ..SessionData::default()
+        };
+        ss.save_session(&whitespace)?;
+        assert_eq!(ss.sudo_password()?, None);
+        assert!(!fs::read_to_string(tmp.path())?.contains("SUDO_PASSWORD="));
+
+        ss.set_sudo_password("TempPass99")?;
+        let unset = SessionData {
+            sudo_password: None,
+            ..SessionData::default()
+        };
+        ss.save_session(&unset)?;
+        assert_eq!(ss.sudo_password()?, None);
+        assert!(!fs::read_to_string(tmp.path())?.contains("SUDO_PASSWORD="));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_record_and_lookup_instance_password_encrypted_round_trip() -> Result<()> {
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard::new(&[
+            "BAB_ENCRYPTION_KEY",
+            "BAB_MASTER_KEY_FILE",
+            "SUDO_PASSWORD",
+        ]);
+        env::remove_var("BAB_ENCRYPTION_KEY");
+        env::remove_var("BAB_MASTER_KEY_FILE");
+        env::remove_var("SUDO_PASSWORD");
+
+        let dir = tempdir()?;
+        let creds_path = dir.path().join("credentials.enc");
+        let settings = Settings::new(&creds_path);
+
+        // Blank password is a no-op
+        settings.record_instance_password(
+            Some("inst-empty"),
+            Some("empty.example.ts.net"),
+            Some("203.0.113.1"),
+            "   ",
+        )?;
+        assert!(!creds_path.exists());
+
+        settings.record_instance_password(
+            Some("inst-abc:123/xyz"),
+            Some("my-vps.tailnet.ts.net"),
+            Some("203.0.113.42"),
+            "  SecRet1234  ",
+        )?;
+
+        let raw = fs::read_to_string(&creds_path)?;
+        assert!(raw.contains("SUDO_PASSWORD=\"enc:v1:"));
+        assert!(raw.contains("BOX_PASS_ID_inst_abc_123_xyz=\"enc:v1:"));
+        assert!(raw.contains("BOX_PASS_HOST_my_vps_tailnet_ts_net=\"enc:v1:"));
+        assert!(raw.contains("BOX_PASS_IP_203_0_113_42=\"enc:v1:"));
+        assert!(!raw.contains("SecRet1234"));
+
+        assert_eq!(
+            settings.get("SUDO_PASSWORD")?,
+            Some("SecRet1234".to_string())
+        );
+
+        // Lookup by ID, IP, and hostname individually
+        assert_eq!(
+            settings.lookup_instance_password(Some("inst-abc:123/xyz"), None, None)?,
+            Some("SecRet1234".to_string())
+        );
+        assert_eq!(
+            settings.lookup_instance_password(None, None, Some("203.0.113.42"))?,
+            Some("SecRet1234".to_string())
+        );
+        assert_eq!(
+            settings.lookup_instance_password(None, Some("my-vps.tailnet.ts.net"), None)?,
+            Some("SecRet1234".to_string())
+        );
+
+        // Precedence: ID > IP > Host
+        settings.record_instance_password(None, Some("shared.ts.net"), None, "HostPass11")?;
+        settings.record_instance_password(None, None, Some("198.51.100.2"), "IpPass2222")?;
+        assert_eq!(
+            settings.lookup_instance_password(
+                Some("missing-id"),
+                Some("shared.ts.net"),
+                Some("198.51.100.2")
+            )?,
+            Some("IpPass2222".to_string())
+        );
+        settings.record_instance_password(Some("id-first"), None, None, "IdPass3333")?;
+        assert_eq!(
+            settings.lookup_instance_password(
+                Some("id-first"),
+                Some("shared.ts.net"),
+                Some("198.51.100.2")
+            )?,
+            Some("IdPass3333".to_string())
+        );
+
+        // Missing or whitespace-only identifiers return None
+        assert_eq!(
+            settings.lookup_instance_password(Some("   "), Some(""), None)?,
+            None
+        );
         Ok(())
     }
 }
