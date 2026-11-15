@@ -4,6 +4,17 @@ use crate::config::SessionState;
 use crate::roles::ServerRole;
 use crate::transport::SshTransport;
 
+/// Configuration for cloning/updating and deploying a GitHub repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubDeployConfig {
+    pub repo: String,
+    pub branch: String,
+    pub deploy_path: Option<String>,
+    pub deploy_cmd: Option<String>,
+    pub github_token: Option<String>,
+    pub username: String,
+}
+
 /// Configuration for executing the 6-step remote VPS setup pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupConfig {
@@ -16,6 +27,7 @@ pub struct SetupConfig {
     pub tailscale_mode: bool,
     pub ssh_pubkey: Option<String>,
     pub dry_run: bool,
+    pub github_deploy: Option<GithubDeployConfig>,
 }
 
 /// Ordered stages of the remote server setup workflow.
@@ -109,6 +121,263 @@ fn wrap_root_script(ssh_user: &str, body: &str) -> String {
             body.trim()
         )
     }
+}
+
+/// Normalizes a GitHub repository reference (`owner/repo`, `https://...`, or `git@...`)
+/// into `(clone_url, repo_name)` while rejecting unsafe characters or traversal sequences.
+pub fn normalize_github_repo(input: &str) -> Result<(String, String)> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("GitHub repository cannot be empty"));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(anyhow!(
+            "GitHub repository must not contain whitespace: '{}'",
+            trimmed
+        ));
+    }
+    if trimmed.contains("..") {
+        return Err(anyhow!(
+            "GitHub repository must not contain '..': '{}'",
+            trimmed
+        ));
+    }
+    const FORBIDDEN_CHARS: &[char] = &[';', '&', '|', '$', '`', '<', '>', '\'', '"'];
+    if trimmed.chars().any(|c| FORBIDDEN_CHARS.contains(&c)) {
+        return Err(anyhow!(
+            "GitHub repository contains forbidden shell metacharacters: '{}'",
+            trimmed
+        ));
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        let cleaned = rest.trim_end_matches('/');
+        let parts: Vec<&str> = cleaned.split('/').filter(|p| !p.is_empty()).collect();
+        if parts.len() < 2 {
+            return Err(anyhow!("Invalid HTTPS repository URL: '{}'", trimmed));
+        }
+        let last = parts.last().unwrap();
+        let repo_name = last.strip_suffix(".git").unwrap_or(last);
+        if repo_name.is_empty() {
+            return Err(anyhow!(
+                "Could not determine repository name from '{}'",
+                trimmed
+            ));
+        }
+        return Ok((
+            trimmed.trim_end_matches('/').to_string(),
+            repo_name.to_string(),
+        ));
+    }
+
+    if let Some(after_git) = trimmed.strip_prefix("git@") {
+        let (host, path) = after_git
+            .split_once(':')
+            .ok_or_else(|| anyhow!("Invalid SSH repository URL: '{}'", trimmed))?;
+        let cleaned_path = path.trim_matches('/');
+        if host.is_empty() || host.contains('/') || cleaned_path.is_empty() {
+            return Err(anyhow!("Invalid SSH repository URL: '{}'", trimmed));
+        }
+        let last = cleaned_path.rsplit('/').next().unwrap_or("");
+        let repo_name = last.strip_suffix(".git").unwrap_or(last);
+        if repo_name.is_empty() {
+            return Err(anyhow!(
+                "Could not determine repository name from '{}'",
+                trimmed
+            ));
+        }
+        return Ok((trimmed.to_string(), repo_name.to_string()));
+    }
+
+    if trimmed.contains("://") || trimmed.contains(':') {
+        return Err(anyhow!("Unsupported repository URL format: '{}'", trimmed));
+    }
+
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(anyhow!(
+            "Expected 'owner/repo', 'https://...', or 'git@...' repository format, got '{}'",
+            trimmed
+        ));
+    }
+    let owner = parts[0];
+    let repo_name = parts[1].strip_suffix(".git").unwrap_or(parts[1]);
+    if repo_name.is_empty() {
+        return Err(anyhow!(
+            "Could not determine repository name from '{}'",
+            trimmed
+        ));
+    }
+
+    Ok((
+        format!("https://github.com/{}/{}.git", owner, repo_name),
+        repo_name.to_string(),
+    ))
+}
+
+fn build_github_deploy_body(cfg: &GithubDeployConfig) -> Result<String> {
+    let (repo_url, repo_name) = normalize_github_repo(&cfg.repo)?;
+    let deploy_user = cfg.username.trim();
+    if deploy_user.is_empty() {
+        return Err(anyhow!("Deploy username cannot be empty"));
+    }
+    if deploy_user.chars().any(char::is_whitespace) {
+        return Err(anyhow!("Deploy username must not contain whitespace"));
+    }
+
+    let branch = {
+        let trimmed = cfg.branch.trim();
+        if trimmed.is_empty() {
+            "main"
+        } else {
+            trimmed
+        }
+    };
+
+    let deploy_path = match cfg
+        .deploy_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(p) => p.to_string(),
+        None => format!("/home/{}/apps/{}", deploy_user, repo_name),
+    };
+
+    let deploy_cmd = cfg
+        .deploy_cmd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let github_token = cfg
+        .github_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let q_repo_url = shell_quote(&repo_url);
+    let q_repo_name = shell_quote(&repo_name);
+    let q_branch = shell_quote(branch);
+    let q_user = shell_quote(deploy_user);
+    let q_path = shell_quote(&deploy_path);
+
+    let askpass_setup = if let Some(token) = github_token {
+        let q_token = shell_quote(token);
+        format!(
+            r#"BAB_GITHUB_TOKEN={q_token}
+export BAB_GITHUB_TOKEN
+GIT_ASKPASS_SCRIPT=$(mktemp /tmp/bab-git-askpass.XXXXXX)
+trap 'rm -f "${{GIT_ASKPASS_SCRIPT}}"' EXIT
+cat > "${{GIT_ASKPASS_SCRIPT}}" << 'BAB_ASKPASS_EOF'
+#!/usr/bin/env bash
+case "${{1:-}}" in
+    *[Uu]sername*) printf '%s\n' 'x-access-token' ;;
+    *) printf '%s\n' "${{BAB_GITHUB_TOKEN}}" ;;
+esac
+BAB_ASKPASS_EOF
+chmod 0700 "${{GIT_ASKPASS_SCRIPT}}"
+if id "${{DEPLOY_USER}}" >/dev/null 2>&1; then
+    chown "${{DEPLOY_USER}}:${{DEPLOY_USER}}" "${{GIT_ASKPASS_SCRIPT}}"
+fi
+export GIT_ASKPASS="${{GIT_ASKPASS_SCRIPT}}"
+export GIT_TERMINAL_PROMPT=0"#
+        )
+    } else {
+        "export GIT_TERMINAL_PROMPT=0".to_string()
+    };
+
+    let deploy_section = if let Some(cmd) = deploy_cmd {
+        let q_cmd = shell_quote(cmd);
+        format!(
+            r#"DEPLOY_CMD={q_cmd}
+export DEPLOY_CMD
+run_as_deploy_user 'cd "${{DEPLOY_PATH}}" && bash -lc "${{DEPLOY_CMD}}"'"#
+        )
+    } else {
+        r#"if command -v docker >/dev/null 2>&1 && ( [ -f "${DEPLOY_PATH}/docker-compose.yml" ] || [ -f "${DEPLOY_PATH}/docker-compose.yaml" ] || [ -f "${DEPLOY_PATH}/compose.yml" ] || [ -f "${DEPLOY_PATH}/compose.yaml" ] ); then
+    run_as_deploy_user 'cd "${DEPLOY_PATH}" && docker compose up -d --build'
+fi"#
+        .to_string()
+    };
+
+    let mut preserve_vars = vec![
+        "GIT_TERMINAL_PROMPT",
+        "REPO_URL",
+        "BRANCH",
+        "DEPLOY_PATH",
+    ];
+    if github_token.is_some() {
+        preserve_vars.push("GIT_ASKPASS");
+        preserve_vars.push("BAB_GITHUB_TOKEN");
+    }
+    if deploy_cmd.is_some() {
+        preserve_vars.push("DEPLOY_CMD");
+    }
+    let preserve_env = preserve_vars.join(",");
+
+    let askpass_cleanup = if github_token.is_some() {
+        "\nrm -f \"${GIT_ASKPASS_SCRIPT}\"\nunset BAB_GITHUB_TOKEN GIT_ASKPASS"
+    } else {
+        ""
+    };
+
+    Ok(format!(
+        r#"REPO_URL={q_repo_url}
+REPO_NAME={q_repo_name}
+BRANCH={q_branch}
+DEPLOY_USER={q_user}
+DEPLOY_PATH={q_path}
+export REPO_URL BRANCH DEPLOY_PATH
+
+if ! command -v git >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y git
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y git
+    else
+        echo "Cannot install git: neither apt-get nor dnf found" >&2
+        exit 1
+    fi
+fi
+
+mkdir -p "${{DEPLOY_PATH}}"
+if id "${{DEPLOY_USER}}" >/dev/null 2>&1; then
+    chown -R "${{DEPLOY_USER}}:${{DEPLOY_USER}}" "${{DEPLOY_PATH}}"
+fi
+
+run_as_deploy_user() {{
+    local cmd="$1"
+    if [ "$(id -un)" = "${{DEPLOY_USER}}" ]; then
+        bash -lc "${{cmd}}"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -H -u "${{DEPLOY_USER}}" --preserve-env={preserve_env} bash -lc "${{cmd}}"
+    else
+        su -p -s /bin/bash "${{DEPLOY_USER}}" -c "bash -lc $(printf '%q' "${{cmd}}")"
+    fi
+}}
+
+{askpass_setup}
+
+if [ -d "${{DEPLOY_PATH}}/.git" ]; then
+    run_as_deploy_user 'git -C "${{DEPLOY_PATH}}" fetch --all --prune && git -C "${{DEPLOY_PATH}}" checkout "${{BRANCH}}" && git -C "${{DEPLOY_PATH}}" pull --ff-only'
+else
+    run_as_deploy_user 'git clone --branch "${{BRANCH}}" "${{REPO_URL}}" "${{DEPLOY_PATH}}"'
+fi{askpass_cleanup}
+
+{deploy_section}"#
+    ))
+}
+
+/// Builds an idempotent bash script (`set -euo pipefail`) to clone/update and deploy a GitHub repository.
+pub fn build_github_deploy_script(cfg: &GithubDeployConfig) -> Result<String> {
+    let body = build_github_deploy_body(cfg)?;
+    Ok(format!(
+        "#!/usr/bin/env bash\nset -euo pipefail\n\n{}\n",
+        body.trim()
+    ))
 }
 
 /// Builds the bash script (`set -euo pipefail`) for a given setup step.
@@ -289,13 +558,31 @@ fi"#
             wrap_root_script(&cfg.ssh_user, &body)
         }
         SetupStepKind::ConfigureRole => {
-            let role_script = cfg.role.role_setup_script(&cfg.new_username, cfg.tailscale_mode);
+            let mut combined = cfg
+                .role
+                .role_setup_script(&cfg.new_username, cfg.tailscale_mode);
+            if let Some(ref gh) = cfg.github_deploy {
+                let gh_body = match build_github_deploy_script(gh) {
+                    Ok(full) => full
+                        .strip_prefix("#!/usr/bin/env bash\n")
+                        .unwrap_or(&full)
+                        .strip_prefix("set -euo pipefail\n")
+                        .unwrap_or(&full)
+                        .trim()
+                        .to_string(),
+                    Err(err) => format!(
+                        "echo {} >&2\nexit 1",
+                        shell_quote(&format!("Invalid GitHub deploy config: {}", err))
+                    ),
+                };
+                combined = format!("{}\n\n{}\n", combined.trim_end(), gh_body);
+            }
             if cfg.ssh_user == "root" {
-                role_script
+                combined
             } else {
-                let inner = role_script
+                let inner = combined
                     .strip_prefix("#!/usr/bin/env bash\n")
-                    .unwrap_or(&role_script);
+                    .unwrap_or(&combined);
                 format!(
                     "#!/usr/bin/env bash\nset -euo pipefail\n\nsudo bash -s << 'BAB_STEP_EOF'\n{}\nBAB_STEP_EOF\n",
                     inner.trim_end()
@@ -445,6 +732,15 @@ esac"##
     }
 }
 
+fn combine_command_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.trim(), stderr.trim()) {
+        ("", "") => String::new(),
+        (_, "") => stdout.to_string(),
+        ("", _) => stderr.to_string(),
+        _ => format!("{}\n{}", stdout.trim_end(), stderr.trim_end()),
+    }
+}
+
 /// Executes the 6-step setup pipeline over an `SshTransport`.
 pub struct SetupRunner<'a> {
     transport: &'a SshTransport,
@@ -466,6 +762,10 @@ impl<'a> SetupRunner<'a> {
     where
         F: FnMut(&StepReport),
     {
+        if let Some(ref gh) = cfg.github_deploy {
+            build_github_deploy_script(gh)?;
+        }
+
         let mut reports = Vec::with_capacity(SetupStepKind::all().len());
 
         for &step in SetupStepKind::all() {
@@ -485,12 +785,7 @@ impl<'a> SetupRunner<'a> {
             let out = self.transport.exec(&cfg.ssh_user, &cfg.host, &script)?;
             let success = out.success();
             let status_code = out.status_code;
-            let combined_output = match (out.stdout.trim(), out.stderr.trim()) {
-                ("", "") => String::new(),
-                (_, "") => out.stdout,
-                ("", _) => out.stderr,
-                _ => format!("{}\n{}", out.stdout.trim_end(), out.stderr.trim_end()),
-            };
+            let combined_output = combine_command_output(&out.stdout, &out.stderr);
             let report = StepReport {
                 step,
                 success,
@@ -518,6 +813,33 @@ impl<'a> SetupRunner<'a> {
 
         Ok(reports)
     }
+
+    /// Clones/updates and deploys a GitHub repository on the target host.
+    /// When `dry_run` is true, returns the generated script without invoking SSH.
+    pub fn deploy_github(
+        &self,
+        ssh_user: &str,
+        host: &str,
+        cfg: &GithubDeployConfig,
+        dry_run: bool,
+    ) -> Result<String> {
+        let body = build_github_deploy_body(cfg)?;
+        let script = wrap_root_script(ssh_user, &body);
+        if dry_run {
+            return Ok(script);
+        }
+
+        let out = self.transport.exec(ssh_user, host, &script)?;
+        let combined_output = combine_command_output(&out.stdout, &out.stderr);
+        if !out.success() {
+            return Err(anyhow!(
+                "github deploy failed (exit {}): {}",
+                out.status_code,
+                combined_output
+            ));
+        }
+        Ok(combined_output)
+    }
 }
 
 #[cfg(test)]
@@ -542,6 +864,7 @@ mod tests {
             tailscale_mode: true,
             ssh_pubkey: None,
             dry_run,
+            github_deploy: None,
         }
     }
 
@@ -792,6 +1115,187 @@ mod tests {
             ]
         );
         assert_eq!(state.server_role()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_github_repo_accepts_valid_and_rejects_unsafe() -> Result<()> {
+        assert_eq!(
+            normalize_github_repo("  octocat/hello-world  ")?,
+            (
+                "https://github.com/octocat/hello-world.git".to_string(),
+                "hello-world".to_string()
+            )
+        );
+        assert_eq!(
+            normalize_github_repo("octocat/hello-world.git")?,
+            (
+                "https://github.com/octocat/hello-world.git".to_string(),
+                "hello-world".to_string()
+            )
+        );
+        assert_eq!(
+            normalize_github_repo("https://github.com/octocat/hello-world.git")?,
+            (
+                "https://github.com/octocat/hello-world.git".to_string(),
+                "hello-world".to_string()
+            )
+        );
+        assert_eq!(
+            normalize_github_repo("https://github.com/octocat/hello-world/")?,
+            (
+                "https://github.com/octocat/hello-world".to_string(),
+                "hello-world".to_string()
+            )
+        );
+        assert_eq!(
+            normalize_github_repo("git@github.com:octocat/hello-world.git")?,
+            (
+                "git@github.com:octocat/hello-world.git".to_string(),
+                "hello-world".to_string()
+            )
+        );
+
+        for bad in [
+            "",
+            "   ",
+            "owner/repo with space",
+            "owner/../other",
+            "owner/repo;rm -rf /",
+            "owner/repo&id",
+            "owner/repo|cat",
+            "owner/repo$HOME",
+            "owner/repo`id`",
+            "owner/repo<in",
+            "owner/repo>out",
+            "owner/repo'q",
+            "owner/repo\"q",
+            "just-repo",
+            "http://github.com/owner/repo",
+            "https://github.com/",
+            "git@github.com",
+        ] {
+            assert!(
+                normalize_github_repo(bad).is_err(),
+                "expected error for '{}'",
+                bad
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn build_github_deploy_script_token_askpass_and_defaults() -> Result<()> {
+        let cfg = GithubDeployConfig {
+            repo: "acme/web-app".to_string(),
+            branch: "".to_string(),
+            deploy_path: None,
+            deploy_cmd: None,
+            github_token: Some("ghp_secretToken123".to_string()),
+            username: "deploy".to_string(),
+        };
+
+        let script = build_github_deploy_script(&cfg)?;
+        assert_bash_syntax_ok(&script, "github-deploy-token-defaults");
+        assert!(script.starts_with("#!/usr/bin/env bash\nset -euo pipefail\n"));
+        assert!(script.contains("REPO_URL='https://github.com/acme/web-app.git'"));
+        assert!(script.contains("BRANCH='main'"));
+        assert!(script.contains("DEPLOY_USER='deploy'"));
+        assert!(script.contains("DEPLOY_PATH='/home/deploy/apps/web-app'"));
+        assert!(script.contains("mktemp /tmp/bab-git-askpass.XXXXXX"));
+        assert!(script.contains("trap 'rm -f \"${GIT_ASKPASS_SCRIPT}\"' EXIT"));
+        assert!(script.contains("chmod 0700 \"${GIT_ASKPASS_SCRIPT}\""));
+        assert!(script.contains("x-access-token"));
+        assert!(script.contains("${BAB_GITHUB_TOKEN}"));
+        assert!(!script.contains("https://ghp_secretToken123"));
+        assert!(!script.contains("x-access-token:ghp_secretToken123@"));
+        assert!(script.contains("docker compose up -d --build"));
+        assert!(script.contains("docker-compose.yml"));
+        assert!(script.contains("compose.yaml"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_github_deploy_script_no_token_and_custom_cmd() -> Result<()> {
+        let cfg = GithubDeployConfig {
+            repo: "https://github.com/acme/api-service.git".to_string(),
+            branch: "production".to_string(),
+            deploy_path: Some("/opt/api-service".to_string()),
+            deploy_cmd: Some("make build && systemctl restart api".to_string()),
+            github_token: None,
+            username: "deploy".to_string(),
+        };
+
+        let script = build_github_deploy_script(&cfg)?;
+        assert_bash_syntax_ok(&script, "github-deploy-no-token-custom-cmd");
+        assert!(script.contains("BRANCH='production'"));
+        assert!(script.contains("DEPLOY_PATH='/opt/api-service'"));
+        assert!(script.contains("DEPLOY_CMD='make build && systemctl restart api'"));
+        assert!(script.contains("bash -lc \"${DEPLOY_CMD}\""));
+        assert!(!script.contains("GIT_ASKPASS"));
+        assert!(!script.contains("BAB_GITHUB_TOKEN"));
+        assert!(!script.contains("docker compose up -d --build"));
+        Ok(())
+    }
+
+    #[test]
+    fn configure_role_appends_github_deploy_when_configured() {
+        let gh = GithubDeployConfig {
+            repo: "acme/stack".to_string(),
+            branch: "main".to_string(),
+            deploy_path: None,
+            deploy_cmd: None,
+            github_token: Some("ghp_tok".to_string()),
+            username: "deploy".to_string(),
+        };
+
+        let mut root_cfg = sample_config(ServerRole::ReverseProxyCaddy, "root", false);
+        root_cfg.github_deploy = Some(gh.clone());
+        let root_script = build_step_script(SetupStepKind::ConfigureRole, &root_cfg);
+        assert_bash_syntax_ok(&root_script, "configure-role-with-github-root");
+        assert!(root_script.contains("caddy"));
+        assert!(root_script.contains("REPO_URL='https://github.com/acme/stack.git'"));
+        assert!(root_script.contains("GIT_ASKPASS_SCRIPT"));
+
+        let mut sudo_cfg = sample_config(ServerRole::Vanilla, "ubuntu", false);
+        sudo_cfg.github_deploy = Some(gh);
+        let sudo_script = build_step_script(SetupStepKind::ConfigureRole, &sudo_cfg);
+        assert_bash_syntax_ok(&sudo_script, "configure-role-with-github-sudo");
+        assert!(sudo_script.contains("sudo bash -s << 'BAB_STEP_EOF'"));
+        assert!(sudo_script.contains("REPO_URL='https://github.com/acme/stack.git'"));
+    }
+
+    #[test]
+    fn runner_deploy_github_supports_dry_run_and_exec() -> Result<()> {
+        let dir = tempdir()?;
+        let log_file = dir.path().join("ssh_calls.log");
+        let mock_ssh = write_mock_ssh(dir.path(), &log_file)?;
+
+        let transport = SshTransport::with_bins(TransportMode::Tailscale, &mock_ssh, &mock_ssh);
+        let runner = SetupRunner::new(&transport, None);
+
+        let gh = GithubDeployConfig {
+            repo: "acme/demo".to_string(),
+            branch: "main".to_string(),
+            deploy_path: None,
+            deploy_cmd: Some("echo deployed".to_string()),
+            github_token: None,
+            username: "deploy".to_string(),
+        };
+
+        let dry_sudo = runner.deploy_github("ubuntu", "100.64.0.50", &gh, true)?;
+        assert_bash_syntax_ok(&dry_sudo, "deploy-github-dry-sudo");
+        assert!(dry_sudo.contains("sudo bash -s << 'BAB_STEP_EOF'"));
+        assert!(!log_file.exists());
+
+        let dry_root = runner.deploy_github("root", "100.64.0.50", &gh, true)?;
+        assert_bash_syntax_ok(&dry_root, "deploy-github-dry-root");
+        assert!(!dry_root.contains("sudo bash -s"));
+
+        let out = runner.deploy_github("root", "100.64.0.50", &gh, false)?;
+        assert!(out.contains("MOCK_SSH_OK"));
+        let log_content = fs::read_to_string(&log_file)?;
+        assert!(log_content.contains("root@100.64.0.50"));
         Ok(())
     }
 }

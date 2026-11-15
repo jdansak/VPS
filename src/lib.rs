@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dns;
 pub mod providers;
 pub mod roles;
 pub mod setup;

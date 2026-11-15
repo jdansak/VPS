@@ -7,8 +7,7 @@ use std::process::Command;
 use std::thread;
 use tempfile::tempdir;
 
-fn bab_cmd(settings_path: &Path, state_path: &Path, ssh_dir: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bab"));
+fn strip_bab_env(cmd: &mut Command) {
     for key in [
         "TAILSCALE_API_KEY",
         "TAILSCALE_API_BASE",
@@ -16,6 +15,11 @@ fn bab_cmd(settings_path: &Path, state_path: &Path, ssh_dir: &Path) -> Command {
         "VULTR_API_KEY",
         "UPCLOUD_API_TOKEN",
         "LINODE_API_TOKEN",
+        "CLOUDFLARE_API_TOKEN",
+        "GITHUB_TOKEN",
+        "BAB_CONFIG_DIR",
+        "BAB_ENCRYPTION_KEY",
+        "BAB_MASTER_KEY_FILE",
         "BAB_SETTINGS_FILE",
         "VPSKIT_SETTINGS_FILE",
         "SETTINGS_FILE",
@@ -35,8 +39,21 @@ fn bab_cmd(settings_path: &Path, state_path: &Path, ssh_dir: &Path) -> Command {
     ] {
         cmd.env_remove(key);
     }
+}
+
+fn bab_cmd(settings_path: &Path, state_path: &Path, ssh_dir: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bab"));
+    strip_bab_env(&mut cmd);
     cmd.env("BAB_SETTINGS_FILE", settings_path);
     cmd.env("BAB_STATE_FILE", state_path);
+    cmd.env("BAB_SSH_DIR", ssh_dir);
+    cmd
+}
+
+fn bab_cmd_config_dir(config_dir: &Path, ssh_dir: &Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_bab"));
+    strip_bab_env(&mut cmd);
+    cmd.env("BAB_CONFIG_DIR", config_dir);
     cmd.env("BAB_SSH_DIR", ssh_dir);
     cmd
 }
@@ -181,8 +198,8 @@ fn cli_setup_manual_dry_run_without_key_uses_placeholder() {
 #[test]
 fn cli_settings_persists_and_masks_keys() {
     let dir = tempdir().unwrap();
-    let settings = dir.path().join(".bab-settings");
-    let state = dir.path().join(".bab-local");
+    let settings = dir.path().join("credentials.enc");
+    let state = dir.path().join("state.conf");
     let ssh_dir = dir.path().join("ssh");
 
     let secret = "tskey-api-supersecret1234";
@@ -193,12 +210,16 @@ fn cli_settings_persists_and_masks_keys() {
     assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("TAILSCALE_API_KEY: tske****1234"));
+    assert!(stdout.contains("CLOUDFLARE_API_TOKEN:"));
+    assert!(stdout.contains("GITHUB_TOKEN:"));
+    assert!(stdout.contains("ChaCha20-Poly1305"));
     assert!(!stdout.contains(secret), "raw secret must not appear in output");
 
     let saved = fs::read_to_string(&settings).unwrap();
-    assert!(saved.contains(&format!("TAILSCALE_API_KEY=\"{}\"", secret)));
+    assert!(saved.contains("TAILSCALE_API_KEY=\"enc:v1:"));
+    assert!(!saved.contains(secret), "raw secret must not appear on disk");
 
-    // Subsequent --show reads persisted key and keeps it masked
+    // Subsequent --show reads persisted encrypted key and keeps it masked
     let show_out = bab_cmd(&settings, &state, &ssh_dir)
         .args(["settings", "--show"])
         .output()
@@ -402,4 +423,235 @@ fn cli_devices_prints_table_from_mock_tailscale_api() {
     assert!(stdout.contains("edge.tail.ts.net"));
     assert!(stdout.contains("100.64.0.12"));
     assert!(stdout.contains("true"));
+}
+
+#[test]
+fn cli_catalog_displays_curated_presets() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("bab-cfg");
+    let ssh_dir = dir.path().join("ssh");
+
+    let out = bab_cmd_config_dir(&config_dir, &ssh_dir)
+        .args(["catalog", "--provider", "vultr"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Vultr (curated presets)"));
+    assert!(stdout.contains("ewr"));
+    assert!(stdout.contains("vc2-1c-1gb"));
+    assert!(stdout.contains("2284"));
+}
+
+#[test]
+fn cli_dns_prints_stub_plan_and_persists_state() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("bab-cfg");
+    let ssh_dir = dir.path().join("ssh");
+
+    let out = bab_cmd_config_dir(&config_dir, &ssh_dir)
+        .args([
+            "dns",
+            "--zone",
+            "example.com",
+            "--record",
+            "app",
+            "--ip",
+            "203.0.113.10",
+            "--proxied",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[STUB] Cloudflare DNS: would upsert A record 'app' -> '203.0.113.10' in zone 'example.com' (proxied=true, token_configured=false)"));
+
+    let state_raw = fs::read_to_string(config_dir.join("state.conf")).unwrap();
+    assert!(state_raw.contains("CF_ZONE=\"example.com\""));
+    assert!(state_raw.contains("CF_RECORD=\"app\""));
+    assert!(state_raw.contains("CF_TARGET=\"203.0.113.10\""));
+    assert!(state_raw.contains("CF_PROXIED=\"true\""));
+
+    // Verify fallback from PUBLIC_IP in state.conf when --ip is omitted
+    fs::write(
+        config_dir.join("state.conf"),
+        "PUBLIC_IP=\"198.51.100.25\"\nVPS_IP=\"100.64.0.99\"\n",
+    )
+    .unwrap();
+    let fallback_out = bab_cmd_config_dir(&config_dir, &ssh_dir)
+        .args(["dns", "--zone", "example.com", "--record", "@"])
+        .output()
+        .unwrap();
+    assert!(
+        fallback_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&fallback_out.stderr)
+    );
+    let fallback_stdout = String::from_utf8_lossy(&fallback_out.stdout);
+    assert!(fallback_stdout.contains("would upsert A record '@' -> '198.51.100.25'"));
+}
+
+#[test]
+fn cli_deploy_dry_run_and_mock_ssh_persists_github_state() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("bab-cfg");
+    let ssh_dir = dir.path().join("ssh");
+
+    let dry_out = bab_cmd_config_dir(&config_dir, &ssh_dir)
+        .args([
+            "deploy",
+            "--repo",
+            "owner/app",
+            "--branch",
+            "main",
+            "--ip",
+            "203.0.113.10",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        dry_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&dry_out.stderr)
+    );
+    let dry_stdout = String::from_utf8_lossy(&dry_out.stdout);
+    assert!(dry_stdout.contains("[DRY-RUN] GitHub Deploy (owner/app)"));
+    assert!(dry_stdout.contains("https://github.com/owner/app.git"));
+    assert!(dry_stdout.contains("git clone"));
+
+    // Live mock SSH deploy persists GITHUB_* keys in state.conf
+    let args_log = dir.path().join("deploy_ssh.log");
+    let mock_ssh = dir.path().join("mock_ssh");
+    {
+        let mut f = File::create(&mock_ssh).unwrap();
+        writeln!(f, "#!/usr/bin/env bash").unwrap();
+        writeln!(f, "printf '%s\\n' \"$*\" >> \"{}\"", args_log.display()).unwrap();
+        writeln!(f, "echo 'DEPLOYED_OK'").unwrap();
+        fs::set_permissions(&mock_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let live_out = bab_cmd_config_dir(&config_dir, &ssh_dir)
+        .env("BAB_SSH_BIN", &mock_ssh)
+        .args([
+            "deploy",
+            "--repo",
+            "owner/app",
+            "--branch",
+            "release",
+            "--path",
+            "/srv/app",
+            "--cmd",
+            "docker compose up -d",
+            "--ip",
+            "100.64.0.44",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        live_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&live_out.stderr)
+    );
+    let live_stdout = String::from_utf8_lossy(&live_out.stdout);
+    assert!(live_stdout.contains("[OK] GitHub Deploy (owner/app)"));
+    assert!(live_stdout.contains("DEPLOYED_OK"));
+
+    let state_raw = fs::read_to_string(config_dir.join("state.conf")).unwrap();
+    assert!(state_raw.contains("GITHUB_REPO=\"owner/app\""));
+    assert!(state_raw.contains("GITHUB_BRANCH=\"release\""));
+    assert!(state_raw.contains("GITHUB_DEPLOY_PATH=\"/srv/app\""));
+    assert!(state_raw.contains("GITHUB_DEPLOY_CMD=\"docker compose up -d\""));
+}
+
+#[test]
+fn cli_settings_cloudflare_and_github_tokens_encrypted_with_permissions() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("bab-cfg");
+    let ssh_dir = dir.path().join("ssh");
+
+    let cf_secret = "cf-super-secret-token-9876";
+    let gh_secret = "ghp_super_secret_token_5432";
+
+    let out = bab_cmd_config_dir(&config_dir, &ssh_dir)
+        .args([
+            "settings",
+            "--cloudflare-token",
+            cf_secret,
+            "--github-token",
+            gh_secret,
+            "--show",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("TAILSCALE_API_KEY:"));
+    assert!(stdout.contains("VULTR_API_KEY:"));
+    assert!(stdout.contains("UPCLOUD_API_TOKEN:"));
+    assert!(stdout.contains("LINODE_API_TOKEN:"));
+    assert!(stdout.contains("CLOUDFLARE_API_TOKEN: cf-s****9876"));
+    assert!(stdout.contains("GITHUB_TOKEN: ghp_****5432"));
+    assert!(stdout.contains("credentials.enc"));
+    assert!(stdout.contains("master.key"));
+    assert!(stdout.contains("ChaCha20-Poly1305"));
+    assert!(!stdout.contains(cf_secret));
+    assert!(!stdout.contains(gh_secret));
+
+    let creds_path = config_dir.join("credentials.enc");
+    let master_key_path = config_dir.join("master.key");
+    let creds_raw = fs::read_to_string(&creds_path).unwrap();
+    assert!(creds_raw.contains("CLOUDFLARE_API_TOKEN=\"enc:v1:"));
+    assert!(creds_raw.contains("GITHUB_TOKEN=\"enc:v1:"));
+    assert!(!creds_raw.contains(cf_secret));
+    assert!(!creds_raw.contains(gh_secret));
+
+    assert_eq!(fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(fs::metadata(&creds_path).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(fs::metadata(&master_key_path).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn cli_setup_with_github_cf_and_final_box_info_dry_run() {
+    let dir = tempdir().unwrap();
+    let config_dir = dir.path().join("bab-cfg");
+    let ssh_dir = dir.path().join("ssh");
+
+    let out = bab_cmd_config_dir(&config_dir, &ssh_dir)
+        .args([
+            "setup",
+            "--provider",
+            "vultr",
+            "--role",
+            "caddy",
+            "--github-repo",
+            "owner/app",
+            "--cf-zone",
+            "example.com",
+            "--cf-record",
+            "app",
+            "--cf-proxied",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("region=ewr"));
+    assert!(stderr.contains("plan=vc2-1c-1gb"));
+    assert!(stderr.contains("image=2284"));
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("https://github.com/owner/app.git"));
+    assert!(stdout.contains("[STUB] Cloudflare DNS: would upsert A record 'app' -> '100.64.0.1' in zone 'example.com' (proxied=true, token_configured=false)"));
+    assert!(stdout.contains("=== Final Box Information ==="));
+    assert!(stdout.contains("Public IP:"));
+    assert!(stdout.contains("Tailscale IP:          100.64.0.1"));
+    assert!(stdout.contains("Active Target IP:      100.64.0.1"));
+    assert!(stdout.contains("Vultr (region: ewr, plan: vc2-1c-1gb, image: 2284)"));
+    assert!(stdout.contains("Cloudflare DNS:        app -> 100.64.0.1 (zone: example.com, proxied: true)"));
+    assert!(stdout.contains("GitHub Repo:           owner/app"));
+    assert!(stdout.contains("Encrypted Credentials:"));
+    assert!(stdout.contains("Master Key:"));
 }

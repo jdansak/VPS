@@ -23,7 +23,7 @@ use bab::providers::{
     provision_full_flow, CreateInstanceRequest, ProvisionConfig, ProviderKind, VpsProvider,
 };
 use bab::roles::ServerRole;
-use bab::setup::{SetupConfig, SetupRunner, SetupStepKind};
+use bab::setup::{GithubDeployConfig, SetupConfig, SetupRunner, SetupStepKind};
 use bab::tailscale::TailscaleClient;
 use bab::transport::{ensure_ssh_keypair, read_public_key, SshTransport, TransportMode};
 
@@ -764,6 +764,7 @@ fn vultr_provider_lifecycle_and_full_provision_flow() -> Result<()> {
     assert_eq!(res.instance_id, "vultr-inst-1");
     assert_eq!(res.ip, "100.64.0.50");
     assert_eq!(res.tailscale_ip, "100.64.0.50");
+    assert_eq!(res.public_ip, "203.0.113.10");
     assert_eq!(res.provider, "vultr");
     assert!(res.tailscale_mode);
 
@@ -779,6 +780,12 @@ fn vultr_provider_lifecycle_and_full_provision_flow() -> Result<()> {
             vps_instance_id: Some("vultr-inst-1".to_string()),
             tailscale_hostname: Some("vultr-edge-01".to_string()),
             server_role: Some("caddy".to_string()),
+            vps_region: Some("ewr".to_string()),
+            vps_plan: Some("vc2-1c-1gb".to_string()),
+            vps_image: Some("2284".to_string()),
+            public_ip: Some("203.0.113.10".to_string()),
+            tailscale_ip: Some("100.64.0.50".to_string()),
+            ..Default::default()
         }
     );
 
@@ -848,14 +855,20 @@ fn upcloud_bearer_and_basic_auth_and_full_provision_flow() -> Result<()> {
     assert_eq!(res.instance_id, "upcloud-uuid-1");
     assert_eq!(res.ip, "100.64.0.51");
     assert_eq!(res.tailscale_ip, "100.64.0.51");
+    assert_eq!(res.public_ip, "203.0.113.11");
     assert_eq!(res.provider, "upcloud");
 
     let loaded = session.load_session()?;
     assert_eq!(loaded.vps_ip.as_deref(), Some("100.64.0.51"));
+    assert_eq!(loaded.public_ip.as_deref(), Some("203.0.113.11"));
+    assert_eq!(loaded.tailscale_ip.as_deref(), Some("100.64.0.51"));
     assert_eq!(loaded.ssh_key.as_deref(), Some("tailscale"));
     assert_eq!(loaded.transport_mode.as_deref(), Some("tailscale"));
     assert_eq!(loaded.vps_provider.as_deref(), Some("upcloud"));
     assert_eq!(loaded.vps_instance_id.as_deref(), Some("upcloud-uuid-1"));
+    assert_eq!(loaded.vps_region.as_deref(), Some("de-fra1"));
+    assert_eq!(loaded.vps_plan.as_deref(), Some("1xCPU-1GB"));
+    assert_eq!(loaded.vps_image.as_deref(), Some(images[0].id.as_str()));
     assert_eq!(loaded.tailscale_hostname.as_deref(), Some("upcloud-vpn-01"));
     assert_eq!(loaded.server_role.as_deref(), Some("wireguard"));
 
@@ -944,14 +957,20 @@ fn linode_provider_lifecycle_and_full_provision_flow() -> Result<()> {
     assert_eq!(res.instance_id, "12345");
     assert_eq!(res.ip, "100.64.0.52");
     assert_eq!(res.tailscale_ip, "100.64.0.52");
+    assert_eq!(res.public_ip, "203.0.113.12");
     assert_eq!(res.provider, "linode");
 
     let loaded = session.load_session()?;
     assert_eq!(loaded.vps_ip.as_deref(), Some("100.64.0.52"));
+    assert_eq!(loaded.public_ip.as_deref(), Some("203.0.113.12"));
+    assert_eq!(loaded.tailscale_ip.as_deref(), Some("100.64.0.52"));
     assert_eq!(loaded.ssh_key.as_deref(), Some("tailscale"));
     assert_eq!(loaded.transport_mode.as_deref(), Some("tailscale"));
     assert_eq!(loaded.vps_provider.as_deref(), Some("linode"));
     assert_eq!(loaded.vps_instance_id.as_deref(), Some("12345"));
+    assert_eq!(loaded.vps_region.as_deref(), Some("us-east"));
+    assert_eq!(loaded.vps_plan.as_deref(), Some("g6-nanode-1"));
+    assert_eq!(loaded.vps_image.as_deref(), Some("linode/ubuntu24.04"));
     assert_eq!(loaded.tailscale_hostname.as_deref(), Some("linode-rbi-01"));
     assert_eq!(loaded.server_role.as_deref(), Some("rbi"));
 
@@ -1034,6 +1053,7 @@ fn setup_runner_all_roles_over_tailscale_transport_via_with_bins() -> Result<()>
             tailscale_mode: true,
             ssh_pubkey: None,
             dry_run: false,
+            github_deploy: None,
         };
         let runner = SetupRunner::new(&transport, Some(&session));
         let mut steps_seen = Vec::new();
@@ -1132,6 +1152,7 @@ fn setup_runner_respects_bab_ssh_bin_env_var_serialized() -> Result<()> {
         tailscale_mode: true,
         ssh_pubkey: None,
         dry_run: false,
+        github_deploy: None,
     };
 
     let reports = runner.run_all(&cfg, |_| {})?;
@@ -1185,11 +1206,14 @@ fn standard_ssh_provisioning_flow_generates_key_and_skips_tailscale() -> Result<
     let res = provision_full_flow(&vultr, None, &cfg, Some(&session))?;
     assert_eq!(res.instance_id, "vultr-inst-1");
     assert_eq!(res.ip, "203.0.113.10");
+    assert_eq!(res.public_ip, "203.0.113.10");
     assert_eq!(res.tailscale_ip, "");
     assert!(!res.tailscale_mode);
 
     let loaded = session.load_session()?;
     assert_eq!(loaded.vps_ip.as_deref(), Some("203.0.113.10"));
+    assert_eq!(loaded.public_ip.as_deref(), Some("203.0.113.10"));
+    assert_eq!(loaded.tailscale_ip, None);
     assert_eq!(
         loaded.ssh_key.as_deref(),
         Some(key_path.to_string_lossy().as_ref())
@@ -1198,6 +1222,9 @@ fn standard_ssh_provisioning_flow_generates_key_and_skips_tailscale() -> Result<
     assert_eq!(loaded.transport_mode.as_deref(), Some("ssh"));
     assert_eq!(loaded.vps_provider.as_deref(), Some("vultr"));
     assert_eq!(loaded.vps_instance_id.as_deref(), Some("vultr-inst-1"));
+    assert_eq!(loaded.vps_region.as_deref(), Some("ewr"));
+    assert_eq!(loaded.vps_plan.as_deref(), Some("vc2-1c-1gb"));
+    assert_eq!(loaded.vps_image.as_deref(), Some("2284"));
     assert_eq!(loaded.tailscale_hostname.as_deref(), Some("ssh-box-01"));
     assert_eq!(loaded.server_role.as_deref(), Some("vanilla"));
 
@@ -1260,6 +1287,7 @@ fn setup_runner_vanilla_both_transport_modes_end_to_end() -> Result<()> {
                 Some(pubkey.to_string())
             },
             dry_run: false,
+            github_deploy: None,
         };
 
         let reports = runner.run_all(&cfg, |_| {})?;
@@ -1317,6 +1345,78 @@ fn setup_runner_vanilla_both_transport_modes_end_to_end() -> Result<()> {
             assert!(step6.contains("BAB_TRANSPORT='Standard SSH'"));
         }
     }
+
+    Ok(())
+}
+
+#[test]
+fn provision_records_dual_ips_and_setup_runner_deploy_github_executes_via_mock_ssh() -> Result<()> {
+    let server = MockApiServer::start();
+    let ts = TailscaleClient::with_config("ts-valid-key", server.base_url("api/v2"), "-")?;
+    let vultr = VultrProvider::with_base_url("vultr-valid-key", server.base_url("v2"))?;
+
+    let dir = tempdir()?;
+    let session = SessionState::new(dir.path().join("state.conf"));
+    let prov_cfg = ProvisionConfig {
+        provider: ProviderKind::Vultr,
+        region: "ewr".to_string(),
+        plan: "vc2-1c-2gb".to_string(),
+        image_id: "2284".to_string(),
+        hostname: "app-node-01".to_string(),
+        username: "deploy".to_string(),
+        role: "caddy".to_string(),
+        tags: vec![],
+        provider_timeout: Duration::from_secs(5),
+        tailscale_timeout: Duration::from_secs(5),
+        poll_interval: Duration::from_millis(10),
+        tailscale_mode: true,
+        ssh_pubkey: None,
+        ssh_key_path: None,
+    };
+
+    let res = provision_full_flow(&vultr, Some(&ts), &prov_cfg, Some(&session))?;
+    assert_eq!(res.public_ip, "203.0.113.10");
+    assert_eq!(res.tailscale_ip, "100.64.0.50");
+    assert_eq!(res.ip, "100.64.0.50");
+
+    let loaded = session.load_session()?;
+    assert_eq!(loaded.public_ip.as_deref(), Some("203.0.113.10"));
+    assert_eq!(loaded.tailscale_ip.as_deref(), Some("100.64.0.50"));
+    assert_eq!(loaded.vps_region.as_deref(), Some("ewr"));
+    assert_eq!(loaded.vps_plan.as_deref(), Some("vc2-1c-2gb"));
+    assert_eq!(loaded.vps_image.as_deref(), Some("2284"));
+
+    let args_log = dir.path().join("deploy_args.log");
+    let scripts_dir = dir.path().join("deploy_scripts");
+    let mock_ssh = write_mock_ssh_script(dir.path(), &args_log, &scripts_dir)?;
+
+    let transport = SshTransport::with_bins(TransportMode::Tailscale, &mock_ssh, &mock_ssh);
+    let runner = SetupRunner::new(&transport, Some(&session));
+
+    let gh_cfg = GithubDeployConfig {
+        repo: "owner/private-app".to_string(),
+        branch: "main".to_string(),
+        deploy_path: Some("/home/deploy/apps/private-app".to_string()),
+        deploy_cmd: Some("docker compose up -d --build".to_string()),
+        github_token: Some("ghp_secret_deploy_token".to_string()),
+        username: "deploy".to_string(),
+    };
+
+    let out = runner.deploy_github("deploy", &res.tailscale_ip, &gh_cfg, false)?;
+    assert!(out.contains("MOCK_STEP_1_OK"));
+
+    let log_text = fs::read_to_string(&args_log)?;
+    assert!(log_text.contains("deploy@100.64.0.50"));
+
+    let script = fs::read_to_string(scripts_dir.join("step_1.sh"))?;
+    assert!(script.contains("sudo bash -s"));
+    assert!(script.contains("https://github.com/owner/private-app.git"));
+    assert!(script.contains("git clone --branch"));
+    assert!(script.contains("git -C \"${DEPLOY_PATH}\" pull --ff-only"));
+    assert!(script.contains("GIT_ASKPASS"));
+    assert!(script.contains("chmod 0700 \"${GIT_ASKPASS_SCRIPT}\""));
+    assert!(script.contains("trap 'rm -f \"${GIT_ASKPASS_SCRIPT}\"' EXIT"));
+    assert!(script.contains("docker compose up -d --build"));
 
     Ok(())
 }

@@ -100,6 +100,143 @@ pub struct ProviderImage {
     pub vendor: String,
 }
 
+/// Curated default region presets for a given provider.
+pub fn default_regions_for(kind: ProviderKind) -> Vec<ProviderRegion> {
+    match kind {
+        ProviderKind::Vultr => vec![
+            ProviderRegion { id: "ewr".into(), name: "Newark, NJ".into(), country: "US".into() },
+            ProviderRegion { id: "ord".into(), name: "Chicago, IL".into(), country: "US".into() },
+            ProviderRegion { id: "lax".into(), name: "Los Angeles, CA".into(), country: "US".into() },
+            ProviderRegion { id: "ams".into(), name: "Amsterdam".into(), country: "NL".into() },
+            ProviderRegion { id: "fra".into(), name: "Frankfurt".into(), country: "DE".into() },
+            ProviderRegion { id: "lhr".into(), name: "London".into(), country: "GB".into() },
+            ProviderRegion { id: "sgp".into(), name: "Singapore".into(), country: "SG".into() },
+            ProviderRegion { id: "nrt".into(), name: "Tokyo".into(), country: "JP".into() },
+        ],
+        ProviderKind::UpCloud => vec![
+            ProviderRegion { id: "us-nyc1".into(), name: "New York".into(), country: "US".into() },
+            ProviderRegion { id: "us-chi1".into(), name: "Chicago".into(), country: "US".into() },
+            ProviderRegion { id: "nl-ams1".into(), name: "Amsterdam".into(), country: "NL".into() },
+            ProviderRegion { id: "de-fra1".into(), name: "Frankfurt".into(), country: "DE".into() },
+            ProviderRegion { id: "uk-lon1".into(), name: "London".into(), country: "GB".into() },
+            ProviderRegion { id: "sg-sin1".into(), name: "Singapore".into(), country: "SG".into() },
+        ],
+        ProviderKind::Linode => vec![
+            ProviderRegion { id: "us-east".into(), name: "Newark, NJ".into(), country: "US".into() },
+            ProviderRegion { id: "us-central".into(), name: "Dallas, TX".into(), country: "US".into() },
+            ProviderRegion { id: "us-west".into(), name: "Fremont, CA".into(), country: "US".into() },
+            ProviderRegion { id: "eu-west".into(), name: "London".into(), country: "GB".into() },
+            ProviderRegion { id: "eu-central".into(), name: "Frankfurt".into(), country: "DE".into() },
+            ProviderRegion { id: "ap-south".into(), name: "Singapore".into(), country: "SG".into() },
+        ],
+        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => Vec::new(),
+    }
+}
+
+/// Curated default machine size (plan) presets for a given provider.
+pub fn default_plans_for(kind: ProviderKind) -> Vec<ProviderPlan> {
+    match kind {
+        ProviderKind::Vultr => vec![
+            ProviderPlan {
+                id: "vc2-1c-1gb".into(),
+                summary: "1 vCPU, 1024 MB RAM, 25 GB SSD ($5/mo)".into(),
+            },
+            ProviderPlan {
+                id: "vc2-1c-2gb".into(),
+                summary: "1 vCPU, 2048 MB RAM, 55 GB SSD ($10/mo)".into(),
+            },
+            ProviderPlan {
+                id: "vc2-2c-4gb".into(),
+                summary: "2 vCPU, 4096 MB RAM, 80 GB SSD ($20/mo)".into(),
+            },
+            ProviderPlan {
+                id: "vc2-4c-8gb".into(),
+                summary: "4 vCPU, 8192 MB RAM, 160 GB SSD ($40/mo)".into(),
+            },
+        ],
+        ProviderKind::UpCloud => vec![
+            ProviderPlan {
+                id: "1xCPU-1GB".into(),
+                summary: "1 vCPU, 1024 MB RAM, 25 GB SSD".into(),
+            },
+            ProviderPlan {
+                id: "1xCPU-2GB".into(),
+                summary: "1 vCPU, 2048 MB RAM, 50 GB SSD".into(),
+            },
+            ProviderPlan {
+                id: "2xCPU-4GB".into(),
+                summary: "2 vCPU, 4096 MB RAM, 80 GB SSD".into(),
+            },
+            ProviderPlan {
+                id: "4xCPU-8GB".into(),
+                summary: "4 vCPU, 8192 MB RAM, 160 GB SSD".into(),
+            },
+        ],
+        ProviderKind::Linode => vec![
+            ProviderPlan {
+                id: "g6-nanode-1".into(),
+                summary: "Nanode 1GB - 1 vCPU, 1024 MB RAM, 25 GB SSD ($5/mo)".into(),
+            },
+            ProviderPlan {
+                id: "g6-standard-1".into(),
+                summary: "Linode 2GB - 1 vCPU, 2048 MB RAM, 50 GB SSD ($12/mo)".into(),
+            },
+            ProviderPlan {
+                id: "g6-standard-2".into(),
+                summary: "Linode 4GB - 2 vCPU, 4096 MB RAM, 80 GB SSD ($24/mo)".into(),
+            },
+            ProviderPlan {
+                id: "g6-standard-4".into(),
+                summary: "Linode 8GB - 4 vCPU, 8192 MB RAM, 160 GB SSD ($48/mo)".into(),
+            },
+        ],
+        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => Vec::new(),
+    }
+}
+
+/// Curated default OS image presets for a given provider.
+pub fn default_images_for(kind: ProviderKind) -> Vec<ProviderImage> {
+    match kind {
+        ProviderKind::Vultr => vec![
+            ProviderImage {
+                id: "2284".into(),
+                name: "Ubuntu 24.04 LTS x64".into(),
+                vendor: "ubuntu".into(),
+            },
+            ProviderImage {
+                id: "2136".into(),
+                name: "Debian 12 x64 (bookworm)".into(),
+                vendor: "debian".into(),
+            },
+        ],
+        ProviderKind::UpCloud => vec![
+            ProviderImage {
+                id: "01000000-0000-4000-8000-000030240200".into(),
+                name: "Ubuntu Server 24.04 LTS".into(),
+                vendor: "upcloud".into(),
+            },
+            ProviderImage {
+                id: "01000000-0000-4000-8000-000020060100".into(),
+                name: "Debian GNU/Linux 12 (Bookworm)".into(),
+                vendor: "upcloud".into(),
+            },
+        ],
+        ProviderKind::Linode => vec![
+            ProviderImage {
+                id: "linode/ubuntu24.04".into(),
+                name: "Ubuntu 24.04 LTS".into(),
+                vendor: "Ubuntu".into(),
+            },
+            ProviderImage {
+                id: "linode/debian12".into(),
+                name: "Debian 12".into(),
+                vendor: "Debian".into(),
+            },
+        ],
+        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => Vec::new(),
+    }
+}
+
 /// Status of a provisioned instance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstanceStatus {
@@ -143,6 +280,7 @@ pub struct ProvisionResult {
     pub instance_id: String,
     pub ip: String,
     pub tailscale_ip: String,
+    pub public_ip: String,
     pub hostname: String,
     pub provider: String,
     pub username: String,
@@ -164,12 +302,12 @@ pub trait VpsProvider {
         instance_id: &str,
         timeout: Duration,
         poll_interval: Duration,
-    ) -> Result<()> {
+    ) -> Result<InstanceStatus> {
         let start = std::time::Instant::now();
         loop {
             let status = self.get_instance_status(instance_id)?;
             if status.ready {
-                return Ok(());
+                return Ok(status);
             }
             if start.elapsed() >= timeout {
                 return Err(anyhow::anyhow!("Timed out waiting for instance {} to become ready", instance_id));
@@ -212,49 +350,65 @@ pub fn provision_full_flow(
         user_data_raw: cloud_init,
     };
     let instance_id = provider.create_instance(&req)?;
-    provider.wait_active(&instance_id, cfg.provider_timeout, cfg.poll_interval)?;
+    let status = provider.wait_active(&instance_id, cfg.provider_timeout, cfg.poll_interval)?;
+    let discovered_public_ip = status
+        .public_ipv4
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
-    let (ip, tailscale_ip, ssh_key, transport_mode) = if cfg.tailscale_mode {
-        let ts = tailscale.expect("validated above");
-        let ts_ip = ts.wait_for_device(&cfg.hostname, cfg.tailscale_timeout, cfg.poll_interval)?;
-        (
-            ts_ip.clone(),
-            ts_ip,
-            Some("tailscale".to_string()),
-            "tailscale",
-        )
-    } else {
-        let status = provider.get_instance_status(&instance_id)?;
-        let public_ipv4 = status
-            .public_ipv4
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
+    let (ip, tailscale_ip, public_ip, session_tailscale_ip, session_public_ip, ssh_key, transport_mode) =
+        if cfg.tailscale_mode {
+            let ts = tailscale.expect("validated above");
+            let ts_ip = ts.wait_for_device(&cfg.hostname, cfg.tailscale_timeout, cfg.poll_interval)?;
+            let pub_ip_str = discovered_public_ip.clone().unwrap_or_default();
+            (
+                ts_ip.clone(),
+                ts_ip.clone(),
+                pub_ip_str,
+                Some(ts_ip),
+                discovered_public_ip,
+                Some("tailscale".to_string()),
+                "tailscale",
+            )
+        } else {
+            let public_ip = discovered_public_ip.ok_or_else(|| {
                 anyhow!(
                     "Instance {} became active without a public IPv4 address",
                     instance_id
                 )
             })?;
-        let ssh_key = cfg
-            .ssh_key_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
-        (public_ipv4, String::new(), ssh_key, "ssh")
-    };
+            let ssh_key = cfg
+                .ssh_key_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            (
+                public_ip.clone(),
+                String::new(),
+                public_ip.clone(),
+                None,
+                Some(public_ip),
+                ssh_key,
+                "ssh",
+            )
+        };
 
     if let Some(ss) = session {
-        let data = SessionData {
-            vps_ip: Some(ip.clone()),
-            ssh_key,
-            username: Some(cfg.username.clone()),
-            transport_mode: Some(transport_mode.to_string()),
-            vps_provider: Some(provider.kind().to_string()),
-            vps_instance_id: Some(instance_id.clone()),
-            tailscale_hostname: Some(cfg.hostname.clone()),
-            server_role: Some(cfg.role.clone()),
-        };
+        let mut data = ss.load_session().unwrap_or_else(|_| SessionData::default());
+        data.vps_ip = Some(ip.clone());
+        data.public_ip = session_public_ip;
+        data.tailscale_ip = session_tailscale_ip;
+        data.ssh_key = ssh_key;
+        data.username = Some(cfg.username.clone());
+        data.transport_mode = Some(transport_mode.to_string());
+        data.vps_provider = Some(provider.kind().to_string());
+        data.vps_instance_id = Some(instance_id.clone());
+        data.tailscale_hostname = Some(cfg.hostname.clone());
+        data.server_role = Some(cfg.role.clone());
+        data.vps_region = Some(cfg.region.clone());
+        data.vps_plan = Some(cfg.plan.clone());
+        data.vps_image = Some(cfg.image_id.clone());
         ss.save_session(&data)?;
     }
 
@@ -262,6 +416,7 @@ pub fn provision_full_flow(
         instance_id,
         ip,
         tailscale_ip,
+        public_ip,
         hostname: cfg.hostname.clone(),
         provider: provider.kind().to_string(),
         username: cfg.username.clone(),
@@ -369,15 +524,59 @@ mod tests {
     }
 
     #[test]
+    fn default_catalog_presets_cover_cloud_providers_and_empty_for_special() {
+        let vultr_regions = default_regions_for(ProviderKind::Vultr);
+        assert!(vultr_regions.iter().any(|r| r.id == "ewr"));
+        assert!(vultr_regions.iter().any(|r| r.id == "nrt"));
+        let upcloud_regions = default_regions_for(ProviderKind::UpCloud);
+        assert!(upcloud_regions.iter().any(|r| r.id == "us-nyc1"));
+        assert!(upcloud_regions.iter().any(|r| r.id == "sg-sin1"));
+        let linode_regions = default_regions_for(ProviderKind::Linode);
+        assert!(linode_regions.iter().any(|r| r.id == "us-east"));
+        assert!(linode_regions.iter().any(|r| r.id == "eu-central"));
+
+        let vultr_plans = default_plans_for(ProviderKind::Vultr);
+        assert!(vultr_plans.iter().any(|p| p.id == "vc2-1c-1gb" && p.summary.contains("1024 MB")));
+        assert!(vultr_plans.iter().any(|p| p.id == "vc2-4c-8gb" && p.summary.contains("8192 MB")));
+        let upcloud_plans = default_plans_for(ProviderKind::UpCloud);
+        assert!(upcloud_plans.iter().any(|p| p.id == "1xCPU-1GB" && p.summary.contains("1 vCPU")));
+        assert!(upcloud_plans.iter().any(|p| p.id == "4xCPU-8GB" && p.summary.contains("8192 MB")));
+        let linode_plans = default_plans_for(ProviderKind::Linode);
+        assert!(linode_plans.iter().any(|p| p.id == "g6-nanode-1" && p.summary.contains("1024 MB")));
+        assert!(linode_plans.iter().any(|p| p.id == "g6-standard-4" && p.summary.contains("8192 MB")));
+
+        let vultr_images = default_images_for(ProviderKind::Vultr);
+        assert!(vultr_images.iter().any(|i| i.id == "2284" && i.name.contains("Ubuntu 24.04")));
+        assert!(vultr_images.iter().any(|i| i.name.contains("Debian 12")));
+        let upcloud_images = default_images_for(ProviderKind::UpCloud);
+        assert!(upcloud_images
+            .iter()
+            .any(|i| i.id == "01000000-0000-4000-8000-000030240200" && i.name.contains("Ubuntu")));
+        assert!(upcloud_images.iter().any(|i| i.name.contains("Debian")));
+        let linode_images = default_images_for(ProviderKind::Linode);
+        assert!(linode_images.iter().any(|i| i.id == "linode/ubuntu24.04"));
+        assert!(linode_images.iter().any(|i| i.id == "linode/debian12"));
+
+        for special in [ProviderKind::ExistingTailscale, ProviderKind::ManualCloudInit] {
+            assert!(default_regions_for(special).is_empty());
+            assert!(default_plans_for(special).is_empty());
+            assert!(default_images_for(special).is_empty());
+        }
+    }
+
+    #[test]
     fn provision_full_flow_standard_ssh_mode_saves_session() -> Result<()> {
         let provider = MockProvider::new(Some("203.0.113.42"));
         let tmp = tempfile::NamedTempFile::new()?;
         let session = SessionState::new(tmp.path());
+        // Seed a stale TAILSCALE_IP to ensure SSH mode clears it.
+        session.set_tailscale_ip("100.64.9.9")?;
         let cfg = base_cfg(false);
 
         let res = provision_full_flow(&provider, None, &cfg, Some(&session))?;
         assert_eq!(res.instance_id, "inst-123");
         assert_eq!(res.ip, "203.0.113.42");
+        assert_eq!(res.public_ip, "203.0.113.42");
         assert_eq!(res.tailscale_ip, "");
         assert!(!res.tailscale_mode);
 
@@ -387,6 +586,8 @@ mod tests {
 
         let loaded = session.load_session()?;
         assert_eq!(loaded.vps_ip.as_deref(), Some("203.0.113.42"));
+        assert_eq!(loaded.public_ip.as_deref(), Some("203.0.113.42"));
+        assert_eq!(loaded.tailscale_ip, None);
         assert_eq!(loaded.ssh_key.as_deref(), Some("/tmp/bab_ed25519"));
         assert_eq!(loaded.transport_mode.as_deref(), Some("ssh"));
         assert_eq!(loaded.username.as_deref(), Some("deploy"));
@@ -394,6 +595,9 @@ mod tests {
         assert_eq!(loaded.vps_instance_id.as_deref(), Some("inst-123"));
         assert_eq!(loaded.tailscale_hostname.as_deref(), Some("bab-vps"));
         assert_eq!(loaded.server_role.as_deref(), Some("caddy"));
+        assert_eq!(loaded.vps_region.as_deref(), Some("ewr"));
+        assert_eq!(loaded.vps_plan.as_deref(), Some("vc2-1c-1gb"));
+        assert_eq!(loaded.vps_image.as_deref(), Some("2284"));
         Ok(())
     }
 
@@ -469,6 +673,7 @@ mod tests {
 
         assert_eq!(res.ip, "100.64.1.2");
         assert_eq!(res.tailscale_ip, "100.64.1.2");
+        assert_eq!(res.public_ip, "203.0.113.42");
         assert!(res.tailscale_mode);
 
         let user_data = provider.captured_user_data.lock().unwrap().clone().unwrap();
@@ -476,8 +681,13 @@ mod tests {
 
         let loaded = session.load_session()?;
         assert_eq!(loaded.vps_ip.as_deref(), Some("100.64.1.2"));
+        assert_eq!(loaded.public_ip.as_deref(), Some("203.0.113.42"));
+        assert_eq!(loaded.tailscale_ip.as_deref(), Some("100.64.1.2"));
         assert_eq!(loaded.ssh_key.as_deref(), Some("tailscale"));
         assert_eq!(loaded.transport_mode.as_deref(), Some("tailscale"));
+        assert_eq!(loaded.vps_region.as_deref(), Some("ewr"));
+        assert_eq!(loaded.vps_plan.as_deref(), Some("vc2-1c-1gb"));
+        assert_eq!(loaded.vps_image.as_deref(), Some("2284"));
         Ok(())
     }
 }
