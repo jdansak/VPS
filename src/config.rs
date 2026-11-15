@@ -678,6 +678,12 @@ impl SessionState {
     pub fn set_github_deploy_cmd(&self, v: &str) -> Result<()> {
         self.set_var("GITHUB_DEPLOY_CMD", v)
     }
+    pub fn github_enabled(&self) -> Result<Option<String>> {
+        self.get_var("GITHUB_ENABLED")
+    }
+    pub fn set_github_enabled(&self, v: &str) -> Result<()> {
+        self.set_var("GITHUB_ENABLED", v)
+    }
 
     pub fn save_session(&self, data: &SessionData) -> Result<()> {
         // Helper to write or remove based on Option
@@ -712,6 +718,7 @@ impl SessionState {
         set_opt!("GITHUB_BRANCH", data.github_branch);
         set_opt!("GITHUB_DEPLOY_PATH", data.github_deploy_path);
         set_opt!("GITHUB_DEPLOY_CMD", data.github_deploy_cmd);
+        set_opt!("GITHUB_ENABLED", data.github_enabled);
         Ok(())
     }
 
@@ -739,6 +746,7 @@ impl SessionState {
             github_branch: self.github_branch()?,
             github_deploy_path: self.github_deploy_path()?,
             github_deploy_cmd: self.github_deploy_cmd()?,
+            github_enabled: self.github_enabled()?,
         })
     }
 }
@@ -767,6 +775,7 @@ pub struct SessionData {
     pub github_branch: Option<String>,
     pub github_deploy_path: Option<String>,
     pub github_deploy_cmd: Option<String>,
+    pub github_enabled: Option<String>,
 }
 
 #[cfg(test)]
@@ -1130,6 +1139,7 @@ mod tests {
             github_branch: Some("main".to_string()),
             github_deploy_path: Some("/home/deploy/apps/repo".to_string()),
             github_deploy_cmd: Some("docker compose up -d".to_string()),
+            github_enabled: Some("true".to_string()),
         };
         ss.save_session(&data)?;
         assert_eq!(ss.load_session()?, data);
@@ -1139,10 +1149,13 @@ mod tests {
         assert_eq!(ss.cf_record()?, Some("api.example.com".to_string()));
         ss.set_cf_enabled("false")?;
         assert_eq!(ss.cf_enabled()?, Some("false".to_string()));
+        ss.set_github_enabled("false")?;
+        assert_eq!(ss.github_enabled()?, Some("false".to_string()));
         let cleared = SessionData {
             cf_record: None,
             cf_enabled: None,
             github_deploy_cmd: None,
+            github_enabled: None,
             ..data
         };
         ss.save_session(&cleared)?;

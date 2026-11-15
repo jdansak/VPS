@@ -78,12 +78,23 @@ const CF_DNS_FIELD_LABELS: [&str; 5] = [
     "DNS Enabled",
 ];
 
-const GITHUB_FIELD_LABELS: [&str; 4] = [
+const GITHUB_FIELD_LABELS: [&str; 5] = [
     "Repository",
     "Branch",
     "Deploy Path",
     "Deploy Command",
+    "Deploy Enabled",
 ];
+
+fn toggle_style(enabled: bool) -> Style {
+    Style::default()
+        .fg(if enabled {
+            Color::LightGreen
+        } else {
+            Color::LightRed
+        })
+        .add_modifier(Modifier::BOLD)
+}
 
 fn default_ssh_key_path_string() -> String {
     default_ssh_key_path()
@@ -318,6 +329,7 @@ pub struct GithubDeployForm {
     pub branch: String,
     pub deploy_path: String,
     pub deploy_cmd: String,
+    pub enabled: bool,
     pub active_field: usize,
     pub editing: bool,
 }
@@ -329,6 +341,7 @@ impl Default for GithubDeployForm {
             branch: "main".to_string(),
             deploy_path: String::new(),
             deploy_cmd: String::new(),
+            enabled: false,
             active_field: 0,
             editing: false,
         }
@@ -363,23 +376,33 @@ impl GithubDeployForm {
             .map(str::trim)
             .unwrap_or("")
             .to_string();
+        let enabled = match session.github_enabled.as_deref() {
+            Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => true,
+                "false" | "0" | "no" | "off" => false,
+                _ => !repo.is_empty(),
+            },
+            None => !repo.is_empty(),
+        };
 
         Self {
             repo,
             branch,
             deploy_path,
             deploy_cmd,
+            enabled,
             active_field: 0,
             editing: false,
         }
     }
 
-    fn active_text_mut(&mut self) -> &mut String {
+    fn active_text_mut(&mut self) -> Option<&mut String> {
         match self.active_field {
-            0 => &mut self.repo,
-            1 => &mut self.branch,
-            2 => &mut self.deploy_path,
-            _ => &mut self.deploy_cmd,
+            0 => Some(&mut self.repo),
+            1 => Some(&mut self.branch),
+            2 => Some(&mut self.deploy_path),
+            3 => Some(&mut self.deploy_cmd),
+            _ => None,
         }
     }
 }
@@ -527,6 +550,7 @@ pub struct TuiApp {
     pub settings_path: Option<PathBuf>,
     pub state_path: Option<PathBuf>,
     pub build_dry_run: bool,
+    pub last_dry_run_target: Option<String>,
     pub running_instances: Vec<ProviderInstance>,
     pub running_statuses: Vec<ProviderQueryStatus>,
     pub running_index: usize,
@@ -633,6 +657,7 @@ impl TuiApp {
             settings_path: None,
             state_path: None,
             build_dry_run: false,
+            last_dry_run_target: None,
             running_instances: Vec::new(),
             running_statuses: Vec::new(),
             running_index: 0,
@@ -682,12 +707,22 @@ impl TuiApp {
         } else {
             "FAIL"
         };
-        self.logs
-            .push(format!("[{}] {}", tag, report.step.title()));
-        for line in report.output.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                self.logs.push(format!("  {}", trimmed));
+        if report.dry_run {
+            self.logs
+                .push(format!("[DRY-RUN] {} (simulated)", report.step.title()));
+        } else {
+            self.logs
+                .push(format!("[{}] {}", tag, report.step.title()));
+            let lines: Vec<&str> = report
+                .output
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+            let keep = if report.success { 2 } else { 3 };
+            let skip = lines.len().saturating_sub(keep);
+            for line in &lines[skip..] {
+                self.logs.push(format!("  {}", line));
             }
         }
         self.status_message = format!("{}: {}", report.step.title(), tag);
@@ -695,6 +730,14 @@ impl TuiApp {
 
     /// Processes a single terminal key event.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        self.handle_key_with_ui(key, |_| {});
+    }
+
+    /// Processes a single terminal key event, invoking `on_update` on UI progress milestones.
+    pub fn handle_key_with_ui<F>(&mut self, key: KeyEvent, on_update: F)
+    where
+        F: FnMut(&Self),
+    {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return;
         }
@@ -749,7 +792,7 @@ impl TuiApp {
             Screen::CloudflareDns => self.handle_cf_dns_nav_key(key),
             Screen::GithubDeploy => self.handle_github_deploy_nav_key(key),
             Screen::ApiKeys => self.handle_api_keys_nav_key(key),
-            Screen::BuildBox => self.handle_build_box_key(key),
+            Screen::BuildBox => self.handle_build_box_key_with_ui(key, on_update),
             Screen::RunningInstances => self.handle_running_instances_key(key),
         }
     }
@@ -987,17 +1030,11 @@ impl TuiApp {
                 if self.cf_dns.active_field == 4 =>
             {
                 self.cf_dns.enabled = !self.cf_dns.enabled;
-                self.status_message = format!(
-                    "Cloudflare DNS {} (press 's' to save)",
-                    if self.cf_dns.enabled { "ON" } else { "OFF" }
-                );
+                self.save_cf_dns();
             }
             KeyCode::Char('t') => {
                 self.cf_dns.enabled = !self.cf_dns.enabled;
-                self.status_message = format!(
-                    "Cloudflare DNS {} (press 's' to save)",
-                    if self.cf_dns.enabled { "ON" } else { "OFF" }
-                );
+                self.save_cf_dns();
             }
             KeyCode::Enter => match self.cf_dns.active_field {
                 2 => {
@@ -1016,10 +1053,7 @@ impl TuiApp {
                 }
                 4 => {
                     self.cf_dns.enabled = !self.cf_dns.enabled;
-                    self.status_message = format!(
-                        "Cloudflare DNS {} (press 's' to save)",
-                        if self.cf_dns.enabled { "ON" } else { "OFF" }
-                    );
+                    self.save_cf_dns();
                 }
                 idx => {
                     self.cf_dns.editing = true;
@@ -1083,7 +1117,27 @@ impl TuiApp {
                 self.github_deploy.active_field =
                     next_index(self.github_deploy.active_field, GITHUB_FIELD_LABELS.len());
             }
-            KeyCode::Enter | KeyCode::Char('e') => {
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                if self.github_deploy.active_field == 4 =>
+            {
+                self.github_deploy.enabled = !self.github_deploy.enabled;
+                self.save_github_deploy();
+            }
+            KeyCode::Char('t') => {
+                self.github_deploy.enabled = !self.github_deploy.enabled;
+                self.save_github_deploy();
+            }
+            KeyCode::Enter => {
+                if self.github_deploy.active_field == 4 {
+                    self.github_deploy.enabled = !self.github_deploy.enabled;
+                    self.save_github_deploy();
+                } else {
+                    self.github_deploy.editing = true;
+                    let label = GITHUB_FIELD_LABELS[self.github_deploy.active_field];
+                    self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
+                }
+            }
+            KeyCode::Char('e') if self.github_deploy.active_field < 4 => {
                 self.github_deploy.editing = true;
                 let label = GITHUB_FIELD_LABELS[self.github_deploy.active_field];
                 self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
@@ -1102,18 +1156,28 @@ impl TuiApp {
         match key.code {
             KeyCode::Enter | KeyCode::Esc => {
                 self.github_deploy.editing = false;
+                if self.github_deploy.active_field == 0
+                    && !self.github_deploy.repo.trim().is_empty()
+                    && self.session.github_enabled.is_none()
+                {
+                    self.github_deploy.enabled = true;
+                }
                 let label = GITHUB_FIELD_LABELS[self.github_deploy.active_field];
                 self.status_message = format!("Updated {} (press 's' to save)", label);
             }
             KeyCode::Backspace => {
-                self.github_deploy.active_text_mut().pop();
+                if let Some(buf) = self.github_deploy.active_text_mut() {
+                    buf.pop();
+                }
             }
             KeyCode::Char(c)
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                self.github_deploy.active_text_mut().push(c);
+                if let Some(buf) = self.github_deploy.active_text_mut() {
+                    buf.push(c);
+                }
             }
             _ => {}
         }
@@ -1170,7 +1234,10 @@ impl TuiApp {
         }
     }
 
-    fn handle_build_box_key(&mut self, key: KeyEvent) {
+    fn handle_build_box_key_with_ui<F>(&mut self, key: KeyEvent, on_update: F)
+    where
+        F: FnMut(&Self),
+    {
         match key.code {
             KeyCode::Char('d') | KeyCode::Char(' ') => {
                 self.cf_dns.enabled = !self.cf_dns.enabled;
@@ -1178,6 +1245,18 @@ impl TuiApp {
                 self.status_message = format!(
                     "Cloudflare DNS toggled {}",
                     if self.cf_dns.enabled { "ON" } else { "OFF" }
+                );
+            }
+            KeyCode::Char('g') => {
+                self.github_deploy.enabled = !self.github_deploy.enabled;
+                self.save_github_deploy();
+                self.status_message = format!(
+                    "GitHub Repo Deploy toggled {}",
+                    if self.github_deploy.enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
                 );
             }
             KeyCode::Char('n') => {
@@ -1192,7 +1271,7 @@ impl TuiApp {
                 );
             }
             KeyCode::Enter | KeyCode::Char('x') => {
-                self.execute_build();
+                self.execute_build_with_ui(on_update);
             }
             KeyCode::Esc | KeyCode::Char('b') => {
                 self.screen = Screen::Home;
@@ -1627,6 +1706,12 @@ impl TuiApp {
         let deploy_cmd = self.github_deploy.deploy_cmd.trim().to_string();
         self.github_deploy.deploy_cmd = deploy_cmd.clone();
 
+        let enabled = if self.github_deploy.enabled {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        };
+
         self.session.github_repo = if repo.is_empty() {
             None
         } else {
@@ -1643,6 +1728,7 @@ impl TuiApp {
         } else {
             Some(deploy_cmd.clone())
         };
+        self.session.github_enabled = Some(enabled);
 
         if let Some(ref path) = self.state_path {
             let state = SessionState::new(path);
@@ -1653,7 +1739,8 @@ impl TuiApp {
         }
 
         self.status_message = format!(
-            "Saved GitHub deploy (repo: {}, branch: {})",
+            "Saved GitHub deploy (enabled: {}, repo: {}, branch: {})",
+            if self.github_deploy.enabled { "ON" } else { "OFF" },
             if repo.is_empty() { "(none)" } else { &repo },
             branch
         );
@@ -1760,6 +1847,14 @@ impl TuiApp {
 
     /// Executes the full provision + 6-step setup + optional Cloudflare DNS plan using current options.
     pub fn execute_build(&mut self) {
+        self.execute_build_with_ui(|_| {});
+    }
+
+    /// Executes the build pipeline while invoking `on_update` after each progress milestone.
+    pub fn execute_build_with_ui<F>(&mut self, mut on_update: F)
+    where
+        F: FnMut(&Self),
+    {
         self.save_provider_selection();
         self.save_access_config();
         self.save_cf_dns();
@@ -1770,15 +1865,19 @@ impl TuiApp {
             .copied()
             .map(|s| (s, None))
             .collect();
+        self.last_dry_run_target = None;
         let mode_tag = if self.build_dry_run { "DRY-RUN" } else { "LIVE" };
         self.logs.push(format!(
-            "[BUILD] Starting {} build (provider={}, role={}, transport={}, dns={})",
+            "[BUILD] Starting {} build (provider={}, role={}, transport={}, dns={}, github={})",
             mode_tag,
             provider_display_label(self.selected_provider),
             self.selected_role,
             self.access.transport_mode_str(),
-            if self.cf_dns.enabled { "ON" } else { "OFF" }
+            if self.cf_dns.enabled { "ON" } else { "OFF" },
+            if self.github_deploy.enabled { "ON" } else { "OFF" }
         ));
+        self.status_message = format!("Starting {} build...", mode_tag);
+        on_update(self);
 
         let tailscale_mode = self.is_tailscale_mode();
         let ssh_cred = if !tailscale_mode {
@@ -1788,6 +1887,7 @@ impl TuiApp {
                     let msg = format!("Failed to resolve SSH key: {}", err);
                     self.logs.push(format!("[ERROR] {}", msg));
                     self.status_message = msg;
+                    on_update(self);
                     return;
                 }
             }
@@ -1805,6 +1905,7 @@ impl TuiApp {
                         let msg = "TAILSCALE_API_KEY is not configured for Manual Cloud-Init".to_string();
                         self.logs.push(format!("[ERROR] {}", msg));
                         self.status_message = msg;
+                        on_update(self);
                         return;
                     };
                     match TailscaleClient::new(ts_key).and_then(|c| {
@@ -1815,6 +1916,7 @@ impl TuiApp {
                             let msg = format!("Failed to create Tailscale auth key: {}", err);
                             self.logs.push(format!("[ERROR] {}", msg));
                             self.status_message = msg;
+                            on_update(self);
                             return;
                         }
                     }
@@ -1854,6 +1956,7 @@ impl TuiApp {
                     self.status_message = msg;
                 }
             }
+            on_update(self);
             return;
         }
 
@@ -1874,11 +1977,13 @@ impl TuiApp {
                                 "203.0.113.10".to_string()
                             }
                         });
+                    self.last_dry_run_target = Some(sim_ip.clone());
                     self.logs.push(format!(
                         "[DRY-RUN] Simulated {} provision -> {}",
                         provider_display_label(self.selected_provider),
                         sim_ip
                     ));
+                    on_update(self);
                     sim_ip
                 } else {
                     let env_name = self
@@ -1895,6 +2000,7 @@ impl TuiApp {
                         let msg = format!("{} is not configured", env_name);
                         self.logs.push(format!("[ERROR] {}", msg));
                         self.status_message = msg;
+                        on_update(self);
                         return;
                     };
                     let provider = match build_cloud_provider_with_key(
@@ -1907,6 +2013,7 @@ impl TuiApp {
                             let msg = format!("Failed to initialize provider: {}", err);
                             self.logs.push(format!("[ERROR] {}", msg));
                             self.status_message = msg;
+                            on_update(self);
                             return;
                         }
                     };
@@ -1917,6 +2024,7 @@ impl TuiApp {
                             let msg = "TAILSCALE_API_KEY is not configured".to_string();
                             self.logs.push(format!("[ERROR] {}", msg));
                             self.status_message = msg;
+                            on_update(self);
                             return;
                         };
                         match TailscaleClient::new(ts_key) {
@@ -1925,6 +2033,7 @@ impl TuiApp {
                                 let msg = format!("Failed to initialize Tailscale client: {}", err);
                                 self.logs.push(format!("[ERROR] {}", msg));
                                 self.status_message = msg;
+                                on_update(self);
                                 return;
                             }
                         }
@@ -1932,88 +2041,203 @@ impl TuiApp {
                         None
                     };
 
-                    let region = self
-                        .selected_region
-                        .clone()
-                        .or_else(|| {
-                            default_regions_for(self.selected_provider)
-                                .into_iter()
-                                .next()
-                                .map(|r| r.id)
-                        })
-                        .unwrap_or_default();
-                    let plan = self
-                        .selected_plan
-                        .clone()
-                        .or_else(|| {
-                            default_plans_for(self.selected_provider)
-                                .into_iter()
-                                .next()
-                                .map(|p| p.id)
-                        })
-                        .unwrap_or_default();
-                    let image_id = self
-                        .selected_image
-                        .clone()
-                        .or_else(|| {
-                            default_images_for(self.selected_provider)
-                                .into_iter()
-                                .next()
-                                .map(|i| i.id)
-                        })
-                        .unwrap_or_default();
-
-                    let prov_cfg = ProvisionConfig {
-                        provider: self.selected_provider,
-                        region,
-                        plan,
-                        image_id,
-                        hostname: self.access.hostname.clone(),
-                        username: self.access.username.clone(),
-                        role: self.selected_role.to_string(),
-                        tags: vec!["tag:bab".to_string()],
-                        provider_timeout: Duration::from_secs(300),
-                        tailscale_timeout: Duration::from_secs(300),
-                        poll_interval: Duration::from_secs(5),
-                        tailscale_mode,
-                        ssh_pubkey: ssh_cred.as_ref().map(|(_, pk)| pk.clone()),
-                        ssh_key_path: ssh_cred
-                            .as_ref()
-                            .map(|(p, _)| p.to_string_lossy().into_owned()),
-                    };
-                    let prov_state = self.state_path.as_ref().map(SessionState::new);
-                    match provision_full_flow(
-                        provider.as_ref(),
-                        ts_client.as_ref(),
-                        &prov_cfg,
-                        prov_state.as_ref(),
-                    ) {
-                        Ok(res) => {
-                            self.session.vps_instance_id = Some(res.instance_id.clone());
-                            self.session.public_ip = if res.public_ip.is_empty() {
-                                None
-                            } else {
-                                Some(res.public_ip.clone())
-                            };
-                            self.session.tailscale_ip = if res.tailscale_ip.is_empty() {
-                                None
-                            } else {
-                                Some(res.tailscale_ip.clone())
-                            };
-                            self.session.vps_ip = Some(res.ip.clone());
-                            self.logs.push(format!(
-                                "[PROVISION] {} ready: instance={}, ip={}",
-                                provider_display_label(self.selected_provider),
-                                res.instance_id,
-                                res.ip
-                            ));
-                            res.ip
-                        }
+                    let desired_hostname = self.access.hostname.trim().to_string();
+                    let existing_instance = match provider.list_instances() {
+                        Ok(instances) => instances.into_iter().find(|inst| {
+                            let st = inst.status.trim().to_ascii_lowercase();
+                            let active = st.contains("active")
+                                || st.contains("running")
+                                || st.contains("started");
+                            active && inst.name.trim().eq_ignore_ascii_case(&desired_hostname)
+                        }),
                         Err(err) => {
-                            let msg = format!("Provision failed: {}", err);
-                            self.logs.push(format!("[ERROR] {}", msg));
-                            self.status_message = msg;
-                            return;
+                            self.logs.push(format!(
+                                "[PROVISION] Warning: failed to list existing {} instances ({}); creating new",
+                                provider_display_label(self.selected_provider),
+                                err
+                            ));
+                            on_update(self);
+                            None
+                        }
+                    };
+
+                    if let Some(existing) = existing_instance {
+                        let existing_pub_ip = existing
+                            .public_ip
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("")
+                            .to_string();
+                        self.logs.push(format!(
+                            "[PROVISION] Reusing existing {} instance '{}' (id={}, public_ip={})",
+                            provider_display_label(self.selected_provider),
+                            desired_hostname,
+                            existing.id,
+                            if existing_pub_ip.is_empty() {
+                                "(none)"
+                            } else {
+                                &existing_pub_ip
+                            }
+                        ));
+                        self.session.vps_instance_id = Some(existing.id.clone());
+                        self.session.public_ip = if existing_pub_ip.is_empty() {
+                            None
+                        } else {
+                            Some(existing_pub_ip.clone())
+                        };
+                        self.status_message =
+                            format!("Reusing existing instance '{}'...", desired_hostname);
+                        on_update(self);
+
+                        let resolved_ip = if tailscale_mode {
+                            self.logs.push(format!(
+                                "[PROVISION] Waiting for Tailscale device '{}'...",
+                                desired_hostname
+                            ));
+                            self.status_message =
+                                format!("Waiting for Tailscale device '{}'...", desired_hostname);
+                            on_update(self);
+                            match ts_client.as_ref().expect("tailscale client").wait_for_device(
+                                &desired_hostname,
+                                Duration::from_secs(300),
+                                Duration::from_secs(5),
+                            ) {
+                                Ok(ts_ip) => {
+                                    self.session.tailscale_ip = Some(ts_ip.clone());
+                                    ts_ip
+                                }
+                                Err(err) => {
+                                    let msg = format!(
+                                        "Failed to find Tailscale device '{}': {}",
+                                        desired_hostname, err
+                                    );
+                                    self.logs.push(format!("[ERROR] {}", msg));
+                                    self.status_message = msg;
+                                    on_update(self);
+                                    return;
+                                }
+                            }
+                        } else {
+                            if existing_pub_ip.is_empty() {
+                                let msg = format!(
+                                    "Existing {} instance '{}' has no public IP",
+                                    provider_display_label(self.selected_provider),
+                                    desired_hostname
+                                );
+                                self.logs.push(format!("[ERROR] {}", msg));
+                                self.status_message = msg;
+                                on_update(self);
+                                return;
+                            }
+                            existing_pub_ip
+                        };
+                        self.session.vps_ip = Some(resolved_ip.clone());
+                        if let Some(ref path) = self.state_path {
+                            let _ = SessionState::new(path).save_session(&self.session);
+                        }
+                        on_update(self);
+                        resolved_ip
+                    } else {
+                        let region = self
+                            .selected_region
+                            .clone()
+                            .or_else(|| {
+                                default_regions_for(self.selected_provider)
+                                    .into_iter()
+                                    .next()
+                                    .map(|r| r.id)
+                            })
+                            .unwrap_or_default();
+                        let plan = self
+                            .selected_plan
+                            .clone()
+                            .or_else(|| {
+                                default_plans_for(self.selected_provider)
+                                    .into_iter()
+                                    .next()
+                                    .map(|p| p.id)
+                            })
+                            .unwrap_or_default();
+                        let image_id = self
+                            .selected_image
+                            .clone()
+                            .or_else(|| {
+                                default_images_for(self.selected_provider)
+                                    .into_iter()
+                                    .next()
+                                    .map(|i| i.id)
+                            })
+                            .unwrap_or_default();
+
+                        self.logs.push(format!(
+                            "[PROVISION] Creating {} instance '{}' (region={}, plan={})...",
+                            provider_display_label(self.selected_provider),
+                            self.access.hostname,
+                            region,
+                            plan
+                        ));
+                        self.status_message = format!(
+                            "Provisioning {} instance '{}'...",
+                            provider_display_label(self.selected_provider),
+                            self.access.hostname
+                        );
+                        on_update(self);
+
+                        let prov_cfg = ProvisionConfig {
+                            provider: self.selected_provider,
+                            region,
+                            plan,
+                            image_id,
+                            hostname: self.access.hostname.clone(),
+                            username: self.access.username.clone(),
+                            role: self.selected_role.to_string(),
+                            tags: vec!["tag:bab".to_string()],
+                            provider_timeout: Duration::from_secs(300),
+                            tailscale_timeout: Duration::from_secs(300),
+                            poll_interval: Duration::from_secs(5),
+                            tailscale_mode,
+                            ssh_pubkey: ssh_cred.as_ref().map(|(_, pk)| pk.clone()),
+                            ssh_key_path: ssh_cred
+                                .as_ref()
+                                .map(|(p, _)| p.to_string_lossy().into_owned()),
+                        };
+                        let prov_state = self.state_path.as_ref().map(SessionState::new);
+                        match provision_full_flow(
+                            provider.as_ref(),
+                            ts_client.as_ref(),
+                            &prov_cfg,
+                            prov_state.as_ref(),
+                        ) {
+                            Ok(res) => {
+                                self.session.vps_instance_id = Some(res.instance_id.clone());
+                                self.session.public_ip = if res.public_ip.is_empty() {
+                                    None
+                                } else {
+                                    Some(res.public_ip.clone())
+                                };
+                                self.session.tailscale_ip = if res.tailscale_ip.is_empty() {
+                                    None
+                                } else {
+                                    Some(res.tailscale_ip.clone())
+                                };
+                                self.session.vps_ip = Some(res.ip.clone());
+                                self.logs.push(format!(
+                                    "[PROVISION] {} ready: instance={}, ip={}",
+                                    provider_display_label(self.selected_provider),
+                                    res.instance_id,
+                                    res.ip
+                                ));
+                                on_update(self);
+                                res.ip
+                            }
+                            Err(err) => {
+                                let msg = format!("Provision failed: {}", err);
+                                self.logs.push(format!("[ERROR] {}", msg));
+                                self.status_message = msg;
+                                on_update(self);
+                                return;
+                            }
                         }
                     }
                 }
@@ -2033,24 +2257,30 @@ impl TuiApp {
                     } else {
                         "203.0.113.10".to_string()
                     };
+                    self.last_dry_run_target = Some(sim_ip.clone());
                     self.logs.push(format!(
                         "[DRY-RUN] Simulated Existing Tailscale target -> {}",
                         sim_ip
                     ));
+                    on_update(self);
                     sim_ip
                 } else {
                     let msg = "No target IP (VPS_IP) configured for Existing Tailscale".to_string();
                     self.logs.push(format!("[ERROR] {}", msg));
                     self.status_message = msg;
+                    on_update(self);
                     return;
                 }
             }
             ProviderKind::ManualCloudInit => unreachable!("handled above"),
         };
 
-        let github_deploy = {
+        let github_deploy = if self.github_deploy.enabled {
             let repo = self.github_deploy.repo.trim();
             if repo.is_empty() {
+                self.logs.push(
+                    "[GITHUB] Warning: GitHub Deploy is ON but GITHUB_REPO is empty".to_string(),
+                );
                 None
             } else {
                 let branch = {
@@ -2078,6 +2308,10 @@ impl TuiApp {
                     }
                 };
                 let github_token = self.resolve_api_key(&self.api_keys.github, "GITHUB_TOKEN");
+                self.logs.push(format!(
+                    "[GITHUB] Deploying '{}' (branch: {})",
+                    repo, branch
+                ));
                 Some(GithubDeployConfig {
                     repo: repo.to_string(),
                     branch,
@@ -2087,9 +2321,13 @@ impl TuiApp {
                     username: self.access.username.clone(),
                 })
             }
+        } else {
+            self.logs
+                .push("[GITHUB] GitHub Repo Deploy is OFF (skipped)".to_string());
+            None
         };
 
-        let setup_cfg = SetupConfig {
+        let mut setup_cfg = SetupConfig {
             host: target_ip.clone(),
             ssh_user: "root".to_string(),
             new_username: self.access.username.clone(),
@@ -2118,12 +2356,78 @@ impl TuiApp {
             self.state_path.as_ref().map(SessionState::new)
         };
 
-        if let Err(err) = SetupRunner::new(&transport, state_opt.as_ref())
-            .run_all(&setup_cfg, |report| self.record_step(report))
-        {
+        if !self.build_dry_run {
+            self.logs.push(format!(
+                "[SSH] Waiting for SSH readiness on {}...",
+                target_ip
+            ));
+            self.status_message = format!("Waiting for SSH on {}...", target_ip);
+            on_update(self);
+
+            let poll_ms = std::env::var("BAB_SSH_POLL_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&ms| ms > 0)
+                .unwrap_or(3000);
+            let timeout = Duration::from_secs(120);
+            let poll_interval = Duration::from_millis(poll_ms);
+            let start = std::time::Instant::now();
+
+            let mut candidates: Vec<&str> = vec!["root"];
+            let trimmed_user = self.access.username.trim();
+            if !trimmed_user.is_empty() && trimmed_user != "root" {
+                candidates.push(trimmed_user);
+            }
+
+            let connected_user = loop {
+                let mut found: Option<String> = None;
+                for &user in &candidates {
+                    let probe = if user == "root" {
+                        "if [ -d /var/lib/cloud ]; then test -f /var/lib/cloud/instance/boot-finished; fi"
+                    } else {
+                        "sudo -n true && (test ! -d /var/lib/cloud || test -f /var/lib/cloud/instance/boot-finished)"
+                    };
+                    if let Ok(out) = transport.exec(user, &target_ip, probe) {
+                        if out.success() {
+                            found = Some(user.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(user) = found {
+                    break user;
+                }
+                if start.elapsed() >= timeout {
+                    let msg = format!(
+                        "Timed out waiting for SSH readiness on {} (tried: {})",
+                        target_ip,
+                        candidates.join(", ")
+                    );
+                    self.logs.push(format!("[ERROR] {}", msg));
+                    self.status_message = msg;
+                    on_update(self);
+                    return;
+                }
+                std::thread::sleep(poll_interval);
+            };
+
+            self.logs.push(format!(
+                "[SSH] Connected to {}@{}",
+                connected_user, target_ip
+            ));
+            setup_cfg.ssh_user = connected_user.clone();
+            self.status_message = format!("SSH ready ({}@{})", connected_user, target_ip);
+            on_update(self);
+        }
+
+        if let Err(err) = SetupRunner::new(&transport, state_opt.as_ref()).run_all(&setup_cfg, |report| {
+            self.record_step(report);
+            on_update(self);
+        }) {
             let msg = format!("Build failed: {}", err);
             self.logs.push(format!("[ERROR] {}", msg));
             self.status_message = msg;
+            on_update(self);
             return;
         }
 
@@ -2179,6 +2483,7 @@ impl TuiApp {
         } else {
             format!("Build complete (target: {})", target_ip)
         };
+        on_update(self);
     }
 
     /// Renders the active TUI screen into the given ratatui `Frame`.
@@ -2260,7 +2565,7 @@ impl TuiApp {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::GithubDeploy => {
-                "Up/Down or j/k: Field | Enter/e: Edit | s: Save | Esc/b/q: Back"
+                "Up/Down or j/k: Field | Space/Enter/Left/Right/t: Toggle/Edit | s: Save | Esc/b/q: Back"
             }
             Screen::ApiKeys if self.api_keys.editing => {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing (Auto-Saved)"
@@ -2269,7 +2574,7 @@ impl TuiApp {
                 "Up/Down or j/k: Field | Enter/e: Edit (Auto-Saves) | s: Save | Esc/b/q: Back"
             }
             Screen::BuildBox => {
-                "Enter/x: Start Build | d/Space: Toggle DNS | n: Toggle Dry-Run | Esc/b/q: Back"
+                "Enter/x: Start Build | d/Space: Toggle DNS | g: Toggle GitHub | n: Toggle Dry-Run | Esc/b/q: Back"
             }
             Screen::RunningInstances if self.running_confirm_destroy => {
                 "y/Enter: Confirm Destroy | n/Esc/b/q: Cancel"
@@ -2432,18 +2737,29 @@ impl TuiApp {
                 "Target IP: {} | Public IP: {} | Tailscale IP: {}",
                 vps_ip, public_ip, tailscale_ip
             )),
-            Line::from(format!(
-                "Cloudflare DNS: {} / {} (enabled={}, target={}, proxied={})",
-                cf_zone,
-                cf_record,
-                if self.cf_dns.enabled { "ON" } else { "OFF" },
-                self.cf_dns.target_mode,
-                self.cf_dns.proxied
-            )),
-            Line::from(format!(
-                "GitHub Repo: {} (branch: {})",
-                github_repo, github_branch
-            )),
+            Line::from(vec![
+                Span::raw(format!("Cloudflare DNS: {} / {} (enabled=", cf_zone, cf_record)),
+                Span::styled(
+                    if self.cf_dns.enabled { "ON" } else { "OFF" },
+                    toggle_style(self.cf_dns.enabled),
+                ),
+                Span::raw(format!(
+                    ", target={}, proxied={})",
+                    self.cf_dns.target_mode, self.cf_dns.proxied
+                )),
+            ]),
+            Line::from(vec![
+                Span::raw(format!("GitHub Repo: {} (enabled=", github_repo)),
+                Span::styled(
+                    if self.github_deploy.enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    toggle_style(self.github_deploy.enabled),
+                ),
+                Span::raw(format!(", branch={})", github_branch)),
+            ]),
             Line::from(format!("API Keys: {}", key_ready)),
         ];
         let summary = Paragraph::new(summary_lines)
@@ -2843,10 +3159,6 @@ impl TuiApp {
             "{} — Space/Enter/Left/Right to toggle",
             self.cf_dns.proxied
         );
-        let enabled_display = format!(
-            "{} — Space/Enter/Left/Right or 't' to toggle",
-            if self.cf_dns.enabled { "ON" } else { "OFF" }
-        );
 
         let items = vec![
             ListItem::new(format!(
@@ -2873,10 +3185,14 @@ impl TuiApp {
                 "{} (CF_PROXIED): {}",
                 CF_DNS_FIELD_LABELS[3], proxied_display
             )),
-            ListItem::new(format!(
-                "{} (CF_ENABLED): {}",
-                CF_DNS_FIELD_LABELS[4], enabled_display
-            )),
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{} (CF_ENABLED): ", CF_DNS_FIELD_LABELS[4])),
+                Span::styled(
+                    if self.cf_dns.enabled { "ON" } else { "OFF" },
+                    toggle_style(self.cf_dns.enabled),
+                ),
+                Span::raw(" — Space/Enter/Left/Right or 't' to toggle"),
+            ])),
         ];
 
         let list = List::new(items)
@@ -2931,18 +3247,24 @@ impl TuiApp {
         };
 
         let details = Paragraph::new(vec![
-            Line::from(format!(
-                "CF_ENABLED={} | CF_ZONE={} | CF_RECORD={} | CF_TARGET={} | CF_PROXIED={}",
-                if self.cf_dns.enabled { "ON" } else { "OFF" },
-                if self.cf_dns.zone.trim().is_empty() {
-                    "(not set)"
-                } else {
-                    self.cf_dns.zone.trim()
-                },
-                cfg.record_name,
-                self.cf_dns.target_mode,
-                self.cf_dns.proxied
-            )),
+            Line::from(vec![
+                Span::raw("CF_ENABLED="),
+                Span::styled(
+                    if self.cf_dns.enabled { "ON" } else { "OFF" },
+                    toggle_style(self.cf_dns.enabled),
+                ),
+                Span::raw(format!(
+                    " | CF_ZONE={} | CF_RECORD={} | CF_TARGET={} | CF_PROXIED={}",
+                    if self.cf_dns.zone.trim().is_empty() {
+                        "(not set)"
+                    } else {
+                        self.cf_dns.zone.trim()
+                    },
+                    cfg.record_name,
+                    self.cf_dns.target_mode,
+                    self.cf_dns.proxied
+                )),
+            ]),
             Line::from(format!(
                 "CLOUDFLARE_API_TOKEN: {} | Resolved Target IP: {}",
                 yes_no(has_token),
@@ -3025,6 +3347,18 @@ impl TuiApp {
                 },
                 edit_tag(3)
             )),
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("{} (GITHUB_ENABLED): ", GITHUB_FIELD_LABELS[4])),
+                Span::styled(
+                    if self.github_deploy.enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    toggle_style(self.github_deploy.enabled),
+                ),
+                Span::raw(" — Space/Enter/Left/Right or 't' to toggle"),
+            ])),
         ];
 
         let list = List::new(items)
@@ -3075,15 +3409,26 @@ impl TuiApp {
         };
 
         let preview = Paragraph::new(vec![
-            Line::from(format!(
-                "GITHUB_REPO={} | GITHUB_BRANCH={}",
-                if self.github_deploy.repo.trim().is_empty() {
-                    "(not set)"
-                } else {
-                    self.github_deploy.repo.trim()
-                },
-                effective_branch
-            )),
+            Line::from(vec![
+                Span::raw("GITHUB_ENABLED="),
+                Span::styled(
+                    if self.github_deploy.enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    toggle_style(self.github_deploy.enabled),
+                ),
+                Span::raw(format!(
+                    " | GITHUB_REPO={} | GITHUB_BRANCH={}",
+                    if self.github_deploy.repo.trim().is_empty() {
+                        "(not set)"
+                    } else {
+                        self.github_deploy.repo.trim()
+                    },
+                    effective_branch
+                )),
+            ]),
             Line::from(format!(
                 "GITHUB_TOKEN: {} | Deploy Cmd: {}",
                 yes_no(!self.api_keys.github.is_empty()),
@@ -3230,6 +3575,11 @@ impl TuiApp {
             self.access.ssh_key_path.clone()
         };
         let dns_state = if self.cf_dns.enabled { "ON" } else { "OFF" };
+        let gh_state = if self.github_deploy.enabled {
+            "ON"
+        } else {
+            "OFF"
+        };
         let dns_zone = if self.cf_dns.zone.trim().is_empty() {
             "(not set)"
         } else {
@@ -3292,15 +3642,25 @@ impl TuiApp {
                 self.access.hostname
             )),
             Line::from(format!("SSH Key Path: {}", ssh_key_display)),
-            Line::from(format!(
-                "Cloudflare DNS: {} ({} / {}, target={}, proxied={})  ['d' or Space: Toggle DNS ON/OFF]",
-                dns_state,
-                dns_zone,
-                self.cf_dns.record_name,
-                self.cf_dns.target_mode,
-                self.cf_dns.proxied
-            )),
-            Line::from(format!("GitHub Repo Deploy: {}", gh_repo)),
+            Line::from(vec![
+                Span::raw("Cloudflare DNS: "),
+                Span::styled(dns_state, toggle_style(self.cf_dns.enabled)),
+                Span::raw(format!(
+                    " ({} / {}, target={}, proxied={})  ['d' or Space: Toggle DNS ON/OFF]",
+                    dns_zone,
+                    self.cf_dns.record_name,
+                    self.cf_dns.target_mode,
+                    self.cf_dns.proxied
+                )),
+            ]),
+            Line::from(vec![
+                Span::raw("GitHub Repo Deploy: "),
+                Span::styled(gh_state, toggle_style(self.github_deploy.enabled)),
+                Span::raw(format!(
+                    " ({})  ['g': Toggle GitHub Deploy ON/OFF]",
+                    gh_repo
+                )),
+            ]),
             Line::from(Span::styled(
                 format!("Execution Mode: {}  ['n': Toggle Dry-Run]", exec_mode),
                 Style::default().fg(if self.build_dry_run {
@@ -3322,7 +3682,7 @@ impl TuiApp {
         frame.render_widget(overview, rows[0]);
 
         let actions = Paragraph::new(Line::from(Span::styled(
-            "Enter / 'x': Start Build with Current Options | d/Space: Toggle DNS | n: Toggle Dry-Run | Esc/b/q: Back",
+            "Enter/'x': Start Build | d/Space: Toggle DNS | g: Toggle GitHub | n: Dry-Run | Esc/b/q: Back",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )))
         .block(Block::default().borders(Borders::ALL));
@@ -3505,24 +3865,47 @@ impl TuiApp {
         frame.render_widget(logs, left_rows[2]);
 
         // Right half: Box & Final Connection Info
+        let dry_ip = self.last_dry_run_target.as_deref();
+        let tailscale_mode = self.is_tailscale_mode();
         let public_ip = self
             .session
             .public_ip
             .as_deref()
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("(not set)");
+            .map(String::from)
+            .or_else(|| {
+                if !tailscale_mode {
+                    dry_ip.map(|ip| format!("{} (dry-run)", ip))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "(not set)".to_string());
         let tailscale_ip = self
             .session
             .tailscale_ip
             .as_deref()
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("(not set)");
+            .map(String::from)
+            .or_else(|| {
+                if tailscale_mode {
+                    dry_ip.map(|ip| format!("{} (dry-run)", ip))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "(not set)".to_string());
         let target_ip = self
             .session
             .vps_ip
             .as_deref()
+            .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or("(not set)");
+            .map(String::from)
+            .or_else(|| dry_ip.map(|ip| format!("{} (dry-run)", ip)))
+            .unwrap_or_else(|| "(not set)".to_string());
         let provider = self
             .session
             .vps_provider
@@ -3580,12 +3963,23 @@ impl TuiApp {
             Line::from(format!("Target IP:     {}", target_ip)),
             Line::from(format!("Region/Plan:   {} / {} ({})", region, plan, provider)),
             Line::from(format!("Role/Mode/Usr: {} / {} / {}", role, transport, username)),
-            Line::from(format!(
-                "DNS / Repo:    {} (enabled={}) / {}",
-                dns_zone,
-                if self.cf_dns.enabled { "ON" } else { "OFF" },
-                repo
-            )),
+            Line::from(vec![
+                Span::raw("DNS / Repo:    "),
+                Span::styled(
+                    if self.cf_dns.enabled { "ON" } else { "OFF" },
+                    toggle_style(self.cf_dns.enabled),
+                ),
+                Span::raw(format!(" ({}) / ", dns_zone)),
+                Span::styled(
+                    if self.github_deploy.enabled {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    toggle_style(self.github_deploy.enabled),
+                ),
+                Span::raw(format!(" ({})", repo)),
+            ]),
             Line::from(format!("Keys: {} [ChaCha20-Poly1305, 0600]", key_filename)),
         ];
         let info = Paragraph::new(info_lines).block(
@@ -3679,7 +4073,9 @@ pub fn run_tui(settings_path: Option<&Path>, state_path: Option<&Path>) -> Resul
         }
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(key) = event::read()? {
-                app.handle_key(key);
+                app.handle_key_with_ui(key, |app_state| {
+                    let _ = guard.terminal.draw(|frame| app_state.render_frame(frame));
+                });
                 if app.should_quit {
                     break;
                 }
@@ -3696,11 +4092,15 @@ mod tests {
     use ratatui::backend::TestBackend;
     use tempfile::tempdir;
 
-    fn render_to_string(app: &TuiApp) -> String {
+    fn render_to_buffer(app: &TuiApp) -> ratatui::buffer::Buffer {
         let backend = TestBackend::new(100, 32);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| app.render_frame(frame)).unwrap();
-        let buf = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_to_string(app: &TuiApp) -> String {
+        let buf = render_to_buffer(app);
         let mut out = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
@@ -3711,6 +4111,41 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn assert_token_fg_in_row(
+        buf: &ratatui::buffer::Buffer,
+        line_substr: &str,
+        token: &str,
+        expected_fg: Color,
+    ) {
+        let rel_idx = line_substr
+            .find(token)
+            .expect("token must be contained in line_substr");
+        for y in 0..buf.area.height {
+            let row_str: String = (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                .collect();
+            if let Some(line_idx) = row_str.find(line_substr) {
+                let start_x = row_str[..line_idx].chars().count()
+                    + line_substr[..rel_idx].chars().count();
+                for offset in 0..token.chars().count() {
+                    let cell = buf.cell(((start_x + offset) as u16, y)).unwrap();
+                    assert_eq!(
+                        cell.fg, expected_fg,
+                        "Expected {:?} for '{}' in '{}' at ({}, {}), got {:?}",
+                        expected_fg, token, line_substr, start_x + offset, y, cell.fg
+                    );
+                    assert!(
+                        cell.modifier.contains(Modifier::BOLD),
+                        "Expected BOLD modifier for '{}' in '{}' at ({}, {})",
+                        token, line_substr, start_x + offset, y
+                    );
+                }
+                return;
+            }
+        }
+        panic!("Did not find '{}' in rendered TestBackend buffer", line_substr);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -4811,6 +5246,468 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         let _ = std::net::TcpStream::connect(addr);
         handle.join().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn github_deploy_form_from_session_parses_enabled_variants() {
+        for raw in ["true", " TRUE ", "1", "yes", "On"] {
+            let form = GithubDeployForm::from_session(&SessionData {
+                github_enabled: Some(raw.to_string()),
+                ..Default::default()
+            });
+            assert!(form.enabled, "expected '{}' to enable github_deploy", raw);
+        }
+        for raw in ["false", " False ", "0", "no", "OFF"] {
+            let form = GithubDeployForm::from_session(&SessionData {
+                github_repo: Some("octocat/app".to_string()),
+                github_enabled: Some(raw.to_string()),
+                ..Default::default()
+            });
+            assert!(!form.enabled, "expected '{}' to disable github_deploy", raw);
+        }
+        let fallback_with_repo = GithubDeployForm::from_session(&SessionData {
+            github_repo: Some("octocat/app".to_string()),
+            github_enabled: Some("invalid".to_string()),
+            ..Default::default()
+        });
+        assert!(fallback_with_repo.enabled);
+        let fallback_empty = GithubDeployForm::from_session(&SessionData::default());
+        assert!(!fallback_empty.enabled);
+    }
+
+    #[test]
+    fn toggles_sync_bidirectionally_between_submenus_build_box_home_and_session() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+        let state = SessionState::new(&state_path);
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert!(!app.cf_dns.enabled);
+        assert!(!app.github_deploy.enabled);
+
+        // 1. Toggle CF DNS in CloudflareDns (field 4 Space, then 't' from field 0) -> immediate sync
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.screen, Screen::CloudflareDns);
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.cf_dns.active_field, 4);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.cf_dns.enabled);
+        assert_eq!(app.session.cf_enabled.as_deref(), Some("true"));
+        assert_eq!(state.cf_enabled()?, Some("true".to_string()));
+
+        app.handle_key(key(KeyCode::Down)); // wraps to field 0
+        assert_eq!(app.cf_dns.active_field, 0);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(!app.cf_dns.enabled);
+        assert_eq!(app.session.cf_enabled.as_deref(), Some("false"));
+        assert_eq!(state.cf_enabled()?, Some("false".to_string()));
+
+        // 2. Toggle GitHub Deploy in GithubDeploy (field 4 guards 'e', toggles on Space/Enter/Left/Right, and 't' anywhere)
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Char('5')));
+        assert_eq!(app.screen, Screen::GithubDeploy);
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.github_deploy.active_field, 4);
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(!app.github_deploy.editing);
+
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.github_deploy.enabled);
+        assert_eq!(app.session.github_enabled.as_deref(), Some("true"));
+        assert_eq!(state.github_enabled()?, Some("true".to_string()));
+
+        app.handle_key(key(KeyCode::Right));
+        assert!(!app.github_deploy.enabled);
+        assert_eq!(state.github_enabled()?, Some("false".to_string()));
+
+        app.handle_key(key(KeyCode::Left));
+        assert!(app.github_deploy.enabled);
+        assert_eq!(state.github_enabled()?, Some("true".to_string()));
+
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.github_deploy.enabled);
+        assert_eq!(state.github_enabled()?, Some("false".to_string()));
+
+        app.handle_key(key(KeyCode::Down)); // wraps to field 0
+        assert_eq!(app.github_deploy.active_field, 0);
+        app.handle_key(key(KeyCode::Char('t')));
+        assert!(app.github_deploy.enabled);
+        assert_eq!(state.github_enabled()?, Some("true".to_string()));
+
+        // 3. Toggle both from BuildBox ('d' / Space for DNS, 'g' for GitHub) and verify reverse sync
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('7')));
+        assert_eq!(app.screen, Screen::BuildBox);
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.cf_dns.enabled);
+        assert_eq!(state.cf_enabled()?, Some("true".to_string()));
+
+        app.handle_key(key(KeyCode::Char('g')));
+        assert!(!app.github_deploy.enabled);
+        assert_eq!(state.github_enabled()?, Some("false".to_string()));
+        assert!(app.status_message.contains("GitHub Repo Deploy toggled OFF"));
+
+        // Verify Home and submenus reflect BuildBox toggles
+        app.handle_key(key(KeyCode::Char('q')));
+        let home_view = render_to_string(&app);
+        assert!(home_view.contains("Cloudflare DNS: (not set) / @ (enabled=ON"));
+        assert!(home_view.contains("GitHub Repo: (not set) (enabled=OFF"));
+
+        app.handle_key(key(KeyCode::Char('4')));
+        assert!(render_to_string(&app).contains("CF_ENABLED=ON"));
+        app.handle_key(key(KeyCode::Char('q')));
+        app.handle_key(key(KeyCode::Char('5')));
+        assert!(render_to_string(&app).contains("GITHUB_ENABLED=OFF"));
+
+        // Verify fresh reload from state.conf preserves both states
+        let reloaded = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert!(reloaded.cf_dns.enabled);
+        assert!(!reloaded.github_deploy.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_toggle_indicators_use_light_green_for_on_and_light_red_for_off() {
+        let _lock = crate::env_lock();
+        let mut app = TuiApp::new(
+            SessionData {
+                cf_zone: Some("example.com".to_string()),
+                cf_enabled: Some("true".to_string()),
+                github_repo: Some("octocat/my-app".to_string()),
+                github_enabled: Some("false".to_string()),
+                ..Default::default()
+            },
+            ApiKeyForm::default(),
+        );
+
+        // Home + bottom pane
+        app.screen = Screen::Home;
+        let home_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(&home_buf, "(enabled=ON,", "ON", Color::LightGreen);
+        assert_token_fg_in_row(&home_buf, "(enabled=OFF,", "OFF", Color::LightRed);
+        assert_token_fg_in_row(&home_buf, "DNS / Repo:    ON (example.com)", "ON", Color::LightGreen);
+        assert_token_fg_in_row(&home_buf, "/ OFF (octocat", "OFF", Color::LightRed);
+
+        // CloudflareDns (ON -> LightGreen)
+        app.screen = Screen::CloudflareDns;
+        app.cf_dns.active_field = 0;
+        let cf_on_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(&cf_on_buf, "(CF_ENABLED): ON", "ON", Color::LightGreen);
+        assert_token_fg_in_row(&cf_on_buf, "CF_ENABLED=ON", "ON", Color::LightGreen);
+
+        // CloudflareDns (OFF -> LightRed)
+        app.cf_dns.enabled = false;
+        let cf_off_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(&cf_off_buf, "(CF_ENABLED): OFF", "OFF", Color::LightRed);
+        assert_token_fg_in_row(&cf_off_buf, "CF_ENABLED=OFF", "OFF", Color::LightRed);
+
+        // GithubDeploy (OFF -> LightRed, then ON -> LightGreen)
+        app.screen = Screen::GithubDeploy;
+        app.github_deploy.active_field = 0;
+        let gh_off_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(&gh_off_buf, "(GITHUB_ENABLED): OFF", "OFF", Color::LightRed);
+        assert_token_fg_in_row(&gh_off_buf, "GITHUB_ENABLED=OFF", "OFF", Color::LightRed);
+
+        app.github_deploy.enabled = true;
+        let gh_on_buf = render_to_buffer(&app);
+        assert_token_fg_in_row(&gh_on_buf, "(GITHUB_ENABLED): ON", "ON", Color::LightGreen);
+        assert_token_fg_in_row(&gh_on_buf, "GITHUB_ENABLED=ON", "ON", Color::LightGreen);
+
+        // BuildBox (CF OFF -> LightRed, GH ON -> LightGreen, then flip both)
+        app.screen = Screen::BuildBox;
+        let bb_buf_1 = render_to_buffer(&app);
+        assert_token_fg_in_row(&bb_buf_1, "Cloudflare DNS: OFF", "OFF", Color::LightRed);
+        assert_token_fg_in_row(&bb_buf_1, "GitHub Repo Deploy: ON", "ON", Color::LightGreen);
+
+        app.cf_dns.enabled = true;
+        app.github_deploy.enabled = false;
+        let bb_buf_2 = render_to_buffer(&app);
+        assert_token_fg_in_row(&bb_buf_2, "Cloudflare DNS: ON", "ON", Color::LightGreen);
+        assert_token_fg_in_row(&bb_buf_2, "GitHub Repo Deploy: OFF", "OFF", Color::LightRed);
+    }
+
+    #[test]
+    fn execute_build_skips_github_when_off_warns_when_empty_and_runs_when_on() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.build_dry_run = true;
+        app.github_deploy.repo = "octocat/my-app".to_string();
+        app.github_deploy.enabled = false;
+
+        // 1. GitHub OFF (even with repo configured) -> skipped
+        app.execute_build();
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[BUILD] Starting DRY-RUN build") && l.contains("github=OFF")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[GITHUB] GitHub Repo Deploy is OFF (skipped)")));
+        assert!(!app.logs.iter().any(|l| l.contains("REPO_URL=")));
+
+        // 2. GitHub ON with empty repo -> warning logged
+        app.logs.clear();
+        app.github_deploy.enabled = true;
+        app.github_deploy.repo.clear();
+        app.execute_build();
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[BUILD] Starting DRY-RUN build") && l.contains("github=ON")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[GITHUB] Warning: GitHub Deploy is ON but GITHUB_REPO is empty")));
+        assert!(!app.logs.iter().any(|l| l.contains("REPO_URL=")));
+
+        // 3. GitHub ON with valid repo -> runs GitHub deploy in ConfigureRole
+        app.logs.clear();
+        app.github_deploy.repo = "octocat/my-app".to_string();
+        app.execute_build();
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[BUILD] Starting DRY-RUN build") && l.contains("github=ON")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[GITHUB] Deploying 'octocat/my-app' (branch: main)")));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[DRY-RUN] Configure Server Role (simulated)")));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|l| l.contains("[GITHUB] GitHub Repo Deploy is OFF (skipped)")));
+        let role_script = crate::setup::build_step_script(
+            SetupStepKind::ConfigureRole,
+            &SetupConfig {
+                host: "100.64.0.1".to_string(),
+                ssh_user: "root".to_string(),
+                new_username: app.access.username.clone(),
+                hostname: app.access.hostname.clone(),
+                role: app.selected_role,
+                provider_name: app.selected_provider.to_string(),
+                tailscale_mode: true,
+                ssh_pubkey: None,
+                dry_run: true,
+                github_deploy: Some(GithubDeployConfig {
+                    repo: "octocat/my-app".to_string(),
+                    branch: "main".to_string(),
+                    deploy_path: None,
+                    deploy_cmd: None,
+                    github_token: None,
+                    username: app.access.username.clone(),
+                }),
+            },
+        );
+        assert!(role_script.contains("REPO_URL='https://github.com/octocat/my-app.git'"));
+        Ok(())
+    }
+
+    #[test]
+    fn record_step_dry_run_and_live_summaries_and_bottom_pane_dry_run_target() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+
+        // Dry-run record_step suppresses raw bash script lines
+        app.record_step(&StepReport {
+            step: SetupStepKind::ConfigureMotd,
+            success: true,
+            dry_run: true,
+            output: "chmod +x /etc/profile.d/vps-dashboard.sh\n;;\nesac\n".to_string(),
+        });
+        assert_eq!(
+            app.logs,
+            vec!["[DRY-RUN] Configure MOTD Dashboard (simulated)".to_string()]
+        );
+        assert!(!app
+            .logs
+            .iter()
+            .any(|l| l.contains("chmod +x /etc/profile.d/vps-dashboard.sh") || l.contains("esac")));
+
+        // Live record_step keeps trailing 2 lines on success and trailing 3 lines on failure
+        app.logs.clear();
+        app.record_step(&StepReport {
+            step: SetupStepKind::SystemUpdate,
+            success: true,
+            dry_run: false,
+            output: "line 1\nline 2\nline 3\n\nline 4\n".to_string(),
+        });
+        assert_eq!(
+            app.logs,
+            vec![
+                "[OK] System Update & Base Packages".to_string(),
+                "  line 3".to_string(),
+                "  line 4".to_string(),
+            ]
+        );
+
+        app.logs.clear();
+        app.record_step(&StepReport {
+            step: SetupStepKind::CreateUser,
+            success: false,
+            dry_run: false,
+            output: "err 1\nerr 2\nerr 3\nerr 4\n".to_string(),
+        });
+        assert_eq!(
+            app.logs,
+            vec![
+                "[FAIL] Create Non-Root User & Sudo".to_string(),
+                "  err 2".to_string(),
+                "  err 3".to_string(),
+                "  err 4".to_string(),
+            ]
+        );
+
+        // Execute dry-run build and verify bottom pane shows (dry-run) IP while state.conf stays empty
+        app.logs.clear();
+        app.build_dry_run = true;
+        app.execute_build();
+        assert_eq!(app.last_dry_run_target, Some("100.64.0.1".to_string()));
+        assert!(!app
+            .logs
+            .iter()
+            .any(|l| l.contains("chmod +x /etc/profile.d/vps-dashboard.sh") || l.contains("esac")));
+        let rendered = render_to_string(&app);
+        assert!(rendered.contains("100.64.0.1 (dry-run)"));
+
+        let state = SessionState::new(&state_path);
+        assert_eq!(state.vps_ip()?, None);
+        assert_eq!(state.tailscale_ip()?, None);
+        assert_eq!(state.public_ip()?, None);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_build_with_ui_progressive_updates_and_ssh_user_fallback_via_mock_ssh() -> Result<()> {
+        use std::fs::{self, File};
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct EnvGuard {
+            saved: Vec<(String, Option<String>)>,
+        }
+        impl EnvGuard {
+            fn new(keys: &[&str]) -> Self {
+                Self {
+                    saved: keys
+                        .iter()
+                        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+                        .collect(),
+                }
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, v) in self.saved.drain(..) {
+                    match v {
+                        Some(val) => std::env::set_var(&k, val),
+                        None => std::env::remove_var(&k),
+                    }
+                }
+            }
+        }
+
+        let _lock = crate::env_lock();
+        let _guard = EnvGuard::new(&["BAB_SSH_BIN", "BAB_SSH_POLL_MS"]);
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+        let mock_ssh = dir.path().join("mock-ssh.sh");
+
+        {
+            let mut f = File::create(&mock_ssh)?;
+            writeln!(
+                f,
+                r#"#!/bin/sh
+cat >/dev/null
+case "$*" in
+  *root@*)
+    echo 'tailnet policy does not permit you to SSH as user "root"' >&2
+    exit 255
+    ;;
+  *deploy@*)
+    echo "mock ok line 1"
+    echo "mock ok line 2"
+    echo "mock ok line 3"
+    exit 0
+    ;;
+  *)
+    echo "unexpected target: $*" >&2
+    exit 1
+    ;;
+esac"#
+            )?;
+        }
+        fs::set_permissions(&mock_ssh, fs::Permissions::from_mode(0o755))?;
+        std::env::set_var("BAB_SSH_BIN", &mock_ssh);
+        std::env::set_var("BAB_SSH_POLL_MS", "10");
+
+        let state = SessionState::new(&state_path);
+        state.save_session(&SessionData {
+            vps_provider: Some("existing_tailscale".to_string()),
+            vps_ip: Some("100.64.9.9".to_string()),
+            tailscale_ip: Some("100.64.9.9".to_string()),
+            username: Some("deploy".to_string()),
+            transport_mode: Some("tailscale".to_string()),
+            ..Default::default()
+        })?;
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.build_dry_run = false;
+        app.screen = Screen::BuildBox;
+
+        let mut snapshots: Vec<(usize, String, Option<String>)> = Vec::new();
+        app.handle_key_with_ui(key(KeyCode::Enter), |snapshot| {
+            let completed = snapshot
+                .progress_steps
+                .iter()
+                .filter(|(_, s)| s.is_some())
+                .count();
+            snapshots.push((
+                completed,
+                snapshot.status_message.clone(),
+                snapshot.logs.last().cloned(),
+            ));
+        });
+
+        // Verify progressive callbacks occurred before completion (0 completed -> 1..=6 completed)
+        assert!(snapshots.len() >= 9, "expected >= 9 UI updates, got {}", snapshots.len());
+        assert_eq!(snapshots[0].0, 0);
+        assert!(snapshots.iter().any(|(c, _, _)| *c == 1));
+        assert!(snapshots.iter().any(|(c, _, _)| *c == 3));
+        assert_eq!(snapshots.last().unwrap().0, 6);
+
+        assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[SSH] Connected to deploy@100.64.9.9")));
+        // Only trailing 2 summary lines per passing live step (line 1 omitted)
+        assert!(app.logs.iter().any(|l| l == "  mock ok line 2"));
+        assert!(app.logs.iter().any(|l| l == "  mock ok line 3"));
+        assert!(!app.logs.iter().any(|l| l == "  mock ok line 1"));
         Ok(())
     }
 }

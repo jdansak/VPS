@@ -217,6 +217,12 @@ struct SetupArgs {
     /// Skip Cloudflare DNS stub plan even if enabled in saved session state
     #[arg(long)]
     no_cf_dns: bool,
+    /// Enable GitHub repository deployment using saved session settings
+    #[arg(long, conflicts_with = "no_github_deploy")]
+    github_deploy: bool,
+    /// Skip GitHub repository deployment even if enabled in saved session state
+    #[arg(long)]
+    no_github_deploy: bool,
     /// GitHub repository to deploy (owner/repo, https://..., or git@...)
     #[arg(long, value_name = "REPO")]
     github_repo: Option<String>,
@@ -611,6 +617,7 @@ fn resolve_dry_run_option(
         .or_else(|| catalog_default.filter(|s| !s.trim().is_empty()))
 }
 
+#[cfg(test)]
 fn wait_for_ssh_ready(
     transport: &SshTransport,
     ssh_user: &str,
@@ -618,29 +625,60 @@ fn wait_for_ssh_ready(
     timeout: Duration,
     interval: Duration,
 ) -> Result<()> {
+    wait_for_ssh_ready_with_fallback(transport, ssh_user, None, host, timeout, interval).map(|_| ())
+}
+
+fn wait_for_ssh_ready_with_fallback(
+    transport: &SshTransport,
+    ssh_user: &str,
+    fallback_user: Option<&str>,
+    host: &str,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<String> {
     let deadline = std::time::Instant::now() + timeout;
-    let probe_cmd =
+    let primary_probe_cmd =
         "if [ -d /var/lib/cloud ]; then test -f /var/lib/cloud/instance/boot-finished; fi";
+    let fallback_probe_cmd =
+        "sudo -n true && (test ! -d /var/lib/cloud || test -f /var/lib/cloud/instance/boot-finished)";
+    let fallback = fallback_user
+        .map(str::trim)
+        .filter(|u| !u.is_empty() && *u != ssh_user);
     let mut last_status;
 
     loop {
-        match transport.exec(ssh_user, host, probe_cmd) {
-            Ok(out) if out.success() => return Ok(()),
-            Ok(out) => {
-                last_status = format!("exit code {}", out.status_code);
-            }
-            Err(err) => {
-                last_status = err.to_string();
+        let primary_status = match transport.exec(ssh_user, host, primary_probe_cmd) {
+            Ok(out) if out.success() => return Ok(ssh_user.to_string()),
+            Ok(out) => format!("exit code {}", out.status_code),
+            Err(err) => err.to_string(),
+        };
+        last_status = primary_status.clone();
+
+        if let Some(fb_user) = fallback {
+            match transport.exec(fb_user, host, fallback_probe_cmd) {
+                Ok(out) if out.success() => return Ok(fb_user.to_string()),
+                Ok(out) => {
+                    last_status = format!(
+                        "{}: {}; {}: exit code {}",
+                        ssh_user, primary_status, fb_user, out.status_code
+                    );
+                }
+                Err(err) => {
+                    last_status = format!("{}: {}; {}: {}", ssh_user, primary_status, fb_user, err);
+                }
             }
         }
 
         let now = std::time::Instant::now();
         if now >= deadline {
+            let target_desc = match fallback {
+                Some(fb_user) => format!("{}@{} (or {}@{})", ssh_user, host, fb_user, host),
+                None => format!("{}@{}", ssh_user, host),
+            };
             return Err(anyhow!(
-                "Timed out after {:?} waiting for SSH and cloud-init readiness on {}@{} (last status: {})",
+                "Timed out after {:?} waiting for SSH and cloud-init readiness on {} (last status: {})",
                 timeout,
-                ssh_user,
-                host,
+                target_desc,
                 last_status
             ));
         }
@@ -790,7 +828,127 @@ fn persist_github_session(session: &SessionState, gh: &GithubDeployConfig) -> Re
     session.set_github_branch(&gh.branch)?;
     session.set_github_deploy_path(gh.deploy_path.as_deref().unwrap_or(""))?;
     session.set_github_deploy_cmd(gh.deploy_cmd.as_deref().unwrap_or(""))?;
+    session.set_github_enabled("true")?;
     Ok(())
+}
+
+fn resolve_github_deploy_config(
+    args: &SetupArgs,
+    settings: &Settings,
+    session: &SessionState,
+) -> Result<Option<GithubDeployConfig>> {
+    if args.no_github_deploy {
+        return Ok(None);
+    }
+
+    let explicit_repo = args
+        .github_repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let explicit_branch = args
+        .github_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let explicit_path = args
+        .github_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let explicit_cmd = args
+        .github_cmd
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
+    let resolve_branch = |explicit: Option<String>| -> Result<String> {
+        if let Some(b) = explicit {
+            return Ok(b);
+        }
+        Ok(session
+            .github_branch()?
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("main")
+            .to_string())
+    };
+
+    if let Some(repo) = explicit_repo {
+        let branch = resolve_branch(explicit_branch)?;
+        let github_token = settings
+            .github_token()?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        return Ok(Some(GithubDeployConfig {
+            repo,
+            branch,
+            deploy_path: explicit_path,
+            deploy_cmd: explicit_cmd,
+            github_token,
+            username: args.user.clone(),
+        }));
+    }
+
+    if args.github_deploy || parse_truthy(session.github_enabled()?.as_deref()) {
+        let saved_repo = session
+            .github_repo()?
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        match saved_repo {
+            Some(repo) => {
+                let branch = resolve_branch(explicit_branch)?;
+                let deploy_path = match explicit_path {
+                    Some(p) => Some(p),
+                    None => session
+                        .github_deploy_path()?
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                };
+                let deploy_cmd = match explicit_cmd {
+                    Some(c) => Some(c),
+                    None => session
+                        .github_deploy_cmd()?
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                };
+                let github_token = settings
+                    .github_token()?
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                Ok(Some(GithubDeployConfig {
+                    repo,
+                    branch,
+                    deploy_path,
+                    deploy_cmd,
+                    github_token,
+                    username: args.user.clone(),
+                }))
+            }
+            None if args.github_deploy => Err(anyhow!(
+                "--github-deploy requires GITHUB_REPO in session state (pass --github-repo <REPO> or configure GitHub Repo Deployment first)"
+            )),
+            None => {
+                eprintln!(
+                    "Note: GITHUB_ENABLED is enabled in session state, but GITHUB_REPO is empty; skipping GitHub repository deployment."
+                );
+                Ok(None)
+            }
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 fn parse_truthy(val: Option<&str>) -> bool {
@@ -909,42 +1067,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         )?;
     }
 
-    let github_deploy = args
-        .github_repo
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|repo| -> Result<GithubDeployConfig> {
-            let github_token = settings
-                .github_token()?
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            Ok(GithubDeployConfig {
-                repo: repo.to_string(),
-                branch: args
-                    .github_branch
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("main")
-                    .to_string(),
-                deploy_path: args
-                    .github_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from),
-                deploy_cmd: args
-                    .github_cmd
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(String::from),
-                github_token,
-                username: args.user.clone(),
-            })
-        })
-        .transpose()?;
+    let github_deploy = resolve_github_deploy_config(&args, &settings, &session)?;
 
     let resolved_ssh = if !tailscale_mode {
         Some(resolve_ssh_credentials(
@@ -1225,7 +1348,7 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
         .and_then(|s| s.key_path.clone())
         .unwrap_or_default();
 
-    let cfg = SetupConfig {
+    let mut cfg = SetupConfig {
         host: target.clone(),
         ssh_user: args.ssh_user,
         new_username: args.user.clone(),
@@ -1249,13 +1372,29 @@ fn cmd_setup(args: SetupArgs) -> Result<()> {
             "Waiting for SSH and cloud-init readiness on {}@{}...",
             cfg.ssh_user, cfg.host
         );
-        wait_for_ssh_ready(
+        cfg.ssh_user = wait_for_ssh_ready_with_fallback(
             &transport,
             &cfg.ssh_user,
+            Some(&cfg.new_username),
             &cfg.host,
             Duration::from_secs(180),
             Duration::from_secs(5),
         )?;
+        println!("Connected as {}@{}.", cfg.ssh_user, cfg.host);
+    } else if was_provisioned && tailscale_mode {
+        println!(
+            "Waiting for Tailscale SSH readiness on {}@{} (fallback: {})...",
+            cfg.ssh_user, cfg.host, cfg.new_username
+        );
+        cfg.ssh_user = wait_for_ssh_ready_with_fallback(
+            &transport,
+            &cfg.ssh_user,
+            Some(&cfg.new_username),
+            &cfg.host,
+            Duration::from_secs(60),
+            Duration::from_secs(3),
+        )?;
+        println!("Connected as {}@{}.", cfg.ssh_user, cfg.host);
     }
 
     let runner = SetupRunner::new(&transport, Some(&session));
@@ -2877,5 +3016,208 @@ mod tests {
         }
 
         assert!(Cli::try_parse_from(["bab", "setup", "--cf-dns", "--no-cf-dns"]).is_err());
+    }
+
+    #[test]
+    fn parse_setup_github_deploy_flags() {
+        let def = Cli::try_parse_from(["bab", "setup"]).unwrap();
+        match def.command {
+            Some(Commands::Setup(args)) => {
+                assert!(!args.github_deploy);
+                assert!(!args.no_github_deploy);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let gh_on = Cli::try_parse_from(["bab", "setup", "--github-deploy"]).unwrap();
+        match gh_on.command {
+            Some(Commands::Setup(args)) => {
+                assert!(args.github_deploy);
+                assert!(!args.no_github_deploy);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let gh_off = Cli::try_parse_from(["bab", "setup", "--no-github-deploy"]).unwrap();
+        match gh_off.command {
+            Some(Commands::Setup(args)) => {
+                assert!(!args.github_deploy);
+                assert!(args.no_github_deploy);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        assert!(
+            Cli::try_parse_from(["bab", "setup", "--github-deploy", "--no-github-deploy"]).is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_github_deploy_config_respects_flags_and_session() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = SessionState::new(dir.path().join("state.conf"));
+        let settings = Settings::new(dir.path().join("settings.conf"));
+
+        let parse_setup = |argv: &[&str]| -> SetupArgs {
+            match Cli::try_parse_from(argv).unwrap().command {
+                Some(Commands::Setup(args)) => args,
+                other => panic!("unexpected command: {:?}", other),
+            }
+        };
+
+        // Empty session, no flags -> None.
+        let args_default = parse_setup(&["bab", "setup"]);
+        assert!(resolve_github_deploy_config(&args_default, &settings, &state)?.is_none());
+
+        // --github-deploy with empty GITHUB_REPO -> clear error.
+        let args_on = parse_setup(&["bab", "setup", "--github-deploy"]);
+        let err = resolve_github_deploy_config(&args_on, &settings, &state).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--github-deploy requires GITHUB_REPO in session state"),
+            "unexpected error: {}",
+            err
+        );
+
+        // GITHUB_ENABLED=true with empty GITHUB_REPO -> Ok(None) (Note printed to stderr).
+        state.set_github_enabled("true")?;
+        assert!(resolve_github_deploy_config(&args_default, &settings, &state)?.is_none());
+
+        // Explicit --github-repo with no saved GITHUB_BRANCH defaults branch to "main".
+        let args_fresh = parse_setup(&["bab", "setup", "--github-repo", "owner/fresh"]);
+        let cfg_fresh = resolve_github_deploy_config(&args_fresh, &settings, &state)?.unwrap();
+        assert_eq!(cfg_fresh.repo, "owner/fresh");
+        assert_eq!(cfg_fresh.branch, "main");
+
+        // Seed saved GitHub session with GITHUB_ENABLED=false.
+        state.set_github_repo("owner/saved")?;
+        state.set_github_branch("release")?;
+        state.set_github_deploy_path("/srv/saved")?;
+        state.set_github_deploy_cmd("make run")?;
+        state.set_github_enabled("false")?;
+
+        // Disabled in session without --github-deploy -> None.
+        assert!(resolve_github_deploy_config(&args_default, &settings, &state)?.is_none());
+
+        // --github-deploy uses saved session values (and CLI overrides like --github-branch).
+        let args_on_branch =
+            parse_setup(&["bab", "setup", "--github-deploy", "--github-branch", "hotfix"]);
+        let cfg_on = resolve_github_deploy_config(&args_on_branch, &settings, &state)?.unwrap();
+        assert_eq!(cfg_on.repo, "owner/saved");
+        assert_eq!(cfg_on.branch, "hotfix");
+        assert_eq!(cfg_on.deploy_path.as_deref(), Some("/srv/saved"));
+        assert_eq!(cfg_on.deploy_cmd.as_deref(), Some("make run"));
+
+        // Explicit --github-repo takes precedence even when GITHUB_ENABLED=false,
+        // defaulting branch to saved GITHUB_BRANCH.
+        let args_explicit = parse_setup(&["bab", "setup", "--github-repo", "owner/explicit"]);
+        let cfg_explicit = resolve_github_deploy_config(&args_explicit, &settings, &state)?.unwrap();
+        assert_eq!(cfg_explicit.repo, "owner/explicit");
+        assert_eq!(cfg_explicit.branch, "release");
+        assert_eq!(cfg_explicit.deploy_path, None);
+        assert_eq!(cfg_explicit.deploy_cmd, None);
+
+        // persist_github_session sets GITHUB_ENABLED=true.
+        persist_github_session(&state, &cfg_explicit)?;
+        assert_eq!(state.github_enabled()?.as_deref(), Some("true"));
+
+        // Enabled in session with no flags -> uses saved session.
+        let cfg_saved = resolve_github_deploy_config(&args_default, &settings, &state)?.unwrap();
+        assert_eq!(cfg_saved.repo, "owner/explicit");
+        assert_eq!(cfg_saved.branch, "release");
+
+        // --no-github-deploy skips even when GITHUB_ENABLED=true or --github-repo is given.
+        let args_off = parse_setup(&["bab", "setup", "--no-github-deploy"]);
+        assert!(resolve_github_deploy_config(&args_off, &settings, &state)?.is_none());
+        let args_off_with_repo = parse_setup(&[
+            "bab",
+            "setup",
+            "--no-github-deploy",
+            "--github-repo",
+            "owner/ignored",
+        ]);
+        assert!(resolve_github_deploy_config(&args_off_with_repo, &settings, &state)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn wait_for_ssh_ready_with_fallback_switches_to_fallback_user() -> Result<()> {
+        let _lock = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+        let dir = tempfile::tempdir()?;
+        let attempts_file = dir.path().join("attempts.log");
+        let count_file = dir.path().join("deploy_count.txt");
+        let mock_ssh = dir.path().join("mock_ssh_fallback.sh");
+
+        write_mock_ssh_script(
+            &mock_ssh,
+            &format!(
+                "#!/bin/sh\nuser=\"\"\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    *@*) user=\"${{arg%%@*}}\" ;;\n  esac\ndone\neval \"last=\\$$#\"\necho \"$user|$last\" >> '{attempts}'\nif [ \"$user\" = \"root\" ]; then\n  echo 'tailnet policy does not permit you to SSH as \"root\"' >&2\n  exit 255\nfi\nif [ \"$user\" = \"deploy\" ]; then\n  c=$(cat '{count}' 2>/dev/null || echo 0)\n  c=$((c + 1))\n  echo \"$c\" > '{count}'\n  if [ \"$c\" -lt 2 ]; then\n    exit 1\n  fi\n  exit 0\nfi\nexit 1\n",
+                attempts = attempts_file.display(),
+                count = count_file.display(),
+            ),
+        )?;
+
+        let _guard = EnvVarGuard::set("BAB_SSH_BIN", mock_ssh.as_os_str());
+        let transport = SshTransport::from_env(TransportMode::Tailscale);
+
+        let connected = wait_for_ssh_ready_with_fallback(
+            &transport,
+            "root",
+            Some("deploy"),
+            "100.64.0.10",
+            Duration::from_secs(2),
+            Duration::from_millis(10),
+        )?;
+        assert_eq!(connected, "deploy");
+
+        let log = std::fs::read_to_string(&attempts_file)?;
+        assert!(
+            log.contains("root|if [ -d /var/lib/cloud ]; then test -f /var/lib/cloud/instance/boot-finished; fi"),
+            "missing root probe in log:\n{}",
+            log
+        );
+        assert!(
+            log.contains("deploy|sudo -n true && (test ! -d /var/lib/cloud || test -f /var/lib/cloud/instance/boot-finished)"),
+            "missing deploy fallback probe in log:\n{}",
+            log
+        );
+
+        // When primary succeeds immediately, fallback is not needed and primary user is returned.
+        let mock_ssh_ok = dir.path().join("mock_ssh_primary_ok.sh");
+        write_mock_ssh_script(&mock_ssh_ok, "#!/bin/sh\nexit 0\n")?;
+        let _guard_ok = EnvVarGuard::set("BAB_SSH_BIN", mock_ssh_ok.as_os_str());
+        let transport_ok = SshTransport::from_env(TransportMode::Tailscale);
+        let connected_primary = wait_for_ssh_ready_with_fallback(
+            &transport_ok,
+            "root",
+            Some("deploy"),
+            "100.64.0.10",
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )?;
+        assert_eq!(connected_primary, "root");
+
+        // Timeout reports both users clearly.
+        let mock_ssh_fail = dir.path().join("mock_ssh_both_fail.sh");
+        write_mock_ssh_script(&mock_ssh_fail, "#!/bin/sh\nexit 1\n")?;
+        let _guard_fail = EnvVarGuard::set("BAB_SSH_BIN", mock_ssh_fail.as_os_str());
+        let transport_fail = SshTransport::from_env(TransportMode::Tailscale);
+        let err = wait_for_ssh_ready_with_fallback(
+            &transport_fail,
+            "root",
+            Some("deploy"),
+            "203.0.113.10",
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Timed out"), "unexpected error: {}", msg);
+        assert!(
+            msg.contains("root@203.0.113.10 (or deploy@203.0.113.10)"),
+            "unexpected error: {}",
+            msg
+        );
+        Ok(())
     }
 }

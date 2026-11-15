@@ -9,10 +9,10 @@
   1. **Select Provider, Location & Size**
   2. **Select Server Role**
   3. **Access, User & Transport**
-  4. **Cloudflare DNS** (includes `CF_ENABLED` ON/OFF toggle)
-  5. **GitHub Repo Deployment**
+  4. **Cloudflare DNS** (includes synced `CF_ENABLED` ON/OFF toggle)
+  5. **GitHub Repo Deployment** (includes synced `GITHUB_ENABLED` ON/OFF toggle)
   6. **API Key Settings** (auto-saves encrypted keys as you edit)
-  7. **Build Box with Current Options** (`Screen::BuildBox`): review current configuration, toggle Cloudflare DNS ON/OFF (`d` / `Space`), toggle Dry-Run (`n`), and run provisioning + setup (`Enter` / `x`).
+  7. **Build Box with Current Options** (`Screen::BuildBox`): review current configuration, toggle Cloudflare DNS ON/OFF (`d` / `Space`) and GitHub Repo Deployment ON/OFF (`g`), toggle Dry-Run (`n`), and run provisioning + setup (`Enter` / `x`). Bright green (`ON`) and bright red (`OFF`) toggle indicators stay synced across **Cloudflare DNS**, **GitHub Repo Deployment**, and **Build Box with Current Options**.
   8. **Running Systems & Destroy** (`Screen::RunningInstances`): query live instances across configured Vultr, UpCloud, and Linode accounts (`r` to refresh), inspect status/IPs/region/plan, and destroy selected instances (`d` / `x` / `Delete` with `y`/`Enter` confirmation).
   9. **Quit** (`9` or `q` on the Home screen).
   - **Consistent Back Navigation**: Pressing `q`, `Esc`, or `b` from any submenu returns to the **Home** screen instead of exiting the application (when not editing a field or confirming an action).
@@ -34,8 +34,9 @@
   - Enable or skip the Cloudflare DNS step during `bab setup` with `--cf-dns` (uses saved `CF_ZONE` / `CF_RECORD` / `CF_TARGET` / `CF_PROXIED`) or `--no-cf-dns`, or toggle `CF_ENABLED` ON/OFF directly on the TUI **Cloudflare DNS** (`t`) and **Build Box with Current Options** (`d` / `Space`) screens.
 - **Cross-Provider Instance Listing & Destruction**:
   - Query running instances across Vultr, UpCloud, and Akamai/Linode in the TUI (**Running Systems & Destroy**) or via `bab instances` (aliases `ps`, `list`; supports `--provider`, `--all`, `--destroy <ID>`, `-y/--yes`) and `bab destroy` (aliases `rm`, `delete`; supports `--id <ID>`, `--provider`, `-y/--yes`, `--dry-run`). UpCloud servers that are still running are automatically stopped (`POST /1.3/server/<id>/stop`) before deletion, and matching active session state in `state.conf` is cleared automatically.
-- **GitHub Repository Deployment**:
+- **GitHub Repository Deployment & Toggle**:
   - Clone/update and deploy public or private GitHub repositories idempotently with `bab deploy --repo <REPO> [--branch <BRANCH>] [--path <PATH>] [--cmd <CMD>]`, via `--github-repo` flags on `bab setup`, or in the TUI under **GitHub Repo Deployment**. Private repositories authenticate using the stored `GITHUB_TOKEN` via an ephemeral `0700` `GIT_ASKPASS` helper script cleaned up on exit.
+  - Enable or skip GitHub deployment during `bab setup` with `--github-deploy` (uses saved `GITHUB_REPO` / `GITHUB_BRANCH` / `GITHUB_DEPLOY_PATH` / `GITHUB_DEPLOY_CMD`) or `--no-github-deploy`, or toggle `GITHUB_ENABLED` ON/OFF directly on the TUI **GitHub Repo Deployment** (`t`) and **Build Box with Current Options** (`g`) screens (with synced bright green `ON` / bright red `OFF` styling matching **Cloudflare DNS**).
 - **Automatic Encrypted API Key Persistence**:
   - API keys and tokens (`TAILSCALE_API_KEY`, `VULTR_API_KEY`, `UPCLOUD_API_TOKEN`, `LINODE_API_TOKEN`, `CLOUDFLARE_API_TOKEN`, `GITHUB_TOKEN`) are encrypted at rest with **ChaCha20-Poly1305** (`enc:v1:`) in `~/.config/bab/credentials.enc` (`0600`) using an auto-generated `~/.config/bab/master.key` (`0600`) inside `~/.config/bab` (`0700`), or deterministically derived from `BAB_ENCRYPTION_KEY`.
   - Any API keys supplied via environment variables are automatically encrypted and persisted to `credentials.enc` whenever `Settings::load_default()` runs (on CLI invocations and TUI startup), and edits in the TUI **API Key Settings** screen are automatically encrypted and saved (or removed from `credentials.enc` when cleared) as you finish editing without needing to press `s`.
@@ -115,6 +116,10 @@ bab dns --zone example.com --record app --proxied
 bab setup --provider existing --cf-dns --dry-run
 bab setup --provider existing --no-cf-dns --dry-run
 
+# Run setup using saved GitHub deployment settings (--github-deploy) or skip GitHub deploy (--no-github-deploy)
+bab setup --provider existing --github-deploy --dry-run
+bab setup --provider existing --no-github-deploy --dry-run
+
 # List running instances across configured cloud providers (aliases: ps, list)
 bab instances
 bab ps --provider vultr --all
@@ -137,7 +142,7 @@ bab status
 - **`~/.config/bab/`** (`0700`): Default configuration directory (override with `BAB_CONFIG_DIR` or legacy `BAB_SSH_DIR` / `VPSKIT_SSH_DIR` / `SSH_DIR`).
 - **`~/.config/bab/credentials.enc`** (`0600`): `ChaCha20-Poly1305` (`enc:v1:`) encrypted API keys and tokens (`TAILSCALE_API_KEY`, `VULTR_API_KEY`, `UPCLOUD_API_TOKEN`, `LINODE_API_TOKEN`, `CLOUDFLARE_API_TOKEN`, `GITHUB_TOKEN`; override path with `BAB_SETTINGS_FILE`).
 - **`~/.config/bab/master.key`** (`0600`): Auto-generated 256-bit base64 master key used for `credentials.enc` (override path with `BAB_MASTER_KEY_FILE`, or set `BAB_ENCRYPTION_KEY` to derive the key from a passphrase instead of using `master.key`).
-- **`~/.config/bab/state.conf`** (`0600`): Saved session state including `VPS_IP`, `PUBLIC_IP`, `TAILSCALE_IP`, `SSH_KEY`, `USERNAME`, `TRANSPORT_MODE`, `VPS_PROVIDER`, `VPS_INSTANCE_ID`, `VPS_REGION`, `VPS_PLAN`, `VPS_IMAGE`, `TAILSCALE_HOSTNAME`, `SERVER_ROLE`, `CF_ZONE`, `CF_RECORD`, `CF_TARGET`, `CF_PROXIED`, `CF_ENABLED`, `GITHUB_REPO`, `GITHUB_BRANCH`, `GITHUB_DEPLOY_PATH`, `GITHUB_DEPLOY_CMD` (override path with `BAB_STATE_FILE`).
+- **`~/.config/bab/state.conf`** (`0600`): Saved session state including `VPS_IP`, `PUBLIC_IP`, `TAILSCALE_IP`, `SSH_KEY`, `USERNAME`, `TRANSPORT_MODE`, `VPS_PROVIDER`, `VPS_INSTANCE_ID`, `VPS_REGION`, `VPS_PLAN`, `VPS_IMAGE`, `TAILSCALE_HOSTNAME`, `SERVER_ROLE`, `CF_ZONE`, `CF_RECORD`, `CF_TARGET`, `CF_PROXIED`, `CF_ENABLED`, `GITHUB_REPO`, `GITHUB_BRANCH`, `GITHUB_DEPLOY_PATH`, `GITHUB_DEPLOY_CMD`, `GITHUB_ENABLED` (override path with `BAB_STATE_FILE`).
 - **`BAB_SSH_BIN` / `BAB_SCP_BIN` / `BAB_SSH_KEYGEN_BIN`**: Optional binary overrides for SSH/SCP/`ssh-keygen` execution and testing.
 
 ## Testing

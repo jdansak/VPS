@@ -456,7 +456,7 @@ AUTH_KEYS="${{SSH_DIR}}/authorized_keys"
 mkdir -p "${{SSH_DIR}}"
 if [ -s /root/.ssh/authorized_keys ]; then
     cp /root/.ssh/authorized_keys "${{AUTH_KEYS}}"
-elif [ "${{SSH_USER}}" != "root" ] && [ -s "/home/${{SSH_USER}}/.ssh/authorized_keys" ]; then
+elif [ "${{SSH_USER}}" != "root" ] && [ "${{SSH_USER}}" != "${{NEW_USER}}" ] && [ -s "/home/${{SSH_USER}}/.ssh/authorized_keys" ]; then
     cp "/home/${{SSH_USER}}/.ssh/authorized_keys" "${{AUTH_KEYS}}"
 else
     touch "${{AUTH_KEYS}}"
@@ -741,6 +741,24 @@ fn combine_command_output(stdout: &str, stderr: &str) -> String {
     }
 }
 
+fn root_fallback_user<'a>(
+    ssh_user: &str,
+    candidate_user: &'a str,
+    combined_output: &str,
+) -> Option<&'a str> {
+    let candidate = candidate_user.trim();
+    if ssh_user == "root"
+        && !candidate.is_empty()
+        && candidate != "root"
+        && (combined_output.contains("tailnet policy does not permit")
+            || combined_output.contains("Permission denied"))
+    {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 /// Executes the 6-step setup pipeline over an `SshTransport`.
 pub struct SetupRunner<'a> {
     transport: &'a SshTransport,
@@ -767,10 +785,11 @@ impl<'a> SetupRunner<'a> {
         }
 
         let mut reports = Vec::with_capacity(SetupStepKind::all().len());
+        let mut active_ssh_user = cfg.ssh_user.clone();
 
         for &step in SetupStepKind::all() {
-            let script = build_step_script(step, cfg);
             if cfg.dry_run {
+                let script = build_step_script(step, cfg);
                 let report = StepReport {
                     step,
                     success: true,
@@ -782,10 +801,28 @@ impl<'a> SetupRunner<'a> {
                 continue;
             }
 
-            let out = self.transport.exec(&cfg.ssh_user, &cfg.host, &script)?;
+            let mut step_cfg = cfg.clone();
+            step_cfg.ssh_user = active_ssh_user.clone();
+            let script = build_step_script(step, &step_cfg);
+
+            let mut out = self.transport.exec(&active_ssh_user, &cfg.host, &script)?;
+            let mut combined_output = combine_command_output(&out.stdout, &out.stderr);
+            if !out.success() {
+                if let Some(fallback_user) =
+                    root_fallback_user(&active_ssh_user, &cfg.new_username, &combined_output)
+                {
+                    active_ssh_user = fallback_user.to_string();
+                    step_cfg.ssh_user = active_ssh_user.clone();
+                    let retry_script = build_step_script(step, &step_cfg);
+                    out = self
+                        .transport
+                        .exec(&active_ssh_user, &cfg.host, &retry_script)?;
+                    combined_output = combine_command_output(&out.stdout, &out.stderr);
+                }
+            }
+
             let success = out.success();
             let status_code = out.status_code;
-            let combined_output = combine_command_output(&out.stdout, &out.stderr);
             let report = StepReport {
                 step,
                 success,
@@ -829,8 +866,17 @@ impl<'a> SetupRunner<'a> {
             return Ok(script);
         }
 
-        let out = self.transport.exec(ssh_user, host, &script)?;
-        let combined_output = combine_command_output(&out.stdout, &out.stderr);
+        let mut out = self.transport.exec(ssh_user, host, &script)?;
+        let mut combined_output = combine_command_output(&out.stdout, &out.stderr);
+        if !out.success() {
+            if let Some(fallback_user) =
+                root_fallback_user(ssh_user, &cfg.username, &combined_output)
+            {
+                let retry_script = wrap_root_script(fallback_user, &body);
+                out = self.transport.exec(fallback_user, host, &retry_script)?;
+                combined_output = combine_command_output(&out.stdout, &out.stderr);
+            }
+        }
         if !out.success() {
             return Err(anyhow!(
                 "github deploy failed (exit {}): {}",
@@ -1296,6 +1342,144 @@ mod tests {
         assert!(out.contains("MOCK_SSH_OK"));
         let log_content = fs::read_to_string(&log_file)?;
         assert!(log_content.contains("root@100.64.0.50"));
+        Ok(())
+    }
+
+    #[test]
+    fn create_user_guards_against_self_copy_authorized_keys() {
+        let mut cfg = sample_config(ServerRole::Vanilla, "deploy", false);
+        cfg.new_username = "deploy".to_string();
+        let script = build_step_script(SetupStepKind::CreateUser, &cfg);
+        assert_bash_syntax_ok(&script, "create-user-self-copy-guard");
+        assert!(script.contains(
+            r#"elif [ "${SSH_USER}" != "root" ] && [ "${SSH_USER}" != "${NEW_USER}" ] && [ -s "/home/${SSH_USER}/.ssh/authorized_keys" ]; then"#
+        ));
+    }
+
+    #[test]
+    fn mock_ssh_falls_back_from_root_to_new_username_on_tailscale_policy_denial() -> Result<()> {
+        let dir = tempdir()?;
+        let log_file = dir.path().join("ssh_calls.log");
+        let mock_ssh = dir.path().join("policy_denying_ssh");
+        {
+            let mut f = File::create(&mock_ssh)?;
+            writeln!(f, "#!/usr/bin/env bash")?;
+            writeln!(f, "set -euo pipefail")?;
+            writeln!(f, "SCRIPT=\"${{!#}}\"")?;
+            writeln!(f, "TARGET=\"\"")?;
+            writeln!(f, "for arg in \"$@\"; do case \"$arg\" in *@*) TARGET=\"$arg\" ;; esac; done")?;
+            writeln!(
+                f,
+                "HAS_SUDO=no; if printf '%s' \"$SCRIPT\" | grep -q 'sudo bash -s'; then HAS_SUDO=yes; fi"
+            )?;
+            writeln!(
+                f,
+                "printf 'CALL:%s|SUDO:%s\\n' \"$TARGET\" \"$HAS_SUDO\" >> \"{}\"",
+                log_file.display()
+            )?;
+            writeln!(
+                f,
+                "if [ \"$TARGET\" = 'root@100.64.0.50' ]; then"
+            )?;
+            writeln!(
+                f,
+                "    echo 'tailnet policy does not permit you to SSH as root' >&2"
+            )?;
+            writeln!(f, "    exit 255")?;
+            writeln!(f, "fi")?;
+            writeln!(f, "echo 'FALLBACK_OK'")?;
+        }
+        fs::set_permissions(&mock_ssh, fs::Permissions::from_mode(0o755))?;
+
+        let state_path = dir.path().join(".bab-local");
+        let state = SessionState::new(&state_path);
+        let transport = SshTransport::with_bins(TransportMode::Tailscale, &mock_ssh, &mock_ssh);
+        let runner = SetupRunner::new(&transport, Some(&state));
+
+        let mut cfg = sample_config(ServerRole::Vanilla, "root", false);
+        cfg.new_username = "  deploy  ".to_string();
+        let mut progressed = Vec::new();
+        let reports = runner.run_all(&cfg, |r| progressed.push((r.step, r.success)))?;
+
+        assert_eq!(reports.len(), 6);
+        assert_eq!(progressed.len(), 6);
+        for (idx, report) in reports.iter().enumerate() {
+            assert_eq!(report.step, SetupStepKind::all()[idx]);
+            assert!(report.success);
+            assert!(!report.dry_run);
+            assert_eq!(report.output.trim(), "FALLBACK_OK");
+        }
+
+        let log_content = fs::read_to_string(&log_file)?;
+        let lines: Vec<&str> = log_content.lines().collect();
+        assert_eq!(lines.len(), 7);
+        assert!(lines[0].contains("root@100.64.0.50") && lines[0].ends_with("|SUDO:no"));
+        for line in &lines[1..] {
+            assert!(line.contains("deploy@100.64.0.50") && line.ends_with("|SUDO:yes"));
+        }
+
+        assert_eq!(state.server_role()?, Some(ServerRole::Vanilla.to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn mock_ssh_deploy_github_falls_back_from_root_to_deploy_user() -> Result<()> {
+        for denial_msg in [
+            "tailnet policy does not permit you to SSH as root",
+            "Permission denied (publickey).",
+        ] {
+            let dir = tempdir()?;
+            let log_file = dir.path().join("ssh_calls.log");
+            let mock_ssh = dir.path().join("policy_denying_ssh");
+            {
+                let mut f = File::create(&mock_ssh)?;
+                writeln!(f, "#!/usr/bin/env bash")?;
+                writeln!(f, "set -euo pipefail")?;
+                writeln!(f, "SCRIPT=\"${{!#}}\"")?;
+                writeln!(f, "TARGET=\"\"")?;
+                writeln!(f, "for arg in \"$@\"; do case \"$arg\" in *@*) TARGET=\"$arg\" ;; esac; done")?;
+                writeln!(
+                    f,
+                    "HAS_SUDO=no; if printf '%s' \"$SCRIPT\" | grep -q 'sudo bash -s'; then HAS_SUDO=yes; fi"
+                )?;
+                writeln!(
+                    f,
+                    "printf 'CALL:%s|SUDO:%s\\n' \"$TARGET\" \"$HAS_SUDO\" >> \"{}\"",
+                    log_file.display()
+                )?;
+                writeln!(
+                    f,
+                    "if [ \"$TARGET\" = 'root@100.64.0.50' ]; then"
+                )?;
+                writeln!(f, "    echo '{}' >&2", denial_msg)?;
+                writeln!(f, "    exit 255")?;
+                writeln!(f, "fi")?;
+                writeln!(f, "echo 'DEPLOY_FALLBACK_OK'")?;
+            }
+            fs::set_permissions(&mock_ssh, fs::Permissions::from_mode(0o755))?;
+
+            let transport =
+                SshTransport::with_bins(TransportMode::Tailscale, &mock_ssh, &mock_ssh);
+            let runner = SetupRunner::new(&transport, None);
+
+            let gh = GithubDeployConfig {
+                repo: "acme/demo".to_string(),
+                branch: "main".to_string(),
+                deploy_path: None,
+                deploy_cmd: Some("echo deployed".to_string()),
+                github_token: None,
+                username: " deploy ".to_string(),
+            };
+
+            let out = runner.deploy_github("root", "100.64.0.50", &gh, false)?;
+            assert_eq!(out.trim(), "DEPLOY_FALLBACK_OK");
+
+            let log_content = fs::read_to_string(&log_file)?;
+            let lines: Vec<&str> = log_content.lines().collect();
+            assert_eq!(lines.len(), 2);
+            assert!(lines[0].contains("root@100.64.0.50") && lines[0].ends_with("|SUDO:no"));
+            assert!(lines[1].contains("deploy@100.64.0.50") && lines[1].ends_with("|SUDO:yes"));
+        }
         Ok(())
     }
 }
