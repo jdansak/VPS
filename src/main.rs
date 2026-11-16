@@ -2109,11 +2109,15 @@ fn ensure_cloud_provider(kind: ProviderKind, action: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_instances_table(instances: &[ProviderInstance]) {
+fn format_instances_table_with(
+    instances: &[ProviderInstance],
+    format_cost: impl Fn(&ProviderInstance) -> String,
+) -> String {
     if instances.is_empty() {
-        println!("No instances found.");
-        return;
+        return "No instances found.\n".to_string();
     }
+
+    let costs: Vec<String> = instances.iter().map(format_cost).collect();
 
     let mut w_prov = "PROVIDER".len();
     let mut w_id = "ID".len();
@@ -2122,8 +2126,9 @@ fn print_instances_table(instances: &[ProviderInstance]) {
     let mut w_ip = "PUBLIC IP".len();
     let mut w_region = "REGION".len();
     let mut w_plan = "PLAN".len();
+    let mut w_cost = "COST".len();
 
-    for inst in instances {
+    for (inst, cost) in instances.iter().zip(&costs) {
         w_prov = w_prov.max(inst.provider.label().len());
         w_id = w_id.max(inst.id.len());
         w_name = w_name.max(inst.name.len());
@@ -2131,15 +2136,18 @@ fn print_instances_table(instances: &[ProviderInstance]) {
         w_ip = w_ip.max(inst.public_ip.as_deref().unwrap_or("-").len());
         w_region = w_region.max(inst.region.as_deref().unwrap_or("-").len());
         w_plan = w_plan.max(inst.plan.as_deref().unwrap_or("-").len());
+        w_cost = w_cost.max(cost.len());
     }
 
-    println!(
-        "{:<w_prov$}  {:<w_id$}  {:<w_name$}  {:<w_status$}  {:<w_ip$}  {:<w_region$}  {:<w_plan$}",
-        "PROVIDER", "ID", "NAME", "STATUS", "PUBLIC IP", "REGION", "PLAN"
+    use std::fmt::Write;
+    let mut out = format!(
+        "{:<w_prov$}  {:<w_id$}  {:<w_name$}  {:<w_status$}  {:<w_ip$}  {:<w_region$}  {:<w_plan$}  {:<w_cost$}\n",
+        "PROVIDER", "ID", "NAME", "STATUS", "PUBLIC IP", "REGION", "PLAN", "COST"
     );
-    for inst in instances {
-        println!(
-            "{:<w_prov$}  {:<w_id$}  {:<w_name$}  {:<w_status$}  {:<w_ip$}  {:<w_region$}  {:<w_plan$}",
+    for (inst, cost) in instances.iter().zip(&costs) {
+        let _ = writeln!(
+            out,
+            "{:<w_prov$}  {:<w_id$}  {:<w_name$}  {:<w_status$}  {:<w_ip$}  {:<w_region$}  {:<w_plan$}  {:<w_cost$}",
             inst.provider.label(),
             inst.id,
             inst.name,
@@ -2147,8 +2155,25 @@ fn print_instances_table(instances: &[ProviderInstance]) {
             inst.public_ip.as_deref().unwrap_or("-"),
             inst.region.as_deref().unwrap_or("-"),
             inst.plan.as_deref().unwrap_or("-"),
+            cost,
         );
     }
+    out
+}
+
+fn format_instances_table(instances: &[ProviderInstance]) -> String {
+    format_instances_table_with(instances, ProviderInstance::format_running_cost_detailed)
+}
+
+#[cfg(test)]
+fn format_instances_table_at(instances: &[ProviderInstance], now_epoch_secs: i64) -> String {
+    format_instances_table_with(instances, |inst| {
+        inst.format_running_cost_detailed_at(now_epoch_secs)
+    })
+}
+
+fn print_instances_table(instances: &[ProviderInstance]) {
+    print!("{}", format_instances_table(instances));
 }
 
 fn resolve_provider_for_instance(
@@ -4037,5 +4062,74 @@ mod tests {
             .iter()
             .any(|l| l.contains("[WARN] Failed to check/remove Tailscale device")));
         Ok(())
+    }
+
+    #[test]
+    fn format_instances_table_includes_aligned_cost_column() {
+        assert_eq!(format_instances_table(&[]), "No instances found.\n");
+
+        let instances = vec![
+            ProviderInstance {
+                provider: ProviderKind::Vultr,
+                id: "v-1".to_string(),
+                name: "web-1".to_string(),
+                status: "active".to_string(),
+                public_ip: Some("203.0.113.10".to_string()),
+                region: Some("ewr".to_string()),
+                plan: Some("vc2-1c-1gb".to_string()),
+                created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            ProviderInstance {
+                provider: ProviderKind::UpCloud,
+                id: "uc-2".to_string(),
+                name: "vpn-2".to_string(),
+                status: "started".to_string(),
+                public_ip: None,
+                region: Some("de-fra1".to_string()),
+                plan: Some("1xCPU-2GB".to_string()),
+                created_at: None,
+            },
+            ProviderInstance {
+                provider: ProviderKind::Linode,
+                id: "lin-3".to_string(),
+                name: "custom-3".to_string(),
+                status: "running".to_string(),
+                public_ip: Some("198.51.100.3".to_string()),
+                region: Some("us-east".to_string()),
+                plan: Some("custom-unknown".to_string()),
+                created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+        ];
+
+        // 2026-01-01T00:15:00Z => 15m elapsed since 2026-01-01T00:00:00Z.
+        let now_epoch =
+            bab::providers::parse_created_at_epoch_secs("2026-01-01T00:15:00Z").unwrap();
+        let table = format_instances_table_at(&instances, now_epoch);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 4);
+
+        let header = lines[0];
+        assert!(header.contains("PLAN"));
+        assert!(header.contains("COST"));
+        let cost_col_idx = header.find("COST").unwrap();
+        for line in &lines {
+            assert_eq!(line.len(), header.len(), "unaligned row: {:?}", line);
+        }
+        assert!(lines[1][cost_col_idx..].starts_with("$0.01 (15m @ $0.007/hr, $5/mo)"));
+        assert_eq!(lines[2][cost_col_idx..].trim_end(), "$10/mo ($0.015/hr)");
+        assert_eq!(lines[3][cost_col_idx..].trim_end(), "-");
+
+        // Real-clock wrapper also renders COST column with known/unknown plan pricing.
+        let live_table = format_instances_table(&instances[1..]);
+        let live_lines: Vec<&str> = live_table.lines().collect();
+        assert_eq!(live_lines.len(), 3);
+        let live_cost_idx = live_lines[0].find("COST").unwrap();
+        assert_eq!(live_lines[1].len(), live_lines[0].len());
+        assert_eq!(live_lines[2].len(), live_lines[0].len());
+        assert_eq!(
+            live_lines[1][live_cost_idx..].trim_end(),
+            "$10/mo ($0.015/hr)"
+        );
+        assert_eq!(live_lines[2][live_cost_idx..].trim_end(), "-");
     }
 }

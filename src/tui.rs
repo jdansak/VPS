@@ -25,9 +25,9 @@ use crate::config::{
 use crate::dns::{build_cloudflare_dns_stub_plan, CloudflareDnsConfig};
 use crate::providers::{
     build_cloud_provider_with_key, clear_destroyed_session_if_matches, default_images_for,
-    default_plans_for, default_regions_for, destroy_provider_instance_with_key,
-    provision_full_flow_with_progress, query_providers_with_keys, ProviderInstance, ProviderKind,
-    ProviderQueryStatus, ProvisionConfig, VpsProvider,
+    default_plans_for, default_regions_for, destroy_provider_instance_with_key, format_hourly_usd,
+    format_monthly_usd, plan_pricing, provision_full_flow_with_progress, query_providers_with_keys,
+    ProviderInstance, ProviderKind, ProviderQueryStatus, ProvisionConfig, VpsProvider,
 };
 use crate::roles::ServerRole;
 use crate::setup::{
@@ -4172,11 +4172,23 @@ impl TuiApp {
                     .unwrap_or("(not set)")
             )
         } else {
+            let plan_display = match self.selected_plan.as_deref() {
+                Some(plan) => match plan_pricing(self.selected_provider, plan) {
+                    Some(p) => format!(
+                        "{} ({}, {})",
+                        plan,
+                        format_monthly_usd(p.monthly_usd),
+                        format_hourly_usd(p.hourly_usd)
+                    ),
+                    None => plan.to_string(),
+                },
+                None => "-".to_string(),
+            };
             format!(
                 "Provider: {} | Region: {} | Plan: {} | Image: {}",
                 provider_display_label(self.selected_provider),
                 self.selected_region.as_deref().unwrap_or("-"),
-                self.selected_plan.as_deref().unwrap_or("-"),
+                plan_display,
                 self.selected_image.as_deref().unwrap_or("-"),
             )
         };
@@ -4346,13 +4358,13 @@ impl TuiApp {
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
+                Constraint::Length(6),
                 Constraint::Min(6),
                 Constraint::Length(4),
             ])
             .split(area);
 
-        let status_lines: Vec<Line> = if self.running_statuses.is_empty() {
+        let mut status_lines: Vec<Line> = if self.running_statuses.is_empty() {
             vec![Line::from("No provider query run yet (press 'r' to refresh).")]
         } else {
             self.running_statuses
@@ -4374,6 +4386,15 @@ impl TuiApp {
                 })
                 .collect()
         };
+        if let Some(total_cost) = running_instances_total_cost_summary_at(&self.running_instances, None)
+        {
+            status_lines.push(Line::from(Span::styled(
+                total_cost,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         let status_widget = Paragraph::new(status_lines)
             .block(
                 Block::default()
@@ -4400,6 +4421,7 @@ impl TuiApp {
                 "IP",
                 "REGION",
                 "PLAN",
+                "COST",
                 "SUDO PASS",
             ])
             .style(
@@ -4426,19 +4448,21 @@ impl TuiApp {
                         ip.to_string(),
                         region.to_string(),
                         plan.to_string(),
+                        inst.format_running_cost_compact(),
                         pass_display,
                     ])
                 })
                 .collect();
             let widths = [
-                Constraint::Length(9),
-                Constraint::Min(14),
-                Constraint::Min(10),
                 Constraint::Length(8),
-                Constraint::Length(16),
+                Constraint::Min(11),
+                Constraint::Min(9),
                 Constraint::Length(7),
-                Constraint::Length(11),
+                Constraint::Length(15),
+                Constraint::Length(6),
+                Constraint::Length(10),
                 Constraint::Length(12),
+                Constraint::Length(10),
             ];
             let table = Table::new(table_rows, widths)
                 .header(header)
@@ -4480,8 +4504,11 @@ impl TuiApp {
                     .map(|pw| self.masked_or_plain_password(&pw))
                     .unwrap_or_else(|| "-".to_string());
                 format!(
-                    "Selected: {} ({}) | Sudo Password: {}",
-                    inst.name, inst.id, pw_display
+                    "Selected: {} ({}) | Cost: {} | Sudo Password: {}",
+                    inst.name,
+                    inst.id,
+                    inst.format_running_cost_detailed(),
+                    pw_display
                 )
             } else {
                 "Selected: (none)".to_string()
@@ -4713,10 +4740,30 @@ impl TuiApp {
             .and_then(|n| n.to_str())
             .unwrap_or("credentials.enc");
 
+        let pricing_provider = if self.session.vps_plan.is_some() {
+            self.session
+                .vps_provider
+                .as_deref()
+                .and_then(|s| ProviderKind::from_str(s).ok())
+                .unwrap_or(self.selected_provider)
+        } else {
+            self.selected_provider
+        };
+        let region_plan_line = match plan_pricing(pricing_provider, plan) {
+            Some(p) => format!(
+                "Region/Plan:   {} / {} ({}) ({})",
+                region,
+                plan,
+                provider,
+                format_monthly_usd(p.monthly_usd)
+            ),
+            None => format!("Region/Plan:   {} / {} ({})", region, plan, provider),
+        };
+
         let info_lines = vec![
             Line::from(format!("Public IP:     {} | Target: {}", public_ip, target_ip)),
             Line::from(format!("Tailscale IP:  {}", tailscale_ip)),
-            Line::from(format!("Region/Plan:   {} / {} ({})", region, plan, provider)),
+            Line::from(region_plan_line),
             Line::from(vec![
                 Span::raw(format!("Role/Mode/Usr: {}/{}/{} (", role, transport, username)),
                 Span::styled(
@@ -4758,6 +4805,51 @@ impl TuiApp {
                 .borders(Borders::ALL),
         );
         frame.render_widget(info, cols[1]);
+    }
+}
+
+fn running_instances_total_cost_summary_at(
+    instances: &[ProviderInstance],
+    now_epoch_secs: Option<i64>,
+) -> Option<String> {
+    if instances.is_empty() {
+        return None;
+    }
+    let mut has_known = false;
+    let mut has_accrued = false;
+    let mut total_accrued = 0.0_f64;
+    let mut total_monthly = 0.0_f64;
+    let mut total_hourly = 0.0_f64;
+
+    for inst in instances {
+        let est = match now_epoch_secs {
+            Some(now) => inst.cost_estimate_at(now),
+            None => inst.cost_estimate(),
+        };
+        if let Some(est) = est {
+            has_known = true;
+            total_monthly += est.monthly_usd;
+            total_hourly += est.hourly_usd;
+            if let Some(accrued) = est.accrued_usd {
+                has_accrued = true;
+                total_accrued += accrued;
+            }
+        }
+    }
+
+    if !has_known {
+        return None;
+    }
+
+    let monthly = format_monthly_usd(total_monthly);
+    let hourly = format_hourly_usd(total_hourly);
+    if has_accrued {
+        Some(format!(
+            "Total Cost: ${:.2} accrued ({}, {})",
+            total_accrued, monthly, hourly
+        ))
+    } else {
+        Some(format!("Total Cost: {}, {}", monthly, hourly))
     }
 }
 
@@ -4913,8 +5005,11 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
-    fn render_to_string(app: &TuiApp) -> String {
-        let buf = render_to_buffer(app);
+    fn render_with_size_to_string(w: u16, h: u16, draw: impl FnOnce(&mut Frame)) -> String {
+        let backend = TestBackend::new(w, h);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(draw).unwrap();
+        let buf = terminal.backend().buffer().clone();
         let mut out = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
@@ -4925,6 +5020,10 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn render_to_string(app: &TuiApp) -> String {
+        render_with_size_to_string(100, 32, |frame| app.render_frame(frame))
     }
 
     fn assert_token_fg_in_row(
@@ -6038,6 +6137,10 @@ mod tests {
         assert!(list_view.contains("edge-box"));
         assert!(list_view.contains("vultr-101"));
         assert!(list_view.contains("203.0.113.77"));
+        assert!(list_view.contains("COST"));
+        assert!(list_view.contains("$5/mo"));
+        assert!(list_view.contains("Total Cost: $5/mo, $0.007/hr"));
+        assert!(list_view.contains("Cost: $5/mo ($0.007/hr)"));
 
         // d -> n cancels confirmation without destroying or quitting
         app.handle_key(key(KeyCode::Char('d')));
@@ -6873,9 +6976,12 @@ esac"#
 
         let small = render_dims(80, 24, false);
         assert!(small.contains("Provider:"));
+        assert!(small.contains("Plan: vc2-1c-1gb ($5/mo, $0.007/hr)"));
         assert!(small.contains("Passwordless Sudo: OFF (password required)"));
         assert!(small.contains("Credentials:"));
         assert!(small.contains("p: Sudo"));
+        assert!(large.contains("Plan: vc2-1c-1gb ($5/mo, $0.007/hr)"));
+        assert!(large.contains("Region/Plan:   ewr / vc2-1c-1gb (Vultr) ($5/mo)"));
         Ok(())
     }
 
@@ -7205,6 +7311,9 @@ esac"#
 
         let masked = render_to_string(&app);
         assert!(masked.contains("SUDO PASS"));
+        assert!(masked.contains("COST"));
+        assert!(masked.contains("Total Cost: $5/mo, $0.007/hr"));
+        assert!(masked.contains("Cost: $5/mo ($0.007/hr)"));
         assert!(masked.contains("••••••••••"));
         assert!(masked.contains("w: Show/Hide Pass"));
         assert!(!masked.contains("AbCdEf1234"));
@@ -7214,6 +7323,14 @@ esac"#
         assert!(app.show_password);
         let plain = render_to_string(&app);
         assert!(plain.contains("AbCdEf1234"));
+        let plain_large = render_with_size_to_string(120, 40, |frame| app.render_frame(frame));
+        assert!(plain_large.contains("AbCdEf1234"));
+        assert!(plain_large.contains("Cost: $5/mo ($0.007/hr)"));
+        let plain_small = render_with_size_to_string(80, 24, |frame| {
+            app.render_running_instances(frame, frame.area());
+        });
+        assert!(plain_small.contains("Total Cost: $5/mo, $0.007/hr"));
+        assert!(plain_small.contains("w: Show/Hide Pass"));
 
         // Destroy instance -> deletes cloud VM AND removes matching Tailscale device
         app.handle_key(key(KeyCode::Char('d')));
@@ -7998,5 +8115,280 @@ esac"#
             Some("ReusePass1")
         );
         Ok(())
+    }
+
+    #[test]
+    fn running_instances_total_cost_summary_handles_accrued_recurring_and_unknown() {
+        let base_epoch = 1_700_000_000_i64;
+        assert_eq!(running_instances_total_cost_summary_at(&[], Some(base_epoch)), None);
+
+        let unknown_only = vec![ProviderInstance {
+            provider: ProviderKind::Vultr,
+            id: "v-unknown".to_string(),
+            name: "unknown-plan".to_string(),
+            status: "active".to_string(),
+            public_ip: None,
+            region: Some("ewr".to_string()),
+            plan: Some("mystery-tier".to_string()),
+            created_at: Some((base_epoch - 900).to_string()),
+        }];
+        assert_eq!(
+            running_instances_total_cost_summary_at(&unknown_only, Some(base_epoch)),
+            None
+        );
+
+        let recurring_only = vec![
+            ProviderInstance {
+                provider: ProviderKind::Vultr,
+                id: "v-1".to_string(),
+                name: "v-box".to_string(),
+                status: "active".to_string(),
+                public_ip: None,
+                region: Some("ewr".to_string()),
+                plan: Some("vc2-1c-1gb".to_string()),
+                created_at: None,
+            },
+            ProviderInstance {
+                provider: ProviderKind::Linode,
+                id: "l-1".to_string(),
+                name: "l-box".to_string(),
+                status: "running".to_string(),
+                public_ip: None,
+                region: Some("us-east".to_string()),
+                plan: Some("g6-nanode-1".to_string()),
+                created_at: None,
+            },
+        ];
+        assert_eq!(
+            running_instances_total_cost_summary_at(&recurring_only, Some(base_epoch)).as_deref(),
+            Some("Total Cost: $10/mo, $0.0145/hr")
+        );
+
+        let mixed_with_accrued = vec![
+            ProviderInstance {
+                provider: ProviderKind::Vultr,
+                id: "v-1".to_string(),
+                name: "v-box".to_string(),
+                status: "active".to_string(),
+                public_ip: None,
+                region: Some("ewr".to_string()),
+                plan: Some("vc2-1c-1gb".to_string()),
+                created_at: Some((base_epoch - 9_000).to_string()),
+            },
+            ProviderInstance {
+                provider: ProviderKind::Vultr,
+                id: "v-2".to_string(),
+                name: "v-box-2".to_string(),
+                status: "active".to_string(),
+                public_ip: None,
+                region: Some("ewr".to_string()),
+                plan: Some("vc2-1c-1gb".to_string()),
+                created_at: Some((base_epoch - 900).to_string()),
+            },
+            unknown_only[0].clone(),
+        ];
+        assert_eq!(
+            running_instances_total_cost_summary_at(&mixed_with_accrued, Some(base_epoch))
+                .as_deref(),
+            Some("Total Cost: $0.03 accrued ($10/mo, $0.014/hr)")
+        );
+    }
+
+    #[test]
+    fn running_instances_renders_cost_column_total_cost_and_selected_cost_across_sizes() {
+        let _lock = crate::env_lock();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let recent_created = (now_secs - 10).to_string();
+
+        let mut app = TuiApp::new(SessionData::default(), ApiKeyForm::default());
+        app.screen = Screen::RunningInstances;
+        app.running_statuses = vec![
+            ProviderQueryStatus {
+                provider: ProviderKind::Vultr,
+                configured: true,
+                instance_count: 1,
+                error: None,
+            },
+            ProviderQueryStatus {
+                provider: ProviderKind::UpCloud,
+                configured: false,
+                instance_count: 0,
+                error: None,
+            },
+            ProviderQueryStatus {
+                provider: ProviderKind::Linode,
+                configured: true,
+                instance_count: 1,
+                error: None,
+            },
+        ];
+        app.running_instances = vec![
+            ProviderInstance {
+                provider: ProviderKind::Vultr,
+                id: "vultr-101".to_string(),
+                name: "edge-box-01".to_string(),
+                status: "running".to_string(),
+                public_ip: Some("203.0.113.77".to_string()),
+                region: Some("ewr".to_string()),
+                plan: Some("vc2-1c-1gb".to_string()),
+                created_at: Some(recent_created.clone()),
+            },
+            ProviderInstance {
+                provider: ProviderKind::Linode,
+                id: "lin-202".to_string(),
+                name: "linode-node".to_string(),
+                status: "running".to_string(),
+                public_ip: Some("198.51.100.42".to_string()),
+                region: Some("eu-uk".to_string()),
+                plan: Some("g6-nanode-1".to_string()),
+                created_at: Some(recent_created),
+            },
+        ];
+        app.running_index = 0;
+
+        for (w, h, full_frame) in [(100, 32, true), (120, 40, true), (80, 24, false)] {
+            let rendered = render_with_size_to_string(w, h, |frame| {
+                if full_frame {
+                    app.render_frame(frame);
+                } else {
+                    app.render_running_instances(frame, frame.area());
+                }
+            });
+            assert!(
+                rendered.contains("Total Cost: $0.01 accrued ($10/mo, $0.0145/hr)"),
+                "missing Total Cost line at {}x{}: {}",
+                w,
+                h,
+                rendered
+            );
+            assert!(
+                rendered.contains("COST"),
+                "missing COST header at {}x{}",
+                w,
+                h
+            );
+            assert!(
+                rendered.contains("w: Show/Hide Pass"),
+                "missing action footer at {}x{}",
+                w,
+                h
+            );
+            if w >= 100 {
+                assert!(
+                    rendered.contains("SUDO PASS"),
+                    "missing SUDO PASS header at {}x{}",
+                    w,
+                    h
+                );
+                assert!(
+                    rendered.contains("$0.01/$5/mo"),
+                    "compact cost truncated at {}x{}: {}",
+                    w,
+                    h,
+                    rendered
+                );
+                assert!(
+                    rendered.contains(
+                        "Selected: edge-box-01 (vultr-101) | Cost: $0.01 (<1m @ $0.007/hr, $5/mo) | Sudo Password: -"
+                    ),
+                    "detailed selected cost clipped at {}x{}: {}",
+                    w,
+                    h,
+                    rendered
+                );
+            } else {
+                assert!(
+                    rendered.contains("Selected: edge-box-01 (vultr-101) | Cost: $0.01"),
+                    "selected cost missing at {}x{}: {}",
+                    w,
+                    h,
+                    rendered
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_box_and_bottom_pane_render_plan_pricing_cleanly() {
+        let _lock = crate::env_lock();
+
+        // Standard Vultr preset fits cleanly at 80x24, 100x32, and 120x40
+        let mut vultr_app = TuiApp::new(SessionData::default(), ApiKeyForm::default());
+        vultr_app.screen = Screen::BuildBox;
+
+        for (w, h, full_frame) in [(100, 32, true), (120, 40, true), (80, 24, false)] {
+            let view = render_with_size_to_string(w, h, |frame| {
+                if full_frame {
+                    vultr_app.render_frame(frame);
+                } else {
+                    vultr_app.render_build_box(frame, frame.area());
+                }
+            });
+            assert!(
+                view.contains("Plan: vc2-1c-1gb ($5/mo, $0.007/hr)"),
+                "BuildBox missing Vultr pricing at {}x{}: {}",
+                w,
+                h,
+                view
+            );
+            if full_frame {
+                assert!(
+                    view.contains("Region/Plan:   ewr / vc2-1c-1gb (Vultr) ($5/mo)"),
+                    "BottomPane missing Vultr monthly price at {}x{}: {}",
+                    w,
+                    h,
+                    view
+                );
+            }
+        }
+
+        // Linode plan pricing displays 4-decimal hourly rate in BuildBox and monthly in BottomPane
+        let mut linode_view_app = TuiApp::new(
+            SessionData {
+                vps_provider: Some("linode".to_string()),
+                vps_region: Some("us-east".to_string()),
+                vps_plan: Some("g6-nanode-1".to_string()),
+                ..Default::default()
+            },
+            ApiKeyForm::default(),
+        );
+        linode_view_app.screen = Screen::BuildBox;
+        let linode_view = render_to_string(&linode_view_app);
+        assert!(linode_view.contains("Plan: g6-nanode-1 ($5/mo, $0.0075/hr)"));
+        assert!(linode_view.contains("Region/Plan:   us-east / g6-nanode-1 (linode) ($5/mo)"));
+
+        // Unknown plan falls back cleanly without appending pricing parentheses
+        let mut unknown_plan_app = TuiApp::new(
+            SessionData {
+                vps_provider: Some("vultr".to_string()),
+                vps_region: Some("ewr".to_string()),
+                vps_plan: Some("custom-tier".to_string()),
+                ..Default::default()
+            },
+            ApiKeyForm::default(),
+        );
+        unknown_plan_app.screen = Screen::BuildBox;
+        let unknown_view = render_to_string(&unknown_plan_app);
+        assert!(unknown_view.contains("Plan: custom-tier | Image:"));
+        assert!(unknown_view.contains("Region/Plan:   ewr / custom-tier (vultr)"));
+        assert!(!unknown_view.contains("/mo"));
+
+        // ExistingTailscale omits plan pricing and displays Target IP
+        let mut ts_app = TuiApp::new(
+            SessionData {
+                vps_provider: Some("existing_tailscale".to_string()),
+                vps_ip: Some("100.64.10.20".to_string()),
+                ..Default::default()
+            },
+            ApiKeyForm::default(),
+        );
+        ts_app.screen = Screen::BuildBox;
+        let ts_view = render_to_string(&ts_app);
+        assert!(ts_view.contains("Provider: Existing Tailscale | Target IP: 100.64.10.20"));
+        assert!(ts_view.contains("Region/Plan:   - / - (existing_tailscale)"));
+        assert!(!ts_view.contains("/mo"));
     }
 }

@@ -198,6 +198,8 @@ struct PlanItem {
     disk: u32,
     #[serde(default, deserialize_with = "deserialize_flexible_f64")]
     monthly_cost: f64,
+    #[serde(default, deserialize_with = "deserialize_flexible_f64")]
+    hourly_cost: f64,
 }
 
 #[derive(Deserialize)]
@@ -343,15 +345,19 @@ impl VpsProvider for VultrProvider {
         let plans = data
             .plans
             .into_iter()
-            .map(|p| ProviderPlan {
-                id: p.id,
-                summary: format!(
-                    "{}vCPU {}MB {}GB ${}/mo",
-                    p.vcpu_count,
-                    p.ram,
-                    p.disk,
-                    p.monthly_cost
-                ),
+            .map(|p| {
+                let summary = if p.hourly_cost.is_finite() && p.hourly_cost > 0.0 {
+                    format!(
+                        "{}vCPU {}MB {}GB ${}/mo (${:.3}/hr)",
+                        p.vcpu_count, p.ram, p.disk, p.monthly_cost, p.hourly_cost
+                    )
+                } else {
+                    format!(
+                        "{}vCPU {}MB {}GB ${}/mo",
+                        p.vcpu_count, p.ram, p.disk, p.monthly_cost
+                    )
+                };
+                ProviderPlan { id: p.id, summary }
             })
             .collect();
         Ok(plans)
@@ -544,17 +550,68 @@ mod tests {
     fn plan_item_deserializes_flexible_numbers() {
         let raw = r#"{
             "plans": [
-                {"id": "vc2-1c-1gb", "vcpu_count": 1, "ram": 1024, "disk": 25, "monthly_cost": 5},
-                {"id": "vc2-1c-2gb", "vcpu_count": "2", "ram": 2048, "disk": "55", "monthly_cost": "10.5"},
+                {"id": "vc2-1c-1gb", "vcpu_count": 1, "ram": 1024, "disk": 25, "monthly_cost": 5, "hourly_cost": 0.007},
+                {"id": "vc2-1c-2gb", "vcpu_count": "2", "ram": 2048, "disk": "55", "monthly_cost": "10.5", "hourly_cost": "0.014"},
                 {"id": "vc2-free", "vcpu_count": 1, "ram": 512, "disk": 10, "monthly_cost": null}
             ]
         }"#;
         let parsed: PlansResponse = serde_json::from_str(raw).unwrap();
         assert_eq!(parsed.plans[0].monthly_cost, 5.0);
+        assert_eq!(parsed.plans[0].hourly_cost, 0.007);
         assert_eq!(parsed.plans[1].vcpu_count, 2);
         assert_eq!(parsed.plans[1].disk, 55);
         assert_eq!(parsed.plans[1].monthly_cost, 10.5);
+        assert_eq!(parsed.plans[1].hourly_cost, 0.014);
         assert_eq!(parsed.plans[2].monthly_cost, 0.0);
+        assert_eq!(parsed.plans[2].hourly_cost, 0.0);
+    }
+
+    #[test]
+    fn list_plans_includes_hourly_cost_when_positive() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut req_line = String::new();
+            reader.read_line(&mut req_line).unwrap();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.trim().is_empty() {
+                    break;
+                }
+            }
+            let body = r#"{
+                "plans": [
+                    {"id": "vc2-1c-1gb", "vcpu_count": 1, "ram": 1024, "disk": 25, "monthly_cost": 5, "hourly_cost": 0.007},
+                    {"id": "vc2-1c-0.5gb-free", "vcpu_count": 1, "ram": 512, "disk": 10, "monthly_cost": 0, "hourly_cost": 0}
+                ]
+            }"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let provider = VultrProvider::with_base_url("test-key", format!("http://{}/v2", addr))?;
+        let plans = provider.list_plans()?;
+        handle.join().unwrap();
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].id, "vc2-1c-1gb");
+        assert_eq!(plans[0].summary, "1vCPU 1024MB 25GB $5/mo ($0.007/hr)");
+        assert_eq!(plans[1].id, "vc2-1c-0.5gb-free");
+        assert_eq!(plans[1].summary, "1vCPU 512MB 10GB $0/mo");
+        Ok(())
     }
 
     #[test]

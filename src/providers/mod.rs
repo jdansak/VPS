@@ -163,19 +163,19 @@ pub fn default_plans_for(kind: ProviderKind) -> Vec<ProviderPlan> {
         ProviderKind::UpCloud => vec![
             ProviderPlan {
                 id: "1xCPU-1GB".into(),
-                summary: "1 vCPU, 1024 MB RAM, 25 GB SSD".into(),
+                summary: "1 vCPU, 1024 MB RAM, 25 GB SSD ($5/mo)".into(),
             },
             ProviderPlan {
                 id: "1xCPU-2GB".into(),
-                summary: "1 vCPU, 2048 MB RAM, 50 GB SSD".into(),
+                summary: "1 vCPU, 2048 MB RAM, 50 GB SSD ($10/mo)".into(),
             },
             ProviderPlan {
                 id: "2xCPU-4GB".into(),
-                summary: "2 vCPU, 4096 MB RAM, 80 GB SSD".into(),
+                summary: "2 vCPU, 4096 MB RAM, 80 GB SSD ($20/mo)".into(),
             },
             ProviderPlan {
                 id: "4xCPU-8GB".into(),
-                summary: "4 vCPU, 8192 MB RAM, 160 GB SSD".into(),
+                summary: "4 vCPU, 8192 MB RAM, 160 GB SSD ($40/mo)".into(),
             },
         ],
         ProviderKind::Linode => vec![
@@ -251,6 +251,254 @@ pub struct InstanceStatus {
     pub ready: bool,
 }
 
+/// Pricing rates for a cloud VPS plan.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PlanPricing {
+    pub monthly_usd: f64,
+    pub hourly_usd: f64,
+}
+
+/// Estimated accrued and recurring cost for a running `ProviderInstance`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InstanceCostEstimate {
+    pub accrued_usd: Option<f64>,
+    pub elapsed_secs: Option<u64>,
+    pub monthly_usd: f64,
+    pub hourly_usd: f64,
+}
+
+fn parse_vcpu_gb_plan(spec: &str, separator: &str) -> Option<PlanPricing> {
+    let (vcpu_str, rest) = spec.split_once(separator)?;
+    if vcpu_str.is_empty() || !vcpu_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let vcpu: u32 = vcpu_str.parse().ok()?;
+    if vcpu == 0 {
+        return None;
+    }
+    let gb_str = rest.strip_suffix("gb")?;
+    if gb_str.is_empty() || !gb_str.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let gb: f64 = gb_str.parse().ok()?;
+    if !gb.is_finite() || gb <= 0.0 {
+        return None;
+    }
+    let monthly_usd = gb * 5.0;
+    Some(PlanPricing {
+        monthly_usd,
+        hourly_usd: monthly_usd / 730.0,
+    })
+}
+
+/// Look up published monthly and hourly pricing for a provider's plan ID.
+pub fn plan_pricing(provider: ProviderKind, plan_id: &str) -> Option<PlanPricing> {
+    let trimmed = plan_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let rates = match provider {
+        ProviderKind::Vultr => match lower.as_str() {
+            "vc2-1c-0.5gb-free" => (0.0, 0.0),
+            "vc2-1c-0.5gb-v6" => (2.5, 0.003),
+            "vc2-1c-0.5gb" => (3.5, 0.005),
+            "vc2-1c-1gb" => (5.0, 0.007),
+            "vc2-1c-2gb" => (10.0, 0.014),
+            "vc2-2c-4gb" => (20.0, 0.027),
+            "vc2-4c-8gb" => (40.0, 0.055),
+            "vc2-6c-16gb" => (80.0, 0.110),
+            "vc2-8c-32gb" => (160.0, 0.219),
+            _ => {
+                let rest = lower.strip_prefix("vc2-")?;
+                return parse_vcpu_gb_plan(rest, "c-");
+            }
+        },
+        ProviderKind::UpCloud => match lower.as_str() {
+            "1xcpu-1gb" => (5.0, 0.007),
+            "1xcpu-2gb" => (10.0, 0.015),
+            "2xcpu-4gb" => (20.0, 0.030),
+            "4xcpu-8gb" => (40.0, 0.060),
+            "6xcpu-16gb" => (80.0, 0.119),
+            _ => return parse_vcpu_gb_plan(&lower, "xcpu-"),
+        },
+        ProviderKind::Linode => match lower.as_str() {
+            "g6-nanode-1" => (5.0, 0.0075),
+            "g6-standard-1" => (12.0, 0.018),
+            "g6-standard-2" => (24.0, 0.036),
+            "g6-standard-4" => (48.0, 0.072),
+            "g6-standard-6" => (96.0, 0.144),
+            "g6-standard-8" => (192.0, 0.288),
+            _ => return None,
+        },
+        ProviderKind::ExistingTailscale | ProviderKind::ManualCloudInit => return None,
+    };
+    Some(PlanPricing {
+        monthly_usd: rates.0,
+        hourly_usd: rates.1,
+    })
+}
+
+/// Format a monthly USD price (`$5/mo` for whole dollars, `$2.50/mo` when fractional).
+pub fn format_monthly_usd(monthly_usd: f64) -> String {
+    let clamped = if monthly_usd.is_finite() && monthly_usd > 0.0 {
+        monthly_usd
+    } else {
+        0.0
+    };
+    let rounded = clamped.round();
+    if (clamped - rounded).abs() < 0.005 {
+        format!("${:.0}/mo", rounded)
+    } else {
+        format!("${:.2}/mo", clamped)
+    }
+}
+
+/// Format an hourly USD rate (`$0.007/hr` or `$0.0075/hr` when a 4th decimal digit is significant).
+pub fn format_hourly_usd(hourly_usd: f64) -> String {
+    let clamped = if hourly_usd.is_finite() && hourly_usd > 0.0 {
+        hourly_usd
+    } else {
+        0.0
+    };
+    if (clamped * 1000.0 - (clamped * 1000.0).round()).abs() > 0.01 {
+        format!("${:.4}/hr", clamped)
+    } else {
+        format!("${:.3}/hr", clamped)
+    }
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+fn days_in_month(year: i64, month: u32) -> Option<u32> {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => Some(31),
+        4 | 6 | 9 | 11 => Some(30),
+        2 => Some(if is_leap_year(year) { 29 } else { 28 }),
+        _ => None,
+    }
+}
+
+/// Converts a proleptic Gregorian date to days since 1970-01-01.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = month as i64;
+    let d = day as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn parse_ascii_uint(s: &str) -> Option<i64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<i64>().ok()
+}
+
+fn parse_tz_offset_secs(rest: &str) -> Option<i64> {
+    if rest.is_empty() || rest.eq_ignore_ascii_case("z") {
+        return Some(0);
+    }
+    let (sign, digits) = if let Some(s) = rest.strip_prefix('+') {
+        (1i64, s)
+    } else {
+        (-1i64, rest.strip_prefix('-')?)
+    };
+    let (hh_str, mm_str) = if digits.len() == 5 && digits.as_bytes()[2] == b':' {
+        (&digits[0..2], &digits[3..5])
+    } else if digits.len() == 4 {
+        (&digits[0..2], &digits[2..4])
+    } else {
+        return None;
+    };
+    let hh = parse_ascii_uint(hh_str)?;
+    let mm = parse_ascii_uint(mm_str)?;
+    if hh > 23 || mm > 59 {
+        return None;
+    }
+    Some(sign * (hh * 3_600 + mm * 60))
+}
+
+/// Parse a provider `created_at` timestamp (ISO-8601 / RFC-3339 or positive integer epoch seconds)
+/// into UTC Unix epoch seconds.
+pub fn parse_created_at_epoch_secs(raw: &str) -> Option<i64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return trimmed.parse::<i64>().ok().filter(|&secs| secs > 0);
+    }
+    if !trimmed.is_ascii() || trimmed.len() < 19 {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b'T' | b't' | b' ')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+
+    let year = parse_ascii_uint(&trimmed[0..4])?;
+    let month = u32::try_from(parse_ascii_uint(&trimmed[5..7])?).ok()?;
+    let day = u32::try_from(parse_ascii_uint(&trimmed[8..10])?).ok()?;
+    let hour = parse_ascii_uint(&trimmed[11..13])?;
+    let minute = parse_ascii_uint(&trimmed[14..16])?;
+    let second = parse_ascii_uint(&trimmed[17..19])?;
+
+    let max_day = days_in_month(year, month)?;
+    if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+
+    let mut rest = &trimmed[19..];
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let frac_digits = after_dot.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if frac_digits == 0 {
+            return None;
+        }
+        rest = &after_dot[frac_digits..];
+    }
+
+    let offset_secs = parse_tz_offset_secs(rest)?;
+    let days = days_from_civil(year, month, day);
+    let local_secs = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?;
+    local_secs.checked_sub(offset_secs)
+}
+
+/// Format an elapsed uptime duration in seconds as `<1m`, `{m}m`, `{h}h {m}m`, or `{d}d {h}h`.
+pub fn format_uptime_duration(elapsed_secs: u64) -> String {
+    if elapsed_secs < 60 {
+        return "<1m".to_string();
+    }
+    let total_mins = elapsed_secs / 60;
+    if total_mins < 60 {
+        return format!("{}m", total_mins);
+    }
+    let total_hours = total_mins / 60;
+    if total_hours < 24 {
+        return format!("{}h {}m", total_hours, total_mins % 60);
+    }
+    format!("{}d {}h", total_hours / 24, total_hours % 24)
+}
+
+fn current_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Summary of a cloud VPS instance returned by provider instance listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderInstance {
@@ -262,6 +510,84 @@ pub struct ProviderInstance {
     pub region: Option<String>,
     pub plan: Option<String>,
     pub created_at: Option<String>,
+}
+
+impl ProviderInstance {
+    /// Estimate the accrued and recurring cost of this instance at the current wall-clock time.
+    pub fn cost_estimate(&self) -> Option<InstanceCostEstimate> {
+        self.cost_estimate_at(current_epoch_secs())
+    }
+
+    /// Estimate the accrued and recurring cost of this instance at `now_epoch_secs`.
+    pub fn cost_estimate_at(&self, now_epoch_secs: i64) -> Option<InstanceCostEstimate> {
+        let pricing = self
+            .plan
+            .as_deref()
+            .and_then(|plan_id| plan_pricing(self.provider, plan_id))?;
+
+        let (accrued_usd, elapsed_secs) = match self
+            .created_at
+            .as_deref()
+            .and_then(parse_created_at_epoch_secs)
+            .filter(|&created| created <= now_epoch_secs)
+        {
+            Some(created) => {
+                let elapsed = now_epoch_secs.abs_diff(created);
+                let billable_hours = ((elapsed / 3_600) + 1) as f64;
+                let accrued = (billable_hours * pricing.hourly_usd).min(pricing.monthly_usd);
+                (Some(accrued), Some(elapsed))
+            }
+            None => (None, None),
+        };
+
+        Some(InstanceCostEstimate {
+            accrued_usd,
+            elapsed_secs,
+            monthly_usd: pricing.monthly_usd,
+            hourly_usd: pricing.hourly_usd,
+        })
+    }
+
+    /// Format a compact running-cost summary at the current wall-clock time (e.g. `"$0.01/$5/mo"`).
+    pub fn format_running_cost_compact(&self) -> String {
+        self.format_running_cost_compact_at(current_epoch_secs())
+    }
+
+    /// Format a compact running-cost summary at `now_epoch_secs`.
+    pub fn format_running_cost_compact_at(&self, now_epoch_secs: i64) -> String {
+        let Some(est) = self.cost_estimate_at(now_epoch_secs) else {
+            return "-".to_string();
+        };
+        let monthly = format_monthly_usd(est.monthly_usd);
+        match est.accrued_usd {
+            Some(accrued) => format!("${:.2}/{}", accrued, monthly),
+            None => monthly,
+        }
+    }
+
+    /// Format a detailed running-cost summary at the current wall-clock time.
+    pub fn format_running_cost_detailed(&self) -> String {
+        self.format_running_cost_detailed_at(current_epoch_secs())
+    }
+
+    /// Format a detailed running-cost summary at `now_epoch_secs`.
+    pub fn format_running_cost_detailed_at(&self, now_epoch_secs: i64) -> String {
+        let Some(est) = self.cost_estimate_at(now_epoch_secs) else {
+            return "-".to_string();
+        };
+        let monthly = format_monthly_usd(est.monthly_usd);
+        let hourly = format_hourly_usd(est.hourly_usd);
+        match (est.accrued_usd, est.elapsed_secs) {
+            (Some(accrued), Some(elapsed)) => format!(
+                "${:.2} ({} @ {}, {})",
+                accrued,
+                format_uptime_duration(elapsed),
+                hourly,
+                monthly
+            ),
+            _ => format!("{} ({})", monthly, hourly),
+        }
+    }
 }
 
 /// Per-provider status recorded while querying across cloud providers.
@@ -1708,5 +2034,273 @@ mod tests {
         assert_eq!(preserved.tailscale_ip, None);
 
         Ok(())
+    }
+
+    #[test]
+    fn default_upcloud_plans_include_pricing_summaries() {
+        let plans = default_plans_for(ProviderKind::UpCloud);
+        assert_eq!(plans.len(), 4);
+        assert_eq!(plans[0].summary, "1 vCPU, 1024 MB RAM, 25 GB SSD ($5/mo)");
+        assert_eq!(plans[1].summary, "1 vCPU, 2048 MB RAM, 50 GB SSD ($10/mo)");
+        assert_eq!(plans[2].summary, "2 vCPU, 4096 MB RAM, 80 GB SSD ($20/mo)");
+        assert_eq!(plans[3].summary, "4 vCPU, 8192 MB RAM, 160 GB SSD ($40/mo)");
+    }
+
+    #[test]
+    fn plan_pricing_covers_known_fallback_and_unknown_plans() {
+        let vultr_cases = [
+            ("vc2-1c-0.5gb-free", 0.0, 0.0),
+            ("vc2-1c-0.5gb-v6", 2.5, 0.003),
+            ("vc2-1c-0.5gb", 3.5, 0.005),
+            ("vc2-1c-1gb", 5.0, 0.007),
+            ("vc2-1c-2gb", 10.0, 0.014),
+            ("vc2-2c-4gb", 20.0, 0.027),
+            ("vc2-4c-8gb", 40.0, 0.055),
+            ("vc2-6c-16gb", 80.0, 0.110),
+            ("vc2-8c-32gb", 160.0, 0.219),
+        ];
+        for (plan_id, monthly, hourly) in vultr_cases {
+            assert_eq!(
+                plan_pricing(ProviderKind::Vultr, plan_id),
+                Some(PlanPricing {
+                    monthly_usd: monthly,
+                    hourly_usd: hourly,
+                }),
+                "vultr plan {plan_id}"
+            );
+        }
+
+        let vultr_fb = plan_pricing(ProviderKind::Vultr, "vc2-16c-64gb").unwrap();
+        assert_eq!(vultr_fb.monthly_usd, 320.0);
+        assert!((vultr_fb.hourly_usd - (320.0 / 730.0)).abs() < 1e-12);
+
+        let vultr_frac_fb = plan_pricing(ProviderKind::Vultr, "vc2-1c-1.5gb").unwrap();
+        assert_eq!(vultr_frac_fb.monthly_usd, 7.5);
+
+        let upcloud_cases = [
+            ("1xCPU-1GB", 5.0, 0.007),
+            ("1xCPU-2GB", 10.0, 0.015),
+            ("2xCPU-4GB", 20.0, 0.030),
+            ("4xCPU-8GB", 40.0, 0.060),
+            ("6xCPU-16GB", 80.0, 0.119),
+        ];
+        for (plan_id, monthly, hourly) in upcloud_cases {
+            assert_eq!(
+                plan_pricing(ProviderKind::UpCloud, plan_id),
+                Some(PlanPricing {
+                    monthly_usd: monthly,
+                    hourly_usd: hourly,
+                }),
+                "upcloud plan {plan_id}"
+            );
+        }
+
+        let uc_fb = plan_pricing(ProviderKind::UpCloud, "8xcpu-32gb").unwrap();
+        assert_eq!(uc_fb.monthly_usd, 160.0);
+        assert!((uc_fb.hourly_usd - (160.0 / 730.0)).abs() < 1e-12);
+
+        let linode_cases = [
+            ("g6-nanode-1", 5.0, 0.0075),
+            ("g6-standard-1", 12.0, 0.018),
+            ("g6-standard-2", 24.0, 0.036),
+            ("g6-standard-4", 48.0, 0.072),
+            ("g6-standard-6", 96.0, 0.144),
+            ("g6-standard-8", 192.0, 0.288),
+        ];
+        for (plan_id, monthly, hourly) in linode_cases {
+            assert_eq!(
+                plan_pricing(ProviderKind::Linode, plan_id),
+                Some(PlanPricing {
+                    monthly_usd: monthly,
+                    hourly_usd: hourly,
+                }),
+                "linode plan {plan_id}"
+            );
+        }
+
+        for (provider, bad_id) in [
+            (ProviderKind::Vultr, ""),
+            (ProviderKind::Vultr, "   "),
+            (ProviderKind::Vultr, "vc2-0c-1gb"),
+            (ProviderKind::Vultr, "vc2-1c-0gb"),
+            (ProviderKind::Vultr, "vc2-free"),
+            (ProviderKind::UpCloud, "DEV-1xCPU-1GB"),
+            (ProviderKind::UpCloud, "1xCPU-0GB"),
+            (ProviderKind::Linode, "g6-dedicated-2"),
+            (ProviderKind::ExistingTailscale, "vc2-1c-1gb"),
+            (ProviderKind::ManualCloudInit, "1xCPU-1GB"),
+        ] {
+            assert_eq!(plan_pricing(provider, bad_id), None, "{provider:?} {bad_id}");
+        }
+    }
+
+    #[test]
+    fn format_usd_helpers_format_monthly_and_hourly_rates() {
+        assert_eq!(format_monthly_usd(5.0), "$5/mo");
+        assert_eq!(format_monthly_usd(0.0), "$0/mo");
+        assert_eq!(format_monthly_usd(2.5), "$2.50/mo");
+        assert_eq!(format_monthly_usd(3.5), "$3.50/mo");
+        assert_eq!(format_hourly_usd(0.0), "$0.000/hr");
+        assert_eq!(format_hourly_usd(0.007), "$0.007/hr");
+        assert_eq!(format_hourly_usd(0.0075), "$0.0075/hr");
+        assert_eq!(format_hourly_usd(0.014), "$0.014/hr");
+        assert_eq!(format_hourly_usd(0.030), "$0.030/hr");
+    }
+
+    #[test]
+    fn parse_created_at_epoch_secs_parses_iso_formats_offsets_and_epoch() {
+        // 2025-01-01T00:00:00Z == 1735689600
+        assert_eq!(
+            parse_created_at_epoch_secs("2025-01-01T00:00:00Z"),
+            Some(1_735_689_600)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs("2025-01-01T02:00:00+02:00"),
+            Some(1_735_689_600)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs("2024-12-31T19:00:00-05:00"),
+            Some(1_735_689_600)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs("2025-01-01T00:00:00"),
+            Some(1_735_689_600)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs("2025-01-01 00:00:00"),
+            Some(1_735_689_600)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs("2025-01-01T00:00:00.123456Z"),
+            Some(1_735_689_600)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs("2025-01-01 05:30:00.999+05:30"),
+            Some(1_735_689_600)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs("2024-02-29T00:00:00Z"),
+            Some(1_709_164_800)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs("2000-02-29T00:00:00Z"),
+            Some(951_782_400)
+        );
+        assert_eq!(
+            parse_created_at_epoch_secs(" 1735689600 "),
+            Some(1_735_689_600)
+        );
+
+        for invalid in [
+            "",
+            "0",
+            "-100",
+            "not-a-timestamp",
+            "2025-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2025-13-01T00:00:00Z",
+            "2025-04-31T00:00:00Z",
+            "2025-01-01T24:00:00Z",
+            "2025-01-01T00:60:00Z",
+            "2025-01-01T00:00:60Z",
+            "2025-01-01T00:00:00.",
+            "2025-01-01T00:00:00+24:00",
+            "2025-01-01T00:00:00Zextra",
+        ] {
+            assert_eq!(parse_created_at_epoch_secs(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn format_uptime_duration_formats_all_ranges() {
+        assert_eq!(format_uptime_duration(0), "<1m");
+        assert_eq!(format_uptime_duration(59), "<1m");
+        assert_eq!(format_uptime_duration(60), "1m");
+        assert_eq!(format_uptime_duration(900), "15m");
+        assert_eq!(format_uptime_duration(3599), "59m");
+        assert_eq!(format_uptime_duration(3600), "1h 0m");
+        assert_eq!(format_uptime_duration(5400), "1h 30m");
+        assert_eq!(format_uptime_duration(86399), "23h 59m");
+        assert_eq!(format_uptime_duration(86400), "1d 0h");
+        assert_eq!(format_uptime_duration(90000), "1d 1h");
+        assert_eq!(format_uptime_duration(259200), "3d 0h");
+    }
+
+    #[test]
+    fn provider_instance_cost_estimate_and_formatters_at() {
+        let created_epoch = 1_735_689_600; // 2025-01-01T00:00:00Z
+        let mut inst = ProviderInstance {
+            provider: ProviderKind::Vultr,
+            id: "v-1".to_string(),
+            name: "box-1".to_string(),
+            status: "active (running)".to_string(),
+            public_ip: Some("203.0.113.10".to_string()),
+            region: Some("ewr".to_string()),
+            plan: Some("vc2-1c-1gb".to_string()),
+            created_at: Some("2025-01-01T00:00:00Z".to_string()),
+        };
+
+        // 15m elapsed -> 1 billable hour @ $0.007/hr
+        let est_15m = inst.cost_estimate_at(created_epoch + 900).unwrap();
+        assert_eq!(est_15m.accrued_usd, Some(0.007));
+        assert_eq!(est_15m.elapsed_secs, Some(900));
+        assert_eq!(est_15m.monthly_usd, 5.0);
+        assert_eq!(est_15m.hourly_usd, 0.007);
+        assert_eq!(inst.format_running_cost_compact_at(created_epoch + 900), "$0.01/$5/mo");
+        assert_eq!(
+            inst.format_running_cost_detailed_at(created_epoch + 900),
+            "$0.01 (15m @ $0.007/hr, $5/mo)"
+        );
+
+        // 2h 30m elapsed -> 3 billable hours @ $0.007/hr = $0.021
+        let est_2h30m = inst.cost_estimate_at(created_epoch + 9000).unwrap();
+        assert!((est_2h30m.accrued_usd.unwrap() - 0.021).abs() < 1e-12);
+        assert_eq!(
+            inst.format_running_cost_detailed_at(created_epoch + 9000),
+            "$0.02 (2h 30m @ $0.007/hr, $5/mo)"
+        );
+
+        // Capped at monthly_usd after many hours (40 days)
+        let est_40d = inst.cost_estimate_at(created_epoch + 40 * 86_400).unwrap();
+        assert_eq!(est_40d.accrued_usd, Some(5.0));
+        assert_eq!(
+            inst.format_running_cost_compact_at(created_epoch + 40 * 86_400),
+            "$5.00/$5/mo"
+        );
+        assert_eq!(
+            inst.format_running_cost_detailed_at(created_epoch + 40 * 86_400),
+            "$5.00 (40d 0h @ $0.007/hr, $5/mo)"
+        );
+
+        // Future created_at falls back to pricing-only formatting
+        assert_eq!(inst.format_running_cost_compact_at(created_epoch - 60), "$5/mo");
+        assert_eq!(
+            inst.format_running_cost_detailed_at(created_epoch - 60),
+            "$5/mo ($0.007/hr)"
+        );
+
+        // Missing created_at with fractional monthly rate
+        inst.plan = Some("vc2-1c-0.5gb-v6".to_string());
+        inst.created_at = None;
+        assert_eq!(inst.format_running_cost_compact_at(created_epoch), "$2.50/mo");
+        assert_eq!(
+            inst.format_running_cost_detailed_at(created_epoch),
+            "$2.50/mo ($0.003/hr)"
+        );
+
+        // Linode 4-decimal hourly rate
+        inst.provider = ProviderKind::Linode;
+        inst.plan = Some("g6-nanode-1".to_string());
+        inst.created_at = Some("2025-01-01T00:00:00".to_string());
+        assert_eq!(
+            inst.format_running_cost_detailed_at(created_epoch + 900),
+            "$0.01 (15m @ $0.0075/hr, $5/mo)"
+        );
+
+        // Unknown plan -> None / "-"
+        inst.plan = Some("unknown-plan".to_string());
+        assert_eq!(inst.cost_estimate_at(created_epoch + 900), None);
+        assert_eq!(inst.format_running_cost_compact_at(created_epoch + 900), "-");
+        assert_eq!(inst.format_running_cost_detailed_at(created_epoch + 900), "-");
     }
 }
