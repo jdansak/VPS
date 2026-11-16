@@ -3234,14 +3234,24 @@ impl TuiApp {
 
     /// Renders the active TUI screen into the given ratatui `Frame`.
     pub fn render_frame(&self, frame: &mut Frame) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        let show_bottom_pane = self.screen == Screen::BuildBox;
+        let constraints: Vec<Constraint> = if show_bottom_pane {
+            vec![
                 Constraint::Length(3),
                 Constraint::Min(9),
                 Constraint::Length(9),
                 Constraint::Length(3),
-            ])
+            ]
+        } else {
+            vec![
+                Constraint::Length(3),
+                Constraint::Min(9),
+                Constraint::Length(3),
+            ]
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
             .split(frame.area());
 
         self.render_header(frame, chunks[0]);
@@ -3257,8 +3267,12 @@ impl TuiApp {
             Screen::RunningInstances => self.render_running_instances(frame, chunks[1]),
             Screen::ViewLog => self.render_view_log(frame, chunks[1]),
         }
-        self.render_bottom_pane(frame, chunks[2]);
-        self.render_footer(frame, chunks[3]);
+        if show_bottom_pane {
+            self.render_bottom_pane(frame, chunks[2]);
+            self.render_footer(frame, chunks[3]);
+        } else {
+            self.render_footer(frame, chunks[2]);
+        }
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect) {
@@ -5366,16 +5380,9 @@ mod tests {
         assert!(text.contains("Log File: ~/.config/bab/bab.log (max 10 MB)"));
         assert!(!text.contains("Cloudflare DNS (Stub)"));
         assert!(!text.contains("API Key Settings (Encrypted)"));
-        assert!(text.contains("Setup Progress"));
+        assert!(!text.contains("Setup Progress"));
         assert!(!text.contains("Setup Progress & Logs"));
-        assert!(!text.contains("(no setup logs yet)"));
-        assert!(text.contains("[ ] 1. System Update & Base Packages"));
-        assert!(text.contains("[ ] 2. Create Non-Root User & Sudo"));
-        assert!(text.contains("[ ] 3. Harden SSH & Tailscale Access"));
-        assert!(text.contains("[ ] 4. Configure Server Role"));
-        assert!(text.contains("[ ] 5. Fail2ban & Security Updates"));
-        assert!(text.contains("[ ] 6. Configure MOTD Dashboard"));
-        assert!(text.contains("Box & Final Connection Info"));
+        assert!(!text.contains("Box & Final Connection Info"));
     }
 
     #[test]
@@ -6044,30 +6051,34 @@ mod tests {
             let bottom = render_with_size_to_string(100, 9, |frame| {
                 app.render_bottom_pane(frame, frame.area());
             });
-            assert!(text.contains("Setup Progress"));
             assert!(!text.contains("Setup Progress & Logs"));
-            assert!(text.contains("2/6 steps"));
-            assert!(text.contains("[x] 1. System Update & Base Packages"));
-            assert!(text.contains("[!] 2. Create Non-Root User & Sudo"));
-            assert!(text.contains("[ ] 3. Harden SSH & Tailscale Access"));
-            assert!(text.contains("[ ] 4. Configure Server Role"));
-            assert!(text.contains("[ ] 5. Fail2ban & Security Updates"));
-            assert!(text.contains("[ ] 6. Configure MOTD Dashboard"));
             assert!(!bottom.contains("apt updated successfully"));
             assert!(!bottom.contains("useradd error"));
             assert!(!bottom.contains("(no setup logs yet)"));
-            if screen != Screen::ViewLog {
+            if screen == Screen::BuildBox {
+                assert!(text.contains("Setup Progress"));
+                assert!(text.contains("Box & Final Connection Info"));
+                assert!(text.contains("2/6 steps"));
+                assert!(text.contains("[x] 1. System Update & Base Packages"));
+                assert!(text.contains("[!] 2. Create Non-Root User & Sudo"));
+                assert!(text.contains("[ ] 3. Harden SSH & Tailscale Access"));
+                assert!(text.contains("[ ] 4. Configure Server Role"));
+                assert!(text.contains("[ ] 5. Fail2ban & Security Updates"));
+                assert!(text.contains("[ ] 6. Configure MOTD Dashboard"));
                 assert!(!text.contains("apt updated successfully"));
                 assert!(!text.contains("useradd error"));
                 assert!(!text.contains("(no setup logs yet)"));
+                assert!(text.contains("Public IP:"));
+                assert!(text.contains("198.51.100.20"));
+                assert!(text.contains("Tailscale IP:"));
+                assert!(text.contains("100.64.2.20"));
+                assert!(text.contains("us-east"));
+                assert!(text.contains("g6-standard-2"));
+                assert!(text.contains("credentials.enc [ChaCha20-Poly1305, 0600]"));
+            } else {
+                assert!(!text.contains("Setup Progress"));
+                assert!(!text.contains("Box & Final Connection Info"));
             }
-            assert!(text.contains("Public IP:"));
-            assert!(text.contains("198.51.100.20"));
-            assert!(text.contains("Tailscale IP:"));
-            assert!(text.contains("100.64.2.20"));
-            assert!(text.contains("us-east"));
-            assert!(text.contains("g6-standard-2"));
-            assert!(text.contains("credentials.enc [ChaCha20-Poly1305, 0600]"));
         }
     }
 
@@ -6596,13 +6607,11 @@ mod tests {
             ApiKeyForm::default(),
         );
 
-        // Home + bottom pane
+        // Home
         app.screen = Screen::Home;
         let home_buf = render_to_buffer(&app);
         assert_token_fg_in_row(&home_buf, "(enabled=ON,", "ON", Color::LightGreen);
         assert_token_fg_in_row(&home_buf, "(enabled=OFF,", "OFF", Color::LightRed);
-        assert_token_fg_in_row(&home_buf, "DNS / Repo:    ON (example.com)", "ON", Color::LightGreen);
-        assert_token_fg_in_row(&home_buf, "/ OFF (octocat", "OFF", Color::LightRed);
 
         // CloudflareDns (ON -> LightGreen)
         app.screen = Screen::CloudflareDns;
@@ -6640,6 +6649,13 @@ mod tests {
         let bb_buf_2 = render_to_buffer(&app);
         assert_token_fg_in_row(&bb_buf_2, "Cloudflare DNS: ON", "ON", Color::LightGreen);
         assert_token_fg_in_row(&bb_buf_2, "GitHub Repo Deploy: OFF", "OFF", Color::LightRed);
+        assert_token_fg_in_row(
+            &bb_buf_2,
+            "DNS / Repo:    ON (example.com)",
+            "ON",
+            Color::LightGreen,
+        );
+        assert_token_fg_in_row(&bb_buf_2, "/ OFF (octocat", "OFF", Color::LightRed);
     }
 
     #[test]
@@ -6797,6 +6813,7 @@ mod tests {
             .logs
             .iter()
             .any(|l| l.contains("chmod +x /etc/profile.d/vps-dashboard.sh") || l.contains("esac")));
+        app.screen = Screen::BuildBox;
         let rendered = render_to_string(&app);
         assert!(rendered.contains("100.64.0.1 (dry-run)"));
 
@@ -8085,6 +8102,7 @@ esac"#
             Some("FailPass99")
         );
 
+        app.screen = Screen::BuildBox;
         let bottom_masked = render_to_string(&app);
         assert!(bottom_masked.contains("Public IP:     198.51.100.77 | Target: (not set)"));
         assert!(bottom_masked.contains("Tailscale IP:  (not set)"));
@@ -8960,6 +8978,7 @@ esac"#
             output: "err".to_string(),
         });
         app.active_step = Some(SetupStepKind::HardenSsh);
+        app.screen = Screen::BuildBox;
 
         let buf = render_to_buffer(&app);
         assert_token_fg_in_row(
