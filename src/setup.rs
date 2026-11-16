@@ -1,4 +1,8 @@
 use anyhow::{anyhow, Result};
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, USER_AGENT};
+use std::env;
+use std::time::Duration;
 
 use crate::config::SessionState;
 use crate::roles::ServerRole;
@@ -937,6 +941,54 @@ impl<'a> SetupRunner<'a> {
     }
 }
 
+const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// Validates a GitHub personal access token against the base URL in `GITHUB_API_BASE`
+/// (falling back to `https://api.github.com` when unset or blank).
+pub fn validate_github_token(token: &str) -> Result<bool> {
+    let base = env::var("GITHUB_API_BASE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_GITHUB_API_BASE.to_string());
+    validate_github_token_with_base(token, &base)
+}
+
+/// Validates a GitHub personal access token against an explicit GitHub API base URL.
+pub fn validate_github_token_with_base(token: &str, base_url: &str) -> Result<bool> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(false);
+    }
+
+    let url = format!("{}/user", base_url.trim().trim_end_matches('/'));
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow!("Failed to build HTTP client: {}", e))?;
+
+    let resp = client
+        .get(&url)
+        .bearer_auth(token)
+        .header(USER_AGENT, "bab/0.1")
+        .header(ACCEPT, "application/vnd.github+json")
+        .send()?;
+
+    let status = resp.status();
+    match status.as_u16() {
+        200..=299 => Ok(true),
+        401 | 403 => Ok(false),
+        _ => {
+            let body = resp.text().unwrap_or_default();
+            Err(anyhow!(
+                "Unexpected status {} when validating GitHub token: {}",
+                status,
+                body
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1662,5 +1714,215 @@ mod tests {
                 "chown -R \"${NEW_USER}:${NEW_USER}\" \"/home/${NEW_USER}/apps\" 2>/dev/null || chown -R \"${NEW_USER}\" \"/home/${NEW_USER}/apps\" || true"
             ));
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct RecordedGithubRequest {
+        method: String,
+        path: String,
+        authorization: Option<String>,
+        user_agent: Option<String>,
+        accept: Option<String>,
+    }
+
+    struct MockGithubResponse {
+        status: u16,
+        reason: &'static str,
+        body: String,
+    }
+
+    impl MockGithubResponse {
+        fn json(status: u16, reason: &'static str, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                reason,
+                body: body.into(),
+            }
+        }
+    }
+
+    struct GithubEnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl GithubEnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for GithubEnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(val) => env::set_var(self.key, val),
+                None => env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn spawn_github_mock_server(
+        responses: Vec<MockGithubResponse>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<RecordedGithubRequest>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock github server");
+        let addr = listener.local_addr().expect("local addr");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = Arc::clone(&recorded);
+
+        let handle = thread::spawn(move || {
+            for resp in responses {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut reader = BufReader::new(&stream);
+
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).expect("read request line");
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+
+                let mut authorization = None;
+                let mut user_agent = None;
+                let mut accept = None;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read header line");
+                    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, val)) = trimmed.split_once(':') {
+                        let name_lower = name.trim().to_ascii_lowercase();
+                        let val_trimmed = val.trim().to_string();
+                        if name_lower == "authorization" {
+                            authorization = Some(val_trimmed);
+                        } else if name_lower == "user-agent" {
+                            user_agent = Some(val_trimmed);
+                        } else if name_lower == "accept" {
+                            accept = Some(val_trimmed);
+                        }
+                    }
+                }
+
+                recorded_clone.lock().unwrap().push(RecordedGithubRequest {
+                    method,
+                    path,
+                    authorization,
+                    user_agent,
+                    accept,
+                });
+
+                let http_resp = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp.status,
+                    resp.reason,
+                    resp.body.len(),
+                    resp.body
+                );
+                stream
+                    .write_all(http_resp.as_bytes())
+                    .expect("write response");
+                stream.flush().expect("flush response");
+            }
+        });
+
+        (format!("http://{}", addr), recorded, handle)
+    }
+
+    #[test]
+    fn validate_github_token_returns_false_for_empty_or_whitespace_token() {
+        assert!(!validate_github_token_with_base("", "http://127.0.0.1:1").unwrap());
+        assert!(!validate_github_token_with_base("  \t\n ", "http://127.0.0.1:1").unwrap());
+    }
+
+    #[test]
+    fn validate_github_token_with_base_returns_true_on_200_and_sends_expected_headers() {
+        let (base_url, recorded, handle) = spawn_github_mock_server(vec![MockGithubResponse::json(
+            200,
+            "OK",
+            r#"{"login":"octocat"}"#,
+        )]);
+
+        assert!(validate_github_token_with_base("  ghp_valid_token \n", &base_url).unwrap());
+
+        handle.join().expect("mock server thread");
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/user");
+        assert_eq!(
+            reqs[0].authorization.as_deref(),
+            Some("Bearer ghp_valid_token")
+        );
+        assert_eq!(reqs[0].user_agent.as_deref(), Some("bab/0.1"));
+        assert_eq!(
+            reqs[0].accept.as_deref(),
+            Some("application/vnd.github+json")
+        );
+    }
+
+    #[test]
+    fn validate_github_token_with_base_returns_false_on_401_and_403() {
+        let (base_url, recorded, handle) = spawn_github_mock_server(vec![
+            MockGithubResponse::json(401, "Unauthorized", r#"{"message":"Bad credentials"}"#),
+            MockGithubResponse::json(403, "Forbidden", r#"{"message":"Forbidden"}"#),
+        ]);
+
+        assert!(!validate_github_token_with_base("ghp_bad", &base_url).unwrap());
+        assert!(!validate_github_token_with_base("ghp_forbidden", &base_url).unwrap());
+
+        handle.join().expect("mock server thread");
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn validate_github_token_with_base_errors_on_500() {
+        let (base_url, recorded, handle) = spawn_github_mock_server(vec![MockGithubResponse::json(
+            500,
+            "Internal Server Error",
+            r#"{"message":"github outage"}"#,
+        )]);
+
+        let err = validate_github_token_with_base("ghp_token", &base_url).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Unexpected status 500"), "unexpected error: {msg}");
+        assert!(msg.contains("github outage"), "unexpected error: {msg}");
+
+        handle.join().expect("mock server thread");
+        assert_eq!(recorded.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn validate_github_token_honors_github_api_base_env() {
+        let _lock = crate::env_lock();
+        let (base_url, recorded, handle) = spawn_github_mock_server(vec![MockGithubResponse::json(
+            200,
+            "OK",
+            r#"{"login":"octocat"}"#,
+        )]);
+        let _env = GithubEnvGuard::set("GITHUB_API_BASE", &format!("{base_url}/"));
+
+        assert!(validate_github_token("ghp_env_token").unwrap());
+
+        handle.join().expect("mock server thread");
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/user");
+        assert_eq!(reqs[0].authorization.as_deref(), Some("Bearer ghp_env_token"));
+        assert_eq!(reqs[0].user_agent.as_deref(), Some("bab/0.1"));
+        assert_eq!(
+            reqs[0].accept.as_deref(),
+            Some("application/vnd.github+json")
+        );
     }
 }

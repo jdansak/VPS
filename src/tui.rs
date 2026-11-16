@@ -1,5 +1,8 @@
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -576,6 +579,15 @@ impl ApiKeyForm {
     }
 }
 
+/// Validation status for a configured API key in the API Key Settings screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeyTestStatus {
+    Untested,
+    Valid,
+    Invalid,
+    Error(String),
+}
+
 /// Interactive state and renderer for the Build A Box (bab) terminal UI.
 pub struct TuiApp {
     pub screen: Screen,
@@ -596,7 +608,10 @@ pub struct TuiApp {
     pub cf_dns: CloudflareDnsForm,
     pub github_deploy: GithubDeployForm,
     pub api_keys: ApiKeyForm,
+    pub api_key_statuses: [ApiKeyTestStatus; 6],
+    pub show_api_keys: bool,
     pub progress_steps: Vec<(SetupStepKind, Option<bool>)>,
+    pub active_step: Option<SetupStepKind>,
     pub logs: Vec<String>,
     pub status_message: String,
     pub settings_path: Option<PathBuf>,
@@ -707,7 +722,10 @@ impl TuiApp {
             cf_dns,
             github_deploy,
             api_keys,
+            api_key_statuses: std::array::from_fn(|_| ApiKeyTestStatus::Untested),
+            show_api_keys: false,
             progress_steps,
+            active_step: None,
             logs: Vec::new(),
             status_message: "Ready".to_string(),
             settings_path: None,
@@ -883,8 +901,70 @@ impl TuiApp {
                 self.logs.push(format!("  {}", line));
             }
         }
+        if self.active_step == Some(report.step) {
+            self.active_step = None;
+        }
         self.append_persistent_log_block(&header, &report.output);
         self.status_message = format!("{}: {}", report.step.title(), tag);
+    }
+
+    /// Processes pasted text from bracketed paste events on editable screens.
+    pub fn handle_paste(&mut self, text: &str) {
+        let stripped: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
+        match self.screen {
+            Screen::ApiKeys => {
+                let pasted = stripped.trim().to_string();
+                if pasted.is_empty() {
+                    return;
+                }
+                let idx = self.api_keys.active_field;
+                if self.api_keys.editing {
+                    self.api_keys.active_value_mut().push_str(&pasted);
+                } else {
+                    *self.api_keys.active_value_mut() = pasted.clone();
+                }
+                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                self.auto_save_api_keys();
+                if !self.status_message.starts_with("Failed to") {
+                    self.status_message = format!(
+                        "Pasted {} ({} chars, auto-encrypted)",
+                        API_KEY_LABELS[idx],
+                        self.api_keys.value_for(idx).chars().count()
+                    );
+                }
+            }
+            Screen::AccessConfig if self.access.editing => {
+                let pasted = stripped.trim();
+                if !pasted.is_empty() {
+                    if let Some(buf) = self.access.active_text_mut() {
+                        buf.push_str(pasted);
+                    }
+                    let label = ACCESS_FIELD_LABELS[self.access.active_field];
+                    self.status_message = format!("Pasted into {} (press 's' to save)", label);
+                }
+            }
+            Screen::CloudflareDns if self.cf_dns.editing => {
+                let pasted = stripped.trim();
+                if !pasted.is_empty() {
+                    if let Some(buf) = self.cf_dns.active_text_mut() {
+                        buf.push_str(pasted);
+                    }
+                    let label = CF_DNS_FIELD_LABELS[self.cf_dns.active_field];
+                    self.status_message = format!("Pasted into {} (press 's' to save)", label);
+                }
+            }
+            Screen::GithubDeploy if self.github_deploy.editing => {
+                let pasted = stripped.trim();
+                if !pasted.is_empty() {
+                    if let Some(buf) = self.github_deploy.active_text_mut() {
+                        buf.push_str(pasted);
+                    }
+                    let label = GITHUB_FIELD_LABELS[self.github_deploy.active_field];
+                    self.status_message = format!("Pasted into {} (press 's' to save)", label);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Processes a single terminal key event.
@@ -1392,6 +1472,80 @@ impl TuiApp {
         }
     }
 
+    fn test_api_key_at(&mut self, idx: usize) -> ApiKeyTestStatus {
+        let val = self.api_keys.value_for(idx).trim().to_string();
+        if val.is_empty() {
+            self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+            return ApiKeyTestStatus::Untested;
+        }
+        let res = match idx {
+            0 => TailscaleClient::new(val).and_then(|c| c.validate_api_key()),
+            1 => build_cloud_provider_with_key(ProviderKind::Vultr, &val, None)
+                .and_then(|p| p.validate_key()),
+            2 => build_cloud_provider_with_key(ProviderKind::UpCloud, &val, None)
+                .and_then(|p| p.validate_key()),
+            3 => build_cloud_provider_with_key(ProviderKind::Linode, &val, None)
+                .and_then(|p| p.validate_key()),
+            4 => crate::dns::validate_cloudflare_token(&val),
+            5 => crate::setup::validate_github_token(&val),
+            _ => Ok(false),
+        };
+        let status = match res {
+            Ok(true) => ApiKeyTestStatus::Valid,
+            Ok(false) => ApiKeyTestStatus::Invalid,
+            Err(err) => ApiKeyTestStatus::Error(err.to_string()),
+        };
+        self.api_key_statuses[idx] = status.clone();
+        status
+    }
+
+    fn test_selected_api_key(&mut self) {
+        let idx = self.api_keys.active_field;
+        let label = API_KEY_LABELS[idx];
+        match self.test_api_key_at(idx) {
+            ApiKeyTestStatus::Untested => {
+                self.status_message = format!("{} is empty — nothing to test", label);
+            }
+            ApiKeyTestStatus::Valid => {
+                self.status_message = format!("{}: VALID", label);
+            }
+            ApiKeyTestStatus::Invalid => {
+                self.status_message = format!("{}: INVALID", label);
+            }
+            ApiKeyTestStatus::Error(err) => {
+                self.status_message = format!("{}: ERROR ({})", label, err);
+            }
+        }
+    }
+
+    fn test_all_api_keys(&mut self) {
+        let mut tested = 0usize;
+        let mut valid = 0usize;
+        let mut invalid = 0usize;
+        let mut errors = 0usize;
+        for idx in 0..API_KEY_LABELS.len() {
+            if self.api_keys.value_for(idx).trim().is_empty() {
+                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                continue;
+            }
+            tested += 1;
+            match self.test_api_key_at(idx) {
+                ApiKeyTestStatus::Valid => valid += 1,
+                ApiKeyTestStatus::Invalid => invalid += 1,
+                ApiKeyTestStatus::Error(_) => errors += 1,
+                ApiKeyTestStatus::Untested => {}
+            }
+        }
+        self.status_message = if tested == 0 {
+            "No API keys configured to test".to_string()
+        } else {
+            format!(
+                "Tested {} key(s): {} valid, {} invalid, {} error(s)",
+                tested, valid, invalid, errors
+            )
+        };
+    }
+
     fn handle_api_keys_nav_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1408,6 +1562,29 @@ impl TuiApp {
                 self.status_message =
                     format!("Editing {} (auto-saves encrypted; Enter/Esc to finish)", label);
             }
+            KeyCode::Char('w') => {
+                self.show_api_keys = !self.show_api_keys;
+                self.status_message = if self.show_api_keys {
+                    "API keys visible".to_string()
+                } else {
+                    "API keys masked".to_string()
+                };
+            }
+            KeyCode::Char('c') | KeyCode::Delete | KeyCode::Backspace => {
+                let idx = self.api_keys.active_field;
+                self.api_keys.active_value_mut().clear();
+                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                self.auto_save_api_keys();
+                if !self.status_message.starts_with("Failed to") {
+                    self.status_message = format!("Cleared {} (auto-encrypted)", API_KEY_LABELS[idx]);
+                }
+            }
+            KeyCode::Char('t') => {
+                self.test_selected_api_key();
+            }
+            KeyCode::Char('a') => {
+                self.test_all_api_keys();
+            }
             KeyCode::Char('s') => {
                 self.save_api_keys();
             }
@@ -1420,15 +1597,25 @@ impl TuiApp {
     }
 
     fn handle_api_key_edit(&mut self, key: KeyEvent) {
+        let idx = self.api_keys.active_field;
         match key.code {
             KeyCode::Enter | KeyCode::Esc => {
                 self.api_keys.editing = false;
                 self.auto_save_api_keys();
-                let label = API_KEY_LABELS[self.api_keys.active_field];
+                let label = API_KEY_LABELS[idx];
                 self.status_message = format!("Saved {} (auto-encrypted)", label);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.api_keys.active_value_mut().clear();
+                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                self.auto_save_api_keys();
+                if !self.status_message.starts_with("Failed to") {
+                    self.status_message = format!("Cleared {} (auto-encrypted)", API_KEY_LABELS[idx]);
+                }
             }
             KeyCode::Backspace => {
                 self.api_keys.active_value_mut().pop();
+                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
                 self.auto_save_api_keys();
             }
             KeyCode::Char(c)
@@ -1437,6 +1624,7 @@ impl TuiApp {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.api_keys.active_value_mut().push(c);
+                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
                 self.auto_save_api_keys();
             }
             _ => {}
@@ -1645,7 +1833,7 @@ impl TuiApp {
     fn handle_running_instances_key(&mut self, key: KeyEvent) {
         if self.running_confirm_destroy {
             match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
+                KeyCode::Char('y') => {
                     self.running_confirm_destroy = false;
                     self.destroy_selected_instance();
                 }
@@ -1653,7 +1841,10 @@ impl TuiApp {
                     self.running_confirm_destroy = false;
                     self.status_message = "Destroy cancelled".to_string();
                 }
-                _ => {}
+                _ => {
+                    self.status_message =
+                        "Press 'y' to confirm destroy, or 'n'/Esc to cancel".to_string();
+                }
             }
             return;
         }
@@ -1675,7 +1866,7 @@ impl TuiApp {
                 if let Some(inst) = self.running_instances.get(self.running_index) {
                     self.running_confirm_destroy = true;
                     self.status_message = format!(
-                        "Confirm destroy of {} {} ({})? Press y/Enter or n/Esc",
+                        "Confirm destroy of {} {} ({})? Press 'y' to confirm or 'n'/Esc to cancel",
                         inst.provider.label(),
                         inst.name,
                         inst.id
@@ -2400,6 +2591,7 @@ impl TuiApp {
             .copied()
             .map(|s| (s, None))
             .collect();
+        self.active_step = None;
         self.last_dry_run_target = None;
         let mode_tag = if self.build_dry_run { "DRY-RUN" } else { "LIVE" };
         self.push_log(format!(
@@ -2959,6 +3151,7 @@ impl TuiApp {
             |idx, total, step| {
                 let mut guard = app_cell.borrow_mut();
                 let (app, cb) = &mut *guard;
+                app.active_step = Some(step);
                 let msg = format!(
                     "[STEP {}/{}] Running {} on {}...",
                     idx + 1,
@@ -2973,16 +3166,19 @@ impl TuiApp {
             |report| {
                 let mut guard = app_cell.borrow_mut();
                 let (app, cb) = &mut *guard;
+                app.active_step = None;
                 app.record_step(report);
                 cb(app);
             },
         ) {
+            self.active_step = None;
             let msg = format!("Build failed: {}", err);
             self.push_log(format!("[ERROR] {}", msg));
             self.status_message = msg;
             on_update(self);
             return;
         }
+        self.active_step = None;
 
         if self.cf_dns.enabled {
             let zone = self.cf_dns.zone.trim();
@@ -3120,16 +3316,16 @@ impl TuiApp {
                 "Up/Down or j/k: Field | Space/Enter/Left/Right/t: Toggle/Edit | s: Save | Esc/b/q: Back"
             }
             Screen::ApiKeys if self.api_keys.editing => {
-                "Type characters | Backspace: Delete | Enter/Esc: Finish Editing (Auto-Saved)"
+                "Type/Paste | Ctrl+U: Clear | Backspace: Del | Enter/Esc: Done (Auto-Saved)"
             }
             Screen::ApiKeys => {
-                "Up/Down or j/k: Field | Enter/e: Edit (Auto-Saves) | s: Save | Esc/b/q: Back"
+                "j/k: Nav | Enter/e: Edit | w: Show | c: Clear | t/a: Test | Esc/b/q: Back"
             }
             Screen::BuildBox => {
                 "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | w: Pass | r: New Pass | n: Dry | Esc/b/q: Back"
             }
             Screen::RunningInstances if self.running_confirm_destroy => {
-                "y/Enter: Confirm Destroy | n/Esc/b/q: Cancel"
+                "y: Confirm Destroy | n/Esc/b/q: Cancel"
             }
             Screen::RunningInstances => {
                 "Up/Down/j/k: Select | r: Refresh | w: Show/Hide Pass | d/x/Del: Destroy | Esc/b/q: Back"
@@ -4108,20 +4304,61 @@ impl TuiApp {
             .iter()
             .enumerate()
             .map(|(i, label)| {
-                let masked = ApiKeyForm::mask_key(self.api_keys.value_for(i));
-                let suffix = if self.api_keys.editing && i == self.api_keys.active_field {
+                let raw = self.api_keys.value_for(i);
+                let display_val = if self.show_api_keys && !raw.is_empty() {
+                    raw.to_string()
+                } else {
+                    ApiKeyForm::mask_key(raw)
+                };
+                let editing_suffix = if self.api_keys.editing && i == self.api_keys.active_field {
                     " [EDITING]"
                 } else {
                     ""
                 };
-                ListItem::new(format!("{}: {}{}", label, masked, suffix))
+                let len_suffix = if raw.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} chars)", raw.chars().count())
+                };
+                let mut spans = vec![Span::raw(format!(
+                    "{}: {}{}{}",
+                    label, display_val, editing_suffix, len_suffix
+                ))];
+                match &self.api_key_statuses[i] {
+                    ApiKeyTestStatus::Untested => {}
+                    ApiKeyTestStatus::Valid => spans.push(Span::styled(
+                        " [VALID]",
+                        Style::default()
+                            .fg(Color::LightGreen)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    ApiKeyTestStatus::Invalid => spans.push(Span::styled(
+                        " [INVALID]",
+                        Style::default()
+                            .fg(Color::LightRed)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    ApiKeyTestStatus::Error(err) => spans.push(Span::styled(
+                        format!(" [ERROR: {}]", err),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect();
 
+        let vis_mode = if self.show_api_keys {
+            "Visible"
+        } else {
+            "Masked"
+        };
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title("API Key Settings (Masked, Auto-Saved & ChaCha20-Poly1305 Encrypted)")
+                    .title(format!(
+                        "API Key Settings ({}, Auto-Saved & ChaCha20-Poly1305 Encrypted)",
+                        vis_mode
+                    ))
                     .borders(Borders::ALL),
             )
             .highlight_style(
@@ -4487,7 +4724,7 @@ impl TuiApp {
             if let Some(inst) = self.running_instances.get(self.running_index) {
                 Paragraph::new(Line::from(Span::styled(
                     format!(
-                        "CONFIRM DESTROY: {} {} ({})? Press 'y'/Enter to confirm or 'n'/Esc/'b'/'q' to cancel",
+                        "CONFIRM DESTROY: {} {} ({})? Press 'y' to confirm or 'n'/Esc/'b'/'q' to cancel",
                         inst.provider.label(),
                         inst.name,
                         inst.id
@@ -4495,7 +4732,7 @@ impl TuiApp {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )))
             } else {
-                Paragraph::new("Confirm destroy? y/Enter: Yes | n/Esc/b/q: Cancel")
+                Paragraph::new("Confirm destroy? y: Yes | n/Esc/b/q: Cancel")
             }
         } else {
             let selected_summary = if let Some(inst) = self.running_instances.get(self.running_index) {
@@ -4585,20 +4822,16 @@ impl TuiApp {
             .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
             .split(area);
 
-        // Left half: Setup Progress & Logs
+        // Left half: Setup Progress
         let left_block = Block::default()
-            .title("Setup Progress & Logs")
+            .title("Setup Progress")
             .borders(Borders::ALL);
         let left_inner = left_block.inner(cols[0]);
         frame.render_widget(left_block, cols[0]);
 
         let left_rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(2),
-                Constraint::Min(1),
-            ])
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(left_inner);
 
         let total = self.progress_steps.len().max(1);
@@ -4607,44 +4840,59 @@ impl TuiApp {
             .iter()
             .filter(|(_, status)| status.is_some())
             .count();
+        let any_failed = self
+            .progress_steps
+            .iter()
+            .any(|(_, status)| *status == Some(false));
+        let all_succeeded = !self.progress_steps.is_empty()
+            && self
+                .progress_steps
+                .iter()
+                .all(|(_, status)| *status == Some(true));
+        let gauge_color = if all_succeeded {
+            Color::Green
+        } else if any_failed {
+            Color::Red
+        } else {
+            Color::Cyan
+        };
         let ratio = (completed as f64 / total as f64).clamp(0.0, 1.0);
         let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(Color::Cyan))
+            .gauge_style(Style::default().fg(gauge_color))
             .ratio(ratio)
             .label(format!("{}/{} steps", completed, total));
         frame.render_widget(gauge, left_rows[0]);
 
-        let markers_text = self
+        let checklist_lines: Vec<Line> = self
             .progress_steps
             .iter()
             .map(|(step, status)| {
-                let marker = match status {
-                    None => "[ ]",
-                    Some(true) => "[x]",
-                    Some(false) => "[!]",
+                let (badge, badge_color, text_color) = match status {
+                    Some(true) => ("[x]", Color::LightGreen, None),
+                    Some(false) => ("[!]", Color::Red, Some(Color::Red)),
+                    None if self.active_step == Some(*step) => {
+                        ("[>]", Color::Yellow, Some(Color::Yellow))
+                    }
+                    None => ("[ ]", Color::DarkGray, Some(Color::DarkGray)),
                 };
-                format!("{} {}", marker, step_short_label(*step))
+                let title_span = match text_color {
+                    Some(c) => Span::styled(step_short_label(*step), Style::default().fg(c)),
+                    None => Span::raw(step_short_label(*step)),
+                };
+                Line::from(vec![
+                    Span::styled(
+                        badge,
+                        Style::default()
+                            .fg(badge_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    title_span,
+                ])
             })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let markers = Paragraph::new(Line::from(markers_text)).wrap(Wrap { trim: true });
-        frame.render_widget(markers, left_rows[1]);
-
-        let max_logs = left_rows[2].height as usize;
-        let log_lines: Vec<Line> = if self.logs.is_empty() {
-            vec![Line::from(Span::styled(
-                "(no setup logs yet)",
-                Style::default().fg(Color::DarkGray),
-            ))]
-        } else {
-            let skip = self.logs.len().saturating_sub(max_logs);
-            self.logs[skip..]
-                .iter()
-                .map(|l| Line::from(l.as_str()))
-                .collect()
-        };
-        let logs = Paragraph::new(log_lines).wrap(Wrap { trim: false });
-        frame.render_widget(logs, left_rows[2]);
+            .collect();
+        let checklist = Paragraph::new(checklist_lines);
+        frame.render_widget(checklist, left_rows[1]);
 
         // Right half: Box & Final Connection Info
         let dry_ip = self.last_dry_run_target.as_deref();
@@ -4855,12 +5103,12 @@ fn running_instances_total_cost_summary_at(
 
 fn step_short_label(step: SetupStepKind) -> &'static str {
     match step {
-        SetupStepKind::SystemUpdate => "Update",
-        SetupStepKind::CreateUser => "User",
-        SetupStepKind::HardenSsh => "SSH",
-        SetupStepKind::ConfigureRole => "Role",
-        SetupStepKind::Fail2banAndUpdates => "Fail2ban",
-        SetupStepKind::ConfigureMotd => "MOTD",
+        SetupStepKind::SystemUpdate => "1. System Update & Base Packages",
+        SetupStepKind::CreateUser => "2. Create Non-Root User & Sudo",
+        SetupStepKind::HardenSsh => "3. Harden SSH & Tailscale Access",
+        SetupStepKind::ConfigureRole => "4. Configure Server Role",
+        SetupStepKind::Fail2banAndUpdates => "5. Fail2ban & Security Updates",
+        SetupStepKind::ConfigureMotd => "6. Configure MOTD Dashboard",
     }
 }
 
@@ -4932,7 +5180,7 @@ impl TerminalGuard {
     fn init() -> Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(err.into());
         }
@@ -4941,7 +5189,7 @@ impl TerminalGuard {
             Ok(terminal) => Ok(Self { terminal }),
             Err(err) => {
                 let mut out = io::stdout();
-                let _ = execute!(out, LeaveAlternateScreen);
+                let _ = execute!(out, DisableBracketedPaste, LeaveAlternateScreen);
                 let _ = disable_raw_mode();
                 Err(err.into())
             }
@@ -4952,7 +5200,11 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -4975,16 +5227,21 @@ pub fn run_tui(settings_path: Option<&Path>, state_path: Option<&Path>) -> Resul
             break;
         }
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                app.handle_key_with_ui(key, |app_state| {
-                    // Discard keys typed during blocking provision/SSH calls so they cannot quit afterward.
-                    let _ = drain_pending_events();
-                    let _ = guard.terminal.draw(|frame| app_state.render_frame(frame));
-                });
-                drain_pending_events()?;
-                if app.should_quit {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    app.handle_key_with_ui(key, |app_state| {
+                        // Discard keys typed during blocking provision/SSH calls so they cannot quit afterward.
+                        let _ = drain_pending_events();
+                        let _ = guard.terminal.draw(|frame| app_state.render_frame(frame));
+                    });
+                    if app.should_quit {
+                        break;
+                    }
                 }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
+                }
+                _ => {}
             }
         }
     }
@@ -5109,7 +5366,15 @@ mod tests {
         assert!(text.contains("Log File: ~/.config/bab/bab.log (max 10 MB)"));
         assert!(!text.contains("Cloudflare DNS (Stub)"));
         assert!(!text.contains("API Key Settings (Encrypted)"));
-        assert!(text.contains("Setup Progress & Logs"));
+        assert!(text.contains("Setup Progress"));
+        assert!(!text.contains("Setup Progress & Logs"));
+        assert!(!text.contains("(no setup logs yet)"));
+        assert!(text.contains("[ ] 1. System Update & Base Packages"));
+        assert!(text.contains("[ ] 2. Create Non-Root User & Sudo"));
+        assert!(text.contains("[ ] 3. Harden SSH & Tailscale Access"));
+        assert!(text.contains("[ ] 4. Configure Server Role"));
+        assert!(text.contains("[ ] 5. Fail2ban & Security Updates"));
+        assert!(text.contains("[ ] 6. Configure MOTD Dashboard"));
         assert!(text.contains("Box & Final Connection Info"));
     }
 
@@ -5776,12 +6041,26 @@ mod tests {
         ] {
             app.screen = screen;
             let text = render_to_string(&app);
+            let bottom = render_with_size_to_string(100, 9, |frame| {
+                app.render_bottom_pane(frame, frame.area());
+            });
+            assert!(text.contains("Setup Progress"));
+            assert!(!text.contains("Setup Progress & Logs"));
             assert!(text.contains("2/6 steps"));
-            assert!(text.contains("[x] Update"));
-            assert!(text.contains("[!] User"));
-            assert!(text.contains("[ ] SSH"));
-            assert!(text.contains("apt updated successfully"));
-            assert!(text.contains("useradd error"));
+            assert!(text.contains("[x] 1. System Update & Base Packages"));
+            assert!(text.contains("[!] 2. Create Non-Root User & Sudo"));
+            assert!(text.contains("[ ] 3. Harden SSH & Tailscale Access"));
+            assert!(text.contains("[ ] 4. Configure Server Role"));
+            assert!(text.contains("[ ] 5. Fail2ban & Security Updates"));
+            assert!(text.contains("[ ] 6. Configure MOTD Dashboard"));
+            assert!(!bottom.contains("apt updated successfully"));
+            assert!(!bottom.contains("useradd error"));
+            assert!(!bottom.contains("(no setup logs yet)"));
+            if screen != Screen::ViewLog {
+                assert!(!text.contains("apt updated successfully"));
+                assert!(!text.contains("useradd error"));
+                assert!(!text.contains("(no setup logs yet)"));
+            }
             assert!(text.contains("Public IP:"));
             assert!(text.contains("198.51.100.20"));
             assert!(text.contains("Tailscale IP:"));
@@ -8390,5 +8669,330 @@ esac"#
         assert!(ts_view.contains("Provider: Existing Tailscale | Target IP: 100.64.10.20"));
         assert!(ts_view.contains("Region/Plan:   - / - (existing_tailscale)"));
         assert!(!ts_view.contains("/mo"));
+    }
+
+    #[test]
+    fn api_keys_paste_clear_show_hide_and_footer_fitting() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.screen = Screen::ApiKeys;
+
+        // Paste into CLOUDFLARE_API_TOKEN (field 4) while !editing
+        for _ in 0..4 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.api_keys.active_field, 4);
+        assert!(!app.api_keys.editing);
+        app.api_key_statuses[4] = ApiKeyTestStatus::Valid;
+        app.handle_paste("  cf-pasted-token-12345\r\n");
+        assert_eq!(app.api_keys.cloudflare, "cf-pasted-token-12345");
+        assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Untested);
+        assert!(app
+            .status_message
+            .contains("Pasted CLOUDFLARE_API_TOKEN (21 chars, auto-encrypted)"));
+        let settings = Settings::new(&settings_path);
+        assert_eq!(
+            settings.cloudflare_api_token()?,
+            Some("cf-pasted-token-12345".to_string())
+        );
+
+        // Pasting while !editing replaces the existing value instead of appending
+        app.handle_paste("cf-replaced-token-9999\n");
+        assert_eq!(app.api_keys.cloudflare, "cf-replaced-token-9999");
+        assert_eq!(
+            settings.cloudflare_api_token()?,
+            Some("cf-replaced-token-9999".to_string())
+        );
+
+        // Toggle show/hide with 'w' and verify rendered visibility + char length + footer
+        let masked_view = render_to_string(&app);
+        assert!(masked_view.contains("CLOUDFLARE_API_TOKEN: cf-r****9999 (22 chars)"));
+        assert!(!masked_view.contains("cf-replaced-token-9999"));
+        assert!(masked_view.contains("Esc/b/q: Back"));
+
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(app.show_api_keys);
+        let plain_view = render_to_string(&app);
+        assert!(plain_view.contains("CLOUDFLARE_API_TOKEN: cf-replaced-token-9999 (22 chars)"));
+
+        app.handle_key(key(KeyCode::Char('w')));
+        assert!(!app.show_api_keys);
+
+        // Clear CLOUDFLARE_API_TOKEN with 'c' while !editing
+        app.api_key_statuses[4] = ApiKeyTestStatus::Valid;
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.api_keys.cloudflare.is_empty());
+        assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Untested);
+        assert_eq!(settings.cloudflare_api_token()?, None);
+
+        // Move to GITHUB_TOKEN (field 5), enter editing mode, paste with trailing \r\n, then Ctrl+U clears
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.api_keys.active_field, 5);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.api_keys.editing);
+        app.handle_paste("ghp_part1\r\n");
+        app.handle_paste("_part2\n");
+        assert_eq!(app.api_keys.github, "ghp_part1_part2");
+        assert_eq!(
+            settings.github_token()?,
+            Some("ghp_part1_part2".to_string())
+        );
+
+        let editing_view = render_to_string(&app);
+        assert!(editing_view.contains("GITHUB_TOKEN: ghp_****art2 [EDITING] (15 chars)"));
+        assert!(editing_view.contains("Ctrl+U: Clear"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert!(app.api_keys.github.is_empty());
+        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Untested);
+        assert_eq!(settings.github_token()?, None);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.api_keys.editing);
+
+        // Delete / Backspace when !editing also clear the active field
+        app.handle_paste("ghp_delete_me_12345\r\n");
+        assert_eq!(app.api_keys.github, "ghp_delete_me_12345");
+        app.handle_key(key(KeyCode::Delete));
+        assert!(app.api_keys.github.is_empty());
+        assert_eq!(settings.github_token()?, None);
+
+        // Paste also works while editing AccessConfig, CloudflareDns, and GithubDeploy
+        app.screen = Screen::AccessConfig;
+        app.access.active_field = 1; // Sudo Username
+        app.access.username.clear();
+        app.access.editing = true;
+        app.handle_paste("  alice\r\n");
+        assert_eq!(app.access.username, "alice");
+
+        app.screen = Screen::CloudflareDns;
+        app.cf_dns.active_field = 0; // Zone
+        app.cf_dns.zone.clear();
+        app.cf_dns.editing = true;
+        app.handle_paste("  example.dev\r\n");
+        assert_eq!(app.cf_dns.zone, "example.dev");
+
+        app.screen = Screen::GithubDeploy;
+        app.github_deploy.active_field = 0; // Repository
+        app.github_deploy.repo.clear();
+        app.github_deploy.editing = true;
+        app.handle_paste("  octocat/hello-world\r\n");
+        assert_eq!(app.github_deploy.repo, "octocat/hello-world");
+
+        Ok(())
+    }
+
+    #[test]
+    fn api_keys_test_single_and_all_via_mock_http_servers() -> Result<()> {
+        let _lock = crate::env_lock();
+        let _env = TestEnvGuard::new(&[
+            "TAILSCALE_API_BASE",
+            "VULTR_API_BASE_URL",
+            "UPCLOUD_API_BASE_URL",
+            "LINODE_API_BASE_URL",
+            "CLOUDFLARE_API_BASE",
+            "GITHUB_API_BASE",
+        ]);
+
+        let srv = MockHttpServer::spawn(|method, path, _| match (method, path) {
+            ("GET", "/ts-ok/tailnet/-/devices") => ("200 OK", r#"{"devices":[]}"#.to_string()),
+            ("GET", "/vultr-ok/account") => {
+                ("200 OK", r#"{"account":{"email":"ops@example.com"}}"#.to_string())
+            }
+            ("GET", "/upcloud-ok/account") => {
+                ("200 OK", r#"{"account":{"username":"demo"}}"#.to_string())
+            }
+            ("GET", "/linode-ok/profile") => ("200 OK", r#"{"username":"demo"}"#.to_string()),
+            ("GET", "/cf-ok/user/tokens/verify") => ("200 OK", r#"{"success":true}"#.to_string()),
+            ("GET", "/cf-bad/user/tokens/verify") => ("401 Unauthorized", r#"{"success":false}"#.to_string()),
+            ("GET", "/gh-ok/user") => ("200 OK", r#"{"login":"octocat"}"#.to_string()),
+            ("GET", "/gh-err/user") => ("500 Internal Server Error", r#"{"message":"boom"}"#.to_string()),
+            _ => ("404 Not Found", "{}".to_string()),
+        })?;
+
+        std::env::set_var("TAILSCALE_API_BASE", format!("http://{}/ts-ok", srv.addr));
+        std::env::set_var("VULTR_API_BASE_URL", format!("http://{}/vultr-ok", srv.addr));
+        std::env::set_var(
+            "UPCLOUD_API_BASE_URL",
+            format!("http://{}/upcloud-ok", srv.addr),
+        );
+        std::env::set_var("LINODE_API_BASE_URL", format!("http://{}/linode-ok", srv.addr));
+        std::env::set_var("CLOUDFLARE_API_BASE", format!("http://{}/cf-ok", srv.addr));
+        std::env::set_var("GITHUB_API_BASE", format!("http://{}/gh-ok", srv.addr));
+
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.screen = Screen::ApiKeys;
+
+        app.api_keys.tailscale = "tskey-valid-1234".to_string();
+        app.api_keys.vultr = "vultr-valid-1234".to_string();
+        app.api_keys.upcloud = "upcloud-valid-1234".to_string();
+        app.api_keys.linode = "linode-valid-1234".to_string();
+        app.api_keys.cloudflare = "cf-valid-1234".to_string();
+        app.api_keys.github = "ghp_valid_1234".to_string();
+
+        // Test single selected key ('t') on CLOUDFLARE_API_TOKEN (field 4)
+        app.api_keys.active_field = 4;
+        app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Valid);
+        assert!(app.status_message.contains("CLOUDFLARE_API_TOKEN: VALID"));
+
+        // Move selection off field 4 so List highlight_style doesn't override span fg color
+        app.api_keys.active_field = 0;
+        let buf = render_to_buffer(&app);
+        assert_token_fg_in_row(&buf, "[VALID]", "[VALID]", Color::LightGreen);
+
+        // Editing/pasting resets that slot back to Untested
+        app.api_keys.active_field = 4;
+        app.handle_paste("cf-new-token-5678\r\n");
+        assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Untested);
+
+        // Test all ('a') with valid, invalid, and server error responses
+        app.api_keys.active_field = 0;
+        std::env::set_var("CLOUDFLARE_API_BASE", format!("http://{}/cf-bad", srv.addr));
+        std::env::set_var("GITHUB_API_BASE", format!("http://{}/gh-err", srv.addr));
+        app.handle_key(key(KeyCode::Char('a')));
+
+        assert_eq!(app.api_key_statuses[0], ApiKeyTestStatus::Valid);
+        assert_eq!(app.api_key_statuses[1], ApiKeyTestStatus::Valid);
+        assert_eq!(app.api_key_statuses[2], ApiKeyTestStatus::Valid);
+        assert_eq!(app.api_key_statuses[3], ApiKeyTestStatus::Valid);
+        assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Invalid);
+        assert!(matches!(
+            app.api_key_statuses[5],
+            ApiKeyTestStatus::Error(_)
+        ));
+        assert!(app
+            .status_message
+            .contains("Tested 6 key(s): 4 valid, 1 invalid, 1 error(s)"));
+
+        let buf = render_to_buffer(&app);
+        assert_token_fg_in_row(
+            &buf,
+            "VULTR_API_KEY: vult****1234 (16 chars) [VALID]",
+            "[VALID]",
+            Color::LightGreen,
+        );
+        assert_token_fg_in_row(&buf, "[INVALID]", "[INVALID]", Color::LightRed);
+        assert_token_fg_in_row(&buf, "[ERROR:", "[ERROR:", Color::Red);
+
+        Ok(())
+    }
+
+    #[test]
+    fn running_instances_destroy_confirm_ignores_enter_and_requires_y() -> Result<()> {
+        let _lock = crate::env_lock();
+        let _env = TestEnvGuard::new(&["VULTR_API_BASE_URL"]);
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let deleted_bg = std::sync::Arc::clone(&deleted);
+
+        let srv = MockHttpServer::spawn(move |method, path, _| match (method, path) {
+            ("DELETE", "/v2/instances/vultr-202") => {
+                deleted_bg.store(true, std::sync::atomic::Ordering::SeqCst);
+                ("204 No Content", String::new())
+            }
+            _ => ("200 OK", "{}".to_string()),
+        })?;
+        std::env::set_var("VULTR_API_BASE_URL", format!("http://{}/v2", srv.addr));
+
+        let keys = ApiKeyForm {
+            vultr: "vultr-test-key".to_string(),
+            ..Default::default()
+        };
+        let mut app = TuiApp::new(SessionData::default(), keys);
+        app.screen = Screen::RunningInstances;
+        app.running_instances = vec![ProviderInstance {
+            provider: ProviderKind::Vultr,
+            id: "vultr-202".to_string(),
+            name: "guard-box".to_string(),
+            status: "active".to_string(),
+            public_ip: Some("203.0.113.88".to_string()),
+            region: Some("ewr".to_string()),
+            plan: Some("vc2-1c-1gb".to_string()),
+            created_at: None,
+        }];
+
+        // Enter destroy confirmation
+        app.handle_key(key(KeyCode::Char('d')));
+        assert!(app.running_confirm_destroy);
+        let confirm_view = render_to_string(&app);
+        assert!(confirm_view.contains("Press 'y' to confirm"));
+        assert!(!confirm_view.contains("y/Enter"));
+
+        // Pressing Enter must NOT destroy; confirmation remains active with warning status
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.running_confirm_destroy);
+        assert!(!deleted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(app.running_instances.len(), 1);
+        assert_eq!(
+            app.status_message,
+            "Press 'y' to confirm destroy, or 'n'/Esc to cancel"
+        );
+
+        // Pressing 'y' destroys the instance
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(!app.running_confirm_destroy);
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(app.running_instances.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn setup_progress_renders_active_step_badges_and_clears_after_build() {
+        let _lock = crate::env_lock();
+        let mut app = TuiApp::new(SessionData::default(), ApiKeyForm::default());
+        app.record_step(&StepReport {
+            step: SetupStepKind::SystemUpdate,
+            success: true,
+            dry_run: true,
+            output: "ok".to_string(),
+        });
+        app.record_step(&StepReport {
+            step: SetupStepKind::CreateUser,
+            success: false,
+            dry_run: true,
+            output: "err".to_string(),
+        });
+        app.active_step = Some(SetupStepKind::HardenSsh);
+
+        let buf = render_to_buffer(&app);
+        assert_token_fg_in_row(
+            &buf,
+            "[x] 1. System Update & Base Packages",
+            "[x]",
+            Color::LightGreen,
+        );
+        assert_token_fg_in_row(
+            &buf,
+            "[!] 2. Create Non-Root User & Sudo",
+            "[!]",
+            Color::Red,
+        );
+        assert_token_fg_in_row(
+            &buf,
+            "[>] 3. Harden SSH & Tailscale Access",
+            "[>]",
+            Color::Yellow,
+        );
+        assert_token_fg_in_row(&buf, "[ ] 4. Configure Server Role", "[ ]", Color::DarkGray);
+
+        // Dry-run execute_build_with_ui sets active_step during steps and clears it when complete
+        app.build_dry_run = true;
+        app.selected_provider = ProviderKind::ExistingTailscale;
+        let mut saw_active_step = false;
+        app.execute_build_with_ui(|snap| {
+            if snap.active_step.is_some() {
+                saw_active_step = true;
+            }
+        });
+        assert!(saw_active_step);
+        assert_eq!(app.active_step, None);
+        assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
     }
 }

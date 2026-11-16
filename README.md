@@ -11,9 +11,9 @@
   3. **Access, User & Transport** (includes synced `SUDO_NOPASSWD` Passwordless Sudo ON/OFF toggle)
   4. **Cloudflare DNS** (includes synced `CF_ENABLED` ON/OFF toggle)
   5. **GitHub Repo Deployment** (includes synced `GITHUB_ENABLED` ON/OFF toggle)
-  6. **API Key Settings** (auto-saves encrypted keys as you edit)
+  6. **API Key Settings** (`Screen::ApiKeys`): supports bracketed paste directly into any selected or edited key field (including `CLOUDFLARE_API_TOKEN` and `GITHUB_TOKEN`), Show/Hide (`w`), Clear (`c` / `Delete` / `Backspace`, or `Ctrl+U` while editing), live key testing (`t` to test selected key, `a` to test all configured keys; or `bab settings --test` in CLI), and automatic encrypted persistence as you edit.
   7. **Build Box with Current Options** (`Screen::BuildBox`): review current configuration, toggle Cloudflare DNS ON/OFF (`d` / `Space`), GitHub Repo Deployment ON/OFF (`g`), and Passwordless Sudo ON/OFF (`p`), show/hide (`w`) or regenerate (`r`) the 10-character sudo password, toggle Dry-Run (`n`), and run provisioning + setup (`Enter` / `x`). Bright green (`ON`) and bright red (`OFF`) toggle indicators stay synced across **Access, User & Transport**, **Cloudflare DNS**, **GitHub Repo Deployment**, and **Build Box with Current Options**.
-  8. **Running Systems & Destroy** (`Screen::RunningInstances`): query live instances across configured Vultr, UpCloud, and Linode accounts (`r` to refresh), inspect status/IPs/region/plan, running cost tracking (per-instance `COST` column, `Total Cost:` across priced instances, and detailed `accrued`, uptime, hourly, and monthly rates in the selected-instance bar), and recorded per-box sudo passwords (`w` to Show/Hide Password), and destroy selected instances (`d` / `x` / `Delete` with `y`/`Enter` confirmation, automatically removing any matching device from your Tailscale tailnet).
+  8. **Running Systems & Destroy** (`Screen::RunningInstances`): query live instances across configured Vultr, UpCloud, and Linode accounts (`r` to refresh), inspect status/IPs/region/plan, running cost tracking (per-instance `COST` column, `Total Cost:` across priced instances, and detailed `accrued`, uptime, hourly, and monthly rates in the selected-instance bar), and recorded per-box sudo passwords (`w` to Show/Hide Password), and destroy selected instances (`d` / `x` / `Delete` with strict `'y'` confirmation — never `Enter` — automatically removing any matching device from your Tailscale tailnet).
   9. **`[9]` View Log** (`Screen::ViewLog`): inspect persistent timestamped logs stored in `~/.config/bab/bab.log` (`j`/`k` or `Up`/`Down` to scroll, `PgUp`/`PgDn` to page, `g`/`G` to jump to top/bottom, `r` to reload from disk, `c` to clear).
   10. **`[0]` Quit** (`0` or `q` on the Home screen).
   - **Consistent Back Navigation**: Pressing `q`, `Esc`, or `b` from any submenu returns to the **Home** screen instead of exiting the application (when not editing a field or confirming an action).
@@ -30,7 +30,7 @@
   - The Vultr client binds an **IPv4-first** local address by default (falling back automatically to dual-stack if needed) so IP-whitelisted Vultr API keys authenticate reliably on dual-stack hosts without hitting IPv6 `401 Unauthorized IP address` errors.
   - Inspect curated or live provider regions, machine sizes (plans), and OS images via `bab catalog --provider <vultr|upcloud|linode> [--live]`, pass `--region`, `--plan`, `--image` to `bab setup`, or choose interactively in the TUI under **Select Provider, Location & Size**.
 - **Persistent TUI Bottom Pane**:
-  - Displays live provisioning/setup progress alongside the **Final Connection Info** summary (`Public IP`, `Tailscale IP`, `Active Target`, `Provider/Region/Plan/Image`, `Role`, `Transport`, `Cloudflare DNS`, and `GitHub Repo`) across screens.
+  - Displays a clean **Setup Progress** step-status pane (step gauge plus the 6 setup steps with `[x]` / `[>]` / `[!]` / `[ ]` status indicators instead of duplicate bottom logs; full logs remain on **Build Box with Current Options** and **`[9]` View Log**) alongside the **Final Connection Info** summary (`Public IP`, `Tailscale IP`, `Active Target`, `Provider/Region/Plan/Image`, `Role`, `Transport`, `Cloudflare DNS`, and `GitHub Repo`) across screens.
 - **Cloudflare DNS (Stub) & Toggle**:
   - Plan and record an A-record upsert with `bab dns --zone <ZONE> --record <NAME> [--ip <IP>] [--proxied]` or via `--cf-zone` / `--cf-record` / `--cf-proxied` on `bab setup`, or in the TUI under **Cloudflare DNS**.
   - Enable or skip the Cloudflare DNS step during `bab setup` with `--cf-dns` (uses saved `CF_ZONE` / `CF_RECORD` / `CF_TARGET` / `CF_PROXIED`) or `--no-cf-dns`, or toggle `CF_ENABLED` ON/OFF directly on the TUI **Cloudflare DNS** (`t`) and **Build Box with Current Options** (`d` / `Space`) screens.
@@ -73,6 +73,8 @@ bab
 # Store API keys (encrypted with ChaCha20-Poly1305 in ~/.config/bab/credentials.enc)
 bab settings --tailscale-key tskey-api-... --vultr-key ... --linode-token ... --upcloud-token ... --cloudflare-token ... --github-token ...
 bab settings --show
+# Validate all configured API keys against their live APIs
+bab settings --test
 
 # Inspect curated or live provider regions, plans, and images
 bab catalog --provider vultr

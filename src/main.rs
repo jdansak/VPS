@@ -8,18 +8,18 @@ use bab::config::{
     default_config_dir, generate_random_password, LogStore, SessionData, SessionState, Settings,
     MAX_LOG_FILE_BYTES, SUDO_PASSWORD_LEN,
 };
-use bab::dns::{build_cloudflare_dns_stub_plan, CloudflareDnsConfig};
+use bab::dns::{build_cloudflare_dns_stub_plan, validate_cloudflare_token, CloudflareDnsConfig};
 use bab::providers::linode::LinodeProvider;
 use bab::providers::upcloud::UpCloudProvider;
 use bab::providers::vultr::VultrProvider;
 use bab::providers::{
-    clear_destroyed_session_if_matches, default_images_for, default_plans_for,
-    default_regions_for, destroy_provider_instance, provision_full_flow, query_all_providers,
-    validate_instance_id, ProvisionConfig, ProviderInstance, ProviderKind, ProviderQueryStatus,
-    VpsProvider,
+    build_cloud_provider_with_key, clear_destroyed_session_if_matches, default_images_for,
+    default_plans_for, default_regions_for, destroy_provider_instance, provision_full_flow,
+    query_all_providers, validate_instance_id, ProvisionConfig, ProviderInstance, ProviderKind,
+    ProviderQueryStatus, VpsProvider,
 };
 use bab::roles::ServerRole;
-use bab::setup::{GithubDeployConfig, SetupConfig, SetupRunner};
+use bab::setup::{validate_github_token, GithubDeployConfig, SetupConfig, SetupRunner};
 use bab::tailscale::{
     generate_cloud_init, generate_ssh_cloud_init, TailscaleClient, TailscaleDevice,
 };
@@ -279,6 +279,9 @@ struct SettingsArgs {
     /// Display masked API key status
     #[arg(long)]
     show: bool,
+    /// Validate configured API keys against their live APIs
+    #[arg(long)]
+    test: bool,
     /// Set TAILSCALE_API_KEY
     #[arg(long)]
     tailscale_key: Option<String>,
@@ -1953,6 +1956,93 @@ fn cmd_cloud_init(args: CloudInitArgs) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyValidationOutcome {
+    NotSet,
+    Valid,
+    Invalid,
+    Error(String),
+}
+
+fn validate_api_key_by_name(name: &str, value: &str) -> KeyValidationOutcome {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return KeyValidationOutcome::NotSet;
+    }
+
+    let result = match name {
+        "TAILSCALE_API_KEY" => {
+            TailscaleClient::new(trimmed).and_then(|client| client.validate_api_key())
+        }
+        "VULTR_API_KEY" => build_cloud_provider_with_key(ProviderKind::Vultr, trimmed, None)
+            .and_then(|provider| provider.validate_key()),
+        "UPCLOUD_API_TOKEN" => build_cloud_provider_with_key(ProviderKind::UpCloud, trimmed, None)
+            .and_then(|provider| provider.validate_key()),
+        "LINODE_API_TOKEN" => build_cloud_provider_with_key(ProviderKind::Linode, trimmed, None)
+            .and_then(|provider| provider.validate_key()),
+        "CLOUDFLARE_API_TOKEN" => validate_cloudflare_token(trimmed),
+        "GITHUB_TOKEN" => validate_github_token(trimmed),
+        other => Err(anyhow!("Unknown API key '{}'", other)),
+    };
+
+    match result {
+        Ok(true) => KeyValidationOutcome::Valid,
+        Ok(false) => KeyValidationOutcome::Invalid,
+        Err(err) => KeyValidationOutcome::Error(err.to_string()),
+    }
+}
+
+fn test_configured_api_keys<W: std::io::Write>(
+    entries: &[(&str, String)],
+    out: &mut W,
+) -> Result<()> {
+    let mut valid_count = 0usize;
+    let mut invalid_count = 0usize;
+    let mut error_count = 0usize;
+    let mut not_set_count = 0usize;
+
+    writeln!(out, "API Key Live Validation:")?;
+    for (name, value) in entries {
+        let outcome = validate_api_key_by_name(name, value);
+        let badge = match &outcome {
+            KeyValidationOutcome::Valid => {
+                valid_count += 1;
+                "[VALID]".to_string()
+            }
+            KeyValidationOutcome::Invalid => {
+                invalid_count += 1;
+                "[INVALID]".to_string()
+            }
+            KeyValidationOutcome::NotSet => {
+                not_set_count += 1;
+                "[NOT SET]".to_string()
+            }
+            KeyValidationOutcome::Error(msg) => {
+                error_count += 1;
+                format!("[ERROR: {}]", msg)
+            }
+        };
+        let masked = ApiKeyForm::mask_key(value.trim());
+        writeln!(out, "  {}: {} {}", name, masked, badge)?;
+    }
+
+    writeln!(
+        out,
+        "Validation Summary: {} valid, {} invalid, {} error, {} not set",
+        valid_count, invalid_count, error_count, not_set_count
+    )?;
+
+    if invalid_count > 0 || error_count > 0 {
+        return Err(anyhow!(
+            "API key validation failed: {} invalid, {} error(s)",
+            invalid_count,
+            error_count
+        ));
+    }
+
+    Ok(())
+}
+
 fn cmd_settings(args: SettingsArgs) -> Result<()> {
     let settings = Settings::load_default()?;
     let mut updated = false;
@@ -1982,14 +2072,34 @@ fn cmd_settings(args: SettingsArgs) -> Result<()> {
         updated = true;
     }
 
-    if args.show || updated || (!args.show && !updated) {
-        let ts = settings.tailscale_api_key()?.unwrap_or_default();
-        let vultr = settings.vultr_api_key()?.unwrap_or_default();
-        let upcloud = settings.upcloud_api_token()?.unwrap_or_default();
-        let linode = settings.linode_api_token()?.unwrap_or_default();
-        let cloudflare = settings.cloudflare_api_token()?.unwrap_or_default();
-        let github = settings.github_token()?.unwrap_or_default();
+    let entries = [
+        (
+            "TAILSCALE_API_KEY",
+            settings.tailscale_api_key()?.unwrap_or_default(),
+        ),
+        (
+            "VULTR_API_KEY",
+            settings.vultr_api_key()?.unwrap_or_default(),
+        ),
+        (
+            "UPCLOUD_API_TOKEN",
+            settings.upcloud_api_token()?.unwrap_or_default(),
+        ),
+        (
+            "LINODE_API_TOKEN",
+            settings.linode_api_token()?.unwrap_or_default(),
+        ),
+        (
+            "CLOUDFLARE_API_TOKEN",
+            settings.cloudflare_api_token()?.unwrap_or_default(),
+        ),
+        (
+            "GITHUB_TOKEN",
+            settings.github_token()?.unwrap_or_default(),
+        ),
+    ];
 
+    if args.show || updated || args.test || (!args.show && !updated) {
         let config_dir = settings
             .path()
             .parent()
@@ -2002,12 +2112,9 @@ fn cmd_settings(args: SettingsArgs) -> Result<()> {
         let log = resolve_cli_log_store(&settings);
         let max_log_mb = MAX_LOG_FILE_BYTES / (1024 * 1024);
 
-        println!("TAILSCALE_API_KEY: {}", ApiKeyForm::mask_key(&ts));
-        println!("VULTR_API_KEY: {}", ApiKeyForm::mask_key(&vultr));
-        println!("UPCLOUD_API_TOKEN: {}", ApiKeyForm::mask_key(&upcloud));
-        println!("LINODE_API_TOKEN: {}", ApiKeyForm::mask_key(&linode));
-        println!("CLOUDFLARE_API_TOKEN: {}", ApiKeyForm::mask_key(&cloudflare));
-        println!("GITHUB_TOKEN: {}", ApiKeyForm::mask_key(&github));
+        for (name, value) in &entries {
+            println!("{}: {}", name, ApiKeyForm::mask_key(value));
+        }
         println!("Config Directory: {} (0700)", config_dir.display());
         println!(
             "Encrypted Credentials: {} (0600, ChaCha20-Poly1305)",
@@ -2019,6 +2126,10 @@ fn cmd_settings(args: SettingsArgs) -> Result<()> {
             log.path().display(),
             max_log_mb
         );
+    }
+
+    if args.test {
+        test_configured_api_keys(&entries, &mut std::io::stdout())?;
     }
 
     Ok(())
@@ -4131,5 +4242,425 @@ mod tests {
             "$10/mo ($0.015/hr)"
         );
         assert_eq!(live_lines[2][live_cost_idx..].trim_end(), "-");
+    }
+
+    struct MockKeyValidationServer {
+        addr: std::net::SocketAddr,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    impl MockKeyValidationServer {
+        fn shutdown(self) -> Vec<(String, String)> {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.addr);
+            self.handle.join().unwrap();
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    fn spawn_key_validation_mock_server() -> MockKeyValidationServer {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind key mock server");
+        let addr = listener.local_addr().expect("key mock local_addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let reqs_clone = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+
+        let handle = std::thread::spawn(move || {
+            while !stop_clone.load(Ordering::SeqCst) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                if stop_clone.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let mut reader = BufReader::new(&stream);
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or("").to_string();
+                let path = parts.next().unwrap_or("").to_string();
+
+                let mut auth_header = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                    if trimmed.is_empty() {
+                        break;
+                    }
+                    if let Some((name, val)) = trimmed.split_once(':') {
+                        if name.trim().eq_ignore_ascii_case("authorization") {
+                            auth_header = val.trim().to_string();
+                        }
+                    }
+                }
+
+                reqs_clone
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), path.clone()));
+
+                let (status, reason, body) = if auth_header.contains("error-") {
+                    (
+                        500,
+                        "Internal Server Error",
+                        r#"{"message":"mock api failure"}"#.to_string(),
+                    )
+                } else if auth_header.contains("invalid-") {
+                    (
+                        401,
+                        "Unauthorized",
+                        r#"{"message":"unauthorized"}"#.to_string(),
+                    )
+                } else {
+                    match (method.as_str(), path.as_str()) {
+                        ("GET", "/api/v2/tailnet/-/devices") => {
+                            (200, "OK", r#"{"devices":[]}"#.to_string())
+                        }
+                        ("GET", "/v2/account") => {
+                            (200, "OK", r#"{"account":{"email":"ops@example.com"}}"#.to_string())
+                        }
+                        ("GET", "/1.3/account") => {
+                            (200, "OK", r#"{"account":{"username":"upcloud-ops"}}"#.to_string())
+                        }
+                        ("GET", "/v4/profile") => {
+                            (200, "OK", r#"{"username":"linode-ops"}"#.to_string())
+                        }
+                        ("GET", "/client/v4/user/tokens/verify") => {
+                            (200, "OK", r#"{"success":true}"#.to_string())
+                        }
+                        ("GET", "/user") => {
+                            (200, "OK", r#"{"login":"octocat"}"#.to_string())
+                        }
+                        _ => (404, "Not Found", r#"{"error":"not found"}"#.to_string()),
+                    }
+                };
+
+                let resp = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    status,
+                    reason,
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        MockKeyValidationServer {
+            addr,
+            requests,
+            stop,
+            handle,
+        }
+    }
+
+    #[test]
+    fn parse_settings_test_flag() {
+        let plain = Cli::try_parse_from(["bab", "settings"]).unwrap();
+        match plain.command {
+            Some(Commands::Settings(args)) => {
+                assert!(!args.show);
+                assert!(!args.test);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let show_only = Cli::try_parse_from(["bab", "settings", "--show"]).unwrap();
+        match show_only.command {
+            Some(Commands::Settings(args)) => {
+                assert!(args.show);
+                assert!(!args.test);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let test_only = Cli::try_parse_from(["bab", "settings", "--test"]).unwrap();
+        match test_only.command {
+            Some(Commands::Settings(args)) => {
+                assert!(!args.show);
+                assert!(args.test);
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+
+        let both = Cli::try_parse_from([
+            "bab",
+            "settings",
+            "--show",
+            "--test",
+            "--cloudflare-token",
+            "cf-test-1234",
+        ])
+        .unwrap();
+        match both.command {
+            Some(Commands::Settings(args)) => {
+                assert!(args.show);
+                assert!(args.test);
+                assert_eq!(args.cloudflare_token.as_deref(), Some("cf-test-1234"));
+            }
+            other => panic!("unexpected command: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_configured_api_keys_reports_valid_invalid_not_set_and_error() -> Result<()> {
+        let _lock = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = spawn_key_validation_mock_server();
+        let base_root = format!("http://{}", server.addr);
+
+        let _g_ts = EnvVarGuard::set(
+            "TAILSCALE_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/api/v2", base_root)),
+        );
+        let _g_vultr_base = EnvVarGuard::set(
+            "VULTR_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/v2", base_root)),
+        );
+        let _g_vultr_url = EnvVarGuard::set(
+            "VULTR_API_BASE_URL",
+            std::ffi::OsStr::new(&format!("{}/v2", base_root)),
+        );
+        let _g_upcloud_base = EnvVarGuard::set(
+            "UPCLOUD_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/1.3", base_root)),
+        );
+        let _g_upcloud_url = EnvVarGuard::set(
+            "UPCLOUD_API_BASE_URL",
+            std::ffi::OsStr::new(&format!("{}/1.3", base_root)),
+        );
+        let _g_linode_base = EnvVarGuard::set(
+            "LINODE_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/v4", base_root)),
+        );
+        let _g_linode_url = EnvVarGuard::set(
+            "LINODE_API_BASE_URL",
+            std::ffi::OsStr::new(&format!("{}/v4", base_root)),
+        );
+        let _g_cf_base = EnvVarGuard::set(
+            "CLOUDFLARE_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/client/v4", base_root)),
+        );
+        let _g_gh_base = EnvVarGuard::set(
+            "GITHUB_API_BASE",
+            std::ffi::OsStr::new(&base_root),
+        );
+
+        // 1. All 6 keys valid
+        let all_valid = vec![
+            ("TAILSCALE_API_KEY", "tskey-valid-1234".to_string()),
+            ("VULTR_API_KEY", "vultr-valid-2345".to_string()),
+            ("UPCLOUD_API_TOKEN", "upcloud-valid-3456".to_string()),
+            ("LINODE_API_TOKEN", "linode-valid-4567".to_string()),
+            ("CLOUDFLARE_API_TOKEN", "cf-valid-5678".to_string()),
+            ("GITHUB_TOKEN", "ghp_valid-6789".to_string()),
+        ];
+        let mut out_ok = Vec::new();
+        test_configured_api_keys(&all_valid, &mut out_ok)?;
+        let ok_str = String::from_utf8(out_ok).unwrap();
+        assert!(ok_str.contains("TAILSCALE_API_KEY: tske****1234 [VALID]"));
+        assert!(ok_str.contains("VULTR_API_KEY: vult****2345 [VALID]"));
+        assert!(ok_str.contains("UPCLOUD_API_TOKEN: upcl****3456 [VALID]"));
+        assert!(ok_str.contains("LINODE_API_TOKEN: lino****4567 [VALID]"));
+        assert!(ok_str.contains("CLOUDFLARE_API_TOKEN: cf-v****5678 [VALID]"));
+        assert!(ok_str.contains("GITHUB_TOKEN: ghp_****6789 [VALID]"));
+        assert!(ok_str.contains("Validation Summary: 6 valid, 0 invalid, 0 error, 0 not set"));
+        assert!(!ok_str.contains("tskey-valid-1234"));
+        assert!(!ok_str.contains("ghp_valid-6789"));
+
+        // 2. Mixed valid, invalid, error, and not set -> returns Err and prints clear badges & summary
+        let mixed = vec![
+            ("TAILSCALE_API_KEY", "tskey-valid-1234".to_string()),
+            ("VULTR_API_KEY", "invalid-vultr-key-9999".to_string()),
+            ("UPCLOUD_API_TOKEN", "   ".to_string()),
+            ("LINODE_API_TOKEN", String::new()),
+            ("CLOUDFLARE_API_TOKEN", "error-cf-token-8888".to_string()),
+            ("GITHUB_TOKEN", "ghp_valid-6789".to_string()),
+        ];
+        let mut out_mixed = Vec::new();
+        let err = test_configured_api_keys(&mixed, &mut out_mixed).unwrap_err();
+        let mixed_str = String::from_utf8(out_mixed).unwrap();
+        assert!(err.to_string().contains("1 invalid, 1 error(s)"));
+        assert!(mixed_str.contains("TAILSCALE_API_KEY: tske****1234 [VALID]"));
+        assert!(mixed_str.contains("VULTR_API_KEY: inva****9999 [INVALID]"));
+        assert!(mixed_str.contains("UPCLOUD_API_TOKEN: (not set) [NOT SET]"));
+        assert!(mixed_str.contains("LINODE_API_TOKEN: (not set) [NOT SET]"));
+        assert!(mixed_str.contains("CLOUDFLARE_API_TOKEN: erro****8888 [ERROR:"));
+        assert!(mixed_str.contains("GITHUB_TOKEN: ghp_****6789 [VALID]"));
+        assert!(mixed_str.contains("Validation Summary: 2 valid, 1 invalid, 1 error, 2 not set"));
+        assert!(!mixed_str.contains("invalid-vultr-key-9999"));
+        assert!(!mixed_str.contains("error-cf-token-8888"));
+
+        // 3. No keys configured -> succeeds without HTTP calls
+        let none_set = vec![
+            ("TAILSCALE_API_KEY", String::new()),
+            ("VULTR_API_KEY", String::new()),
+            ("UPCLOUD_API_TOKEN", String::new()),
+            ("LINODE_API_TOKEN", String::new()),
+            ("CLOUDFLARE_API_TOKEN", String::new()),
+            ("GITHUB_TOKEN", String::new()),
+        ];
+        let mut out_none = Vec::new();
+        test_configured_api_keys(&none_set, &mut out_none)?;
+        let none_str = String::from_utf8(out_none).unwrap();
+        assert!(none_str.contains("Validation Summary: 0 valid, 0 invalid, 0 error, 6 not set"));
+
+        let recorded = server.shutdown();
+        assert!(recorded
+            .iter()
+            .any(|(m, p)| m == "GET" && p == "/api/v2/tailnet/-/devices"));
+        assert!(recorded
+            .iter()
+            .any(|(m, p)| m == "GET" && p == "/v2/account"));
+        assert!(recorded
+            .iter()
+            .any(|(m, p)| m == "GET" && p == "/1.3/account"));
+        assert!(recorded
+            .iter()
+            .any(|(m, p)| m == "GET" && p == "/v4/profile"));
+        assert!(recorded
+            .iter()
+            .any(|(m, p)| m == "GET" && p == "/client/v4/user/tokens/verify"));
+        assert!(recorded.iter().any(|(m, p)| m == "GET" && p == "/user"));
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_settings_test_validates_saved_keys_while_show_stays_offline() -> Result<()> {
+        let _lock = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir()?;
+        let cfg_dir = dir.path().join("cfg");
+        let server = spawn_key_validation_mock_server();
+        let base_root = format!("http://{}", server.addr);
+
+        let _g_cfg = EnvVarGuard::set("BAB_CONFIG_DIR", cfg_dir.as_os_str());
+        let _g_settings = EnvVarGuard::remove("BAB_SETTINGS_FILE");
+        let _g_state = EnvVarGuard::remove("BAB_STATE_FILE");
+        let _g_log = EnvVarGuard::remove("BAB_LOG_FILE");
+        let _g_ts_env = EnvVarGuard::remove("TAILSCALE_API_KEY");
+        let _g_vultr_env = EnvVarGuard::remove("VULTR_API_KEY");
+        let _g_upcloud_env = EnvVarGuard::remove("UPCLOUD_API_TOKEN");
+        let _g_linode_env = EnvVarGuard::remove("LINODE_API_TOKEN");
+        let _g_cf_env = EnvVarGuard::remove("CLOUDFLARE_API_TOKEN");
+        let _g_gh_env = EnvVarGuard::remove("GITHUB_TOKEN");
+
+        let _g_ts = EnvVarGuard::set(
+            "TAILSCALE_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/api/v2", base_root)),
+        );
+        let _g_vultr_base = EnvVarGuard::set(
+            "VULTR_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/v2", base_root)),
+        );
+        let _g_vultr_url = EnvVarGuard::set(
+            "VULTR_API_BASE_URL",
+            std::ffi::OsStr::new(&format!("{}/v2", base_root)),
+        );
+        let _g_upcloud_base = EnvVarGuard::set(
+            "UPCLOUD_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/1.3", base_root)),
+        );
+        let _g_upcloud_url = EnvVarGuard::set(
+            "UPCLOUD_API_BASE_URL",
+            std::ffi::OsStr::new(&format!("{}/1.3", base_root)),
+        );
+        let _g_linode_base = EnvVarGuard::set(
+            "LINODE_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/v4", base_root)),
+        );
+        let _g_linode_url = EnvVarGuard::set(
+            "LINODE_API_BASE_URL",
+            std::ffi::OsStr::new(&format!("{}/v4", base_root)),
+        );
+        let _g_cf_base = EnvVarGuard::set(
+            "CLOUDFLARE_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/client/v4", base_root)),
+        );
+        let _g_gh_base = EnvVarGuard::set(
+            "GITHUB_API_BASE",
+            std::ffi::OsStr::new(&base_root),
+        );
+
+        // Save all 6 keys via --show (must stay offline)
+        let save_args = match Cli::try_parse_from([
+            "bab",
+            "settings",
+            "--tailscale-key",
+            "tskey-saved-1111",
+            "--vultr-key",
+            "vultr-saved-2222",
+            "--upcloud-token",
+            "upcloud-saved-3333",
+            "--linode-token",
+            "linode-saved-4444",
+            "--cloudflare-token",
+            "cf-saved-5555",
+            "--github-token",
+            "ghp_saved-6666",
+            "--show",
+        ])?
+        .command
+        {
+            Some(Commands::Settings(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        cmd_settings(save_args)?;
+
+        let show_args = match Cli::try_parse_from(["bab", "settings", "--show"])?.command {
+            Some(Commands::Settings(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        cmd_settings(show_args)?;
+        assert!(
+            server.requests.lock().unwrap().is_empty(),
+            "settings --show must remain offline"
+        );
+
+        // Passing only --test validates all 6 saved keys
+        let test_only_args = match Cli::try_parse_from(["bab", "settings", "--test"])?.command {
+            Some(Commands::Settings(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        cmd_settings(test_only_args)?;
+        assert_eq!(server.requests.lock().unwrap().len(), 6);
+
+        // Updating one key to an invalid value causes --test to fail
+        let bad_args = match Cli::try_parse_from([
+            "bab",
+            "settings",
+            "--github-token",
+            "invalid-ghp-0000",
+            "--test",
+        ])?
+        .command
+        {
+            Some(Commands::Settings(a)) => a,
+            other => panic!("unexpected command: {:?}", other),
+        };
+        let err = cmd_settings(bad_args).unwrap_err();
+        assert!(err.to_string().contains("1 invalid, 0 error(s)"));
+
+        let _recorded = server.shutdown();
+        Ok(())
     }
 }
