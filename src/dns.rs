@@ -89,25 +89,75 @@ struct CloudflareVerifyResponse {
     success: bool,
 }
 
-/// Validates a Cloudflare API token against the base URL in `CLOUDFLARE_API_BASE`
-/// (falling back to the default Cloudflare v4 API endpoint when unset or blank).
-pub fn validate_cloudflare_token(token: &str) -> Result<bool> {
-    let base = env::var("CLOUDFLARE_API_BASE")
+fn cloudflare_api_base() -> String {
+    env::var("CLOUDFLARE_API_BASE")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_CLOUDFLARE_API_BASE.to_string());
-    validate_cloudflare_token_with_base(token, &base)
+        .unwrap_or_else(|| DEFAULT_CLOUDFLARE_API_BASE.to_string())
+}
+
+/// Validates a Cloudflare Account ID (`1..=128` trimmed ASCII alphanumeric, `-`, or `_` chars).
+pub fn validate_cloudflare_account_id(account_id: &str) -> bool {
+    let trimmed = account_id.trim();
+    (1..=128).contains(&trimmed.len())
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Validates a Cloudflare API token against the base URL in `CLOUDFLARE_API_BASE`
+/// (falling back to the default Cloudflare v4 API endpoint when unset or blank).
+pub fn validate_cloudflare_token(token: &str) -> Result<bool> {
+    validate_cloudflare_token_for_account(token, None)
 }
 
 /// Validates a Cloudflare API token against an explicit Cloudflare API base URL.
 pub fn validate_cloudflare_token_with_base(token: &str, base_url: &str) -> Result<bool> {
+    validate_cloudflare_token_with_base_and_account(token, None, base_url)
+}
+
+/// Validates a Cloudflare API token (user or account token) against `CLOUDFLARE_API_BASE`
+/// (falling back to the default Cloudflare v4 API endpoint when unset or blank).
+pub fn validate_cloudflare_token_for_account(
+    token: &str,
+    account_id: Option<&str>,
+) -> Result<bool> {
+    let base = cloudflare_api_base();
+    validate_cloudflare_token_with_base_and_account(token, account_id, &base)
+}
+
+/// Validates a Cloudflare API token against an explicit Cloudflare API base URL,
+/// using `/accounts/{account_id}/tokens/verify` when a non-empty `account_id` is provided
+/// or `/user/tokens/verify` when omitted/blank (rejecting `cfat_*` account tokens without an account ID).
+pub fn validate_cloudflare_token_with_base_and_account(
+    token: &str,
+    account_id: Option<&str>,
+    base_url: &str,
+) -> Result<bool> {
     let token = token.trim();
     if token.is_empty() {
         return Ok(false);
     }
 
-    let url = format!("{}/user/tokens/verify", base_url.trim().trim_end_matches('/'));
+    let base = base_url.trim().trim_end_matches('/');
+    let url = match account_id.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(acct) => {
+            if !validate_cloudflare_account_id(acct) {
+                return Err(anyhow!("Invalid Cloudflare Account ID: '{}'", acct));
+            }
+            format!("{}/accounts/{}/tokens/verify", base, acct)
+        }
+        None => {
+            if token.starts_with("cfat_") {
+                return Err(anyhow!(
+                    "CLOUDFLARE_ACCOUNT_ID is required to verify a Cloudflare Account API token (cfat_*)"
+                ));
+            }
+            format!("{}/user/tokens/verify", base)
+        }
+    };
+
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -485,5 +535,144 @@ mod tests {
         assert_eq!(reqs[0].path, "/user/tokens/verify");
         assert_eq!(reqs[0].authorization.as_deref(), Some("Bearer cf-env-token"));
         assert_eq!(reqs[0].user_agent.as_deref(), Some("bab/0.1"));
+    }
+
+    #[test]
+    fn validate_cloudflare_account_id_accepts_valid_and_rejects_invalid_inputs() {
+        assert!(validate_cloudflare_account_id("0123456789abcdef0123456789abcdef"));
+        assert!(validate_cloudflare_account_id("acct_123-XYZ"));
+        assert!(validate_cloudflare_account_id("a"));
+        assert!(validate_cloudflare_account_id("  acct_trimmed  "));
+        assert!(validate_cloudflare_account_id(&"a".repeat(128)));
+
+        assert!(!validate_cloudflare_account_id(""));
+        assert!(!validate_cloudflare_account_id("   \t\n "));
+        assert!(!validate_cloudflare_account_id(&"a".repeat(129)));
+        assert!(!validate_cloudflare_account_id("acct id"));
+        assert!(!validate_cloudflare_account_id("acct\tid"));
+        assert!(!validate_cloudflare_account_id("acct\nid"));
+        assert!(!validate_cloudflare_account_id("acct/id"));
+        assert!(!validate_cloudflare_account_id("acct?x=1"));
+        assert!(!validate_cloudflare_account_id("acct#frag"));
+        assert!(!validate_cloudflare_account_id(".."));
+        assert!(!validate_cloudflare_account_id("acct..id"));
+        assert!(!validate_cloudflare_account_id("acct.id"));
+    }
+
+    #[test]
+    fn validate_cloudflare_token_with_base_and_account_uses_accounts_verify_endpoint() {
+        let (base_url, recorded, handle) = spawn_mock_server(vec![
+            MockResponse::json(200, "OK", r#"{"success":true}"#),
+            MockResponse::json(200, "OK", r#"{"success":false}"#),
+        ]);
+
+        assert!(validate_cloudflare_token_with_base_and_account(
+            "  cfat_valid_token \n",
+            Some("  acct-01_abc  "),
+            &base_url
+        )
+        .unwrap());
+        assert!(!validate_cloudflare_token_with_base_and_account(
+            "cfat_inactive_token",
+            Some("acct-01_abc"),
+            &base_url
+        )
+        .unwrap());
+
+        handle.join().expect("mock server thread");
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].method, "GET");
+        assert_eq!(reqs[0].path, "/accounts/acct-01_abc/tokens/verify");
+        assert_eq!(
+            reqs[0].authorization.as_deref(),
+            Some("Bearer cfat_valid_token")
+        );
+        assert_eq!(reqs[0].user_agent.as_deref(), Some("bab/0.1"));
+        assert_eq!(reqs[1].path, "/accounts/acct-01_abc/tokens/verify");
+        assert_eq!(
+            reqs[1].authorization.as_deref(),
+            Some("Bearer cfat_inactive_token")
+        );
+    }
+
+    #[test]
+    fn validate_cloudflare_token_for_account_honors_cloudflare_api_base_env() {
+        let _lock = crate::env_lock();
+        let (base_url, recorded, handle) = spawn_mock_server(vec![MockResponse::json(
+            200,
+            "OK",
+            r#"{"success":true}"#,
+        )]);
+        let _env = EnvGuard::set("CLOUDFLARE_API_BASE", &format!("{base_url}/"));
+
+        assert!(
+            validate_cloudflare_token_for_account("cfat_env_token", Some("acct-env-99")).unwrap()
+        );
+
+        handle.join().expect("mock server thread");
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/accounts/acct-env-99/tokens/verify");
+        assert_eq!(
+            reqs[0].authorization.as_deref(),
+            Some("Bearer cfat_env_token")
+        );
+        assert_eq!(reqs[0].user_agent.as_deref(), Some("bab/0.1"));
+    }
+
+    #[test]
+    fn validate_cloudflare_token_cfat_requires_account_id() {
+        for account_id in [None, Some(""), Some("   \t\n ")] {
+            let err = validate_cloudflare_token_with_base_and_account(
+                "  cfat_secret_token  ",
+                account_id,
+                "http://127.0.0.1:1",
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("CLOUDFLARE_ACCOUNT_ID is required"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_cloudflare_token_rejects_invalid_account_id() {
+        for bad in ["bad/acct", "bad?acct", "bad#acct", "..", "bad acct"] {
+            let err = validate_cloudflare_token_with_base_and_account(
+                "cfat_secret_token",
+                Some(bad),
+                "http://127.0.0.1:1",
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Invalid Cloudflare Account ID"),
+                "unexpected error for '{bad}': {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_cloudflare_token_with_base_and_account_blank_account_falls_back_to_user_verify() {
+        let (base_url, recorded, handle) = spawn_mock_server(vec![MockResponse::json(
+            200,
+            "OK",
+            r#"{"success":true}"#,
+        )]);
+
+        assert!(validate_cloudflare_token_with_base_and_account(
+            "cf-user-token",
+            Some("   "),
+            &base_url
+        )
+        .unwrap());
+
+        handle.join().expect("mock server thread");
+        let reqs = recorded.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].path, "/user/tokens/verify");
     }
 }

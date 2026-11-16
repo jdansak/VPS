@@ -30,7 +30,7 @@ use crate::providers::{
     build_cloud_provider_with_key, clear_destroyed_session_if_matches, default_images_for,
     default_plans_for, default_regions_for, destroy_provider_instance_with_key, format_hourly_usd,
     format_monthly_usd, plan_pricing, provision_full_flow_with_progress, query_providers_with_keys,
-    ProviderInstance, ProviderKind, ProviderQueryStatus, ProvisionConfig, VpsProvider,
+    ProviderInstance, ProviderKind, ProviderQueryStatus, ProvisionConfig,
 };
 use crate::roles::ServerRole;
 use crate::setup::{
@@ -66,12 +66,13 @@ const HOME_MENU_ITEMS: [&str; 10] = [
     "Quit",
 ];
 
-const API_KEY_LABELS: [&str; 6] = [
+const API_KEY_LABELS: [&str; 7] = [
     "TAILSCALE_API_KEY",
     "VULTR_API_KEY",
     "UPCLOUD_API_TOKEN",
     "LINODE_API_TOKEN",
     "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
     "GITHUB_TOKEN",
 ];
 
@@ -137,10 +138,60 @@ pub enum Screen {
     ViewLog,
 }
 
-enum ExistingInstanceOutcome {
-    Reuse(String),
-    Recreate,
-    Abort,
+/// Computes the next available DNS-safe hostname (<= 63 chars) that does not collide
+/// case-insensitively with any name in `taken`, incrementing any trailing `-<positive_int>` suffix.
+pub fn next_available_hostname(base: &str, taken: &[String]) -> String {
+    let trimmed = base.trim();
+    let candidate_base = if trimmed.is_empty() {
+        "bab-node"
+    } else {
+        trimmed
+    };
+
+    let is_taken = |name: &str| -> bool {
+        taken
+            .iter()
+            .any(|t| t.trim().eq_ignore_ascii_case(name))
+    };
+
+    if !is_taken(candidate_base) {
+        return candidate_base.to_string();
+    }
+
+    let (root, mut num) = match candidate_base.rsplit_once('-') {
+        Some((prefix, suffix))
+            if !prefix.is_empty()
+                && !suffix.is_empty()
+                && suffix.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            match suffix.parse::<usize>() {
+                Ok(n) if n > 0 => (prefix, n + 1),
+                _ => (candidate_base, 2),
+            }
+        }
+        _ => (candidate_base, 2),
+    };
+
+    loop {
+        let suffix = format!("-{}", num);
+        let max_root_len = 63usize.saturating_sub(suffix.len());
+        let raw_clamped: String = root.chars().take(max_root_len).collect();
+        let trimmed_root = raw_clamped.trim_end_matches('-');
+        let effective_root = if trimmed_root.is_empty() {
+            raw_clamped.as_str()
+        } else {
+            trimmed_root
+        };
+        let candidate = if effective_root.is_empty() {
+            num.to_string()
+        } else {
+            format!("{}{}", effective_root, suffix)
+        };
+        if !is_taken(&candidate) {
+            return candidate;
+        }
+        num += 1;
+    }
 }
 
 /// Editable form state for access transport, sudo admin user, SSH key path, hostname, and passwordless sudo.
@@ -470,6 +521,7 @@ pub struct ApiKeyForm {
     pub upcloud: String,
     pub linode: String,
     pub cloudflare: String,
+    pub cloudflare_account_id: String,
     pub github: String,
     pub active_field: usize,
     pub editing: bool,
@@ -513,6 +565,10 @@ impl ApiKeyForm {
                 .cloudflare_api_token()?
                 .filter(|s| !s.is_empty())
                 .unwrap_or_default(),
+            cloudflare_account_id: settings
+                .cloudflare_account_id()?
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default(),
             github: settings
                 .github_token()?
                 .filter(|s| !s.is_empty())
@@ -530,6 +586,7 @@ impl ApiKeyForm {
             ("UPCLOUD_API_TOKEN", &self.upcloud),
             ("LINODE_API_TOKEN", &self.linode),
             ("CLOUDFLARE_API_TOKEN", &self.cloudflare),
+            ("CLOUDFLARE_ACCOUNT_ID", &self.cloudflare_account_id),
             ("GITHUB_TOKEN", &self.github),
         ] {
             let trimmed = val.trim();
@@ -549,6 +606,7 @@ impl ApiKeyForm {
             2 => &self.upcloud,
             3 => &self.linode,
             4 => &self.cloudflare,
+            5 => &self.cloudflare_account_id,
             _ => &self.github,
         }
     }
@@ -560,6 +618,7 @@ impl ApiKeyForm {
             2 => &mut self.upcloud,
             3 => &mut self.linode,
             4 => &mut self.cloudflare,
+            5 => &mut self.cloudflare_account_id,
             _ => &mut self.github,
         }
     }
@@ -571,6 +630,7 @@ impl ApiKeyForm {
             &self.upcloud,
             &self.linode,
             &self.cloudflare,
+            &self.cloudflare_account_id,
             &self.github,
         ]
         .iter()
@@ -608,7 +668,7 @@ pub struct TuiApp {
     pub cf_dns: CloudflareDnsForm,
     pub github_deploy: GithubDeployForm,
     pub api_keys: ApiKeyForm,
-    pub api_key_statuses: [ApiKeyTestStatus; 6],
+    pub api_key_statuses: [ApiKeyTestStatus; 7],
     pub show_api_keys: bool,
     pub progress_steps: Vec<(SetupStepKind, Option<bool>)>,
     pub active_step: Option<SetupStepKind>,
@@ -923,7 +983,7 @@ impl TuiApp {
                 } else {
                     *self.api_keys.active_value_mut() = pasted.clone();
                 }
-                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                self.reset_api_key_status(idx);
                 self.auto_save_api_keys();
                 if !self.status_message.starts_with("Failed to") {
                     self.status_message = format!(
@@ -1472,6 +1532,14 @@ impl TuiApp {
         }
     }
 
+    fn reset_api_key_status(&mut self, idx: usize) {
+        self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+        if idx == 4 || idx == 5 {
+            self.api_key_statuses[4] = ApiKeyTestStatus::Untested;
+            self.api_key_statuses[5] = ApiKeyTestStatus::Untested;
+        }
+    }
+
     fn test_api_key_at(&mut self, idx: usize) -> ApiKeyTestStatus {
         let val = self.api_keys.value_for(idx).trim().to_string();
         if val.is_empty() {
@@ -1486,8 +1554,23 @@ impl TuiApp {
                 .and_then(|p| p.validate_key()),
             3 => build_cloud_provider_with_key(ProviderKind::Linode, &val, None)
                 .and_then(|p| p.validate_key()),
-            4 => crate::dns::validate_cloudflare_token(&val),
-            5 => crate::setup::validate_github_token(&val),
+            4 => crate::dns::validate_cloudflare_token_for_account(
+                &val,
+                Some(&self.api_keys.cloudflare_account_id),
+            ),
+            5 => {
+                if self.api_keys.cloudflare.trim().is_empty() {
+                    self.api_key_statuses[5] = ApiKeyTestStatus::Untested;
+                    self.status_message =
+                        "Set CLOUDFLARE_API_TOKEN first to test CLOUDFLARE_ACCOUNT_ID".to_string();
+                    return ApiKeyTestStatus::Untested;
+                }
+                crate::dns::validate_cloudflare_token_for_account(
+                    &self.api_keys.cloudflare,
+                    Some(&val),
+                )
+            }
+            6 => crate::setup::validate_github_token(&val),
             _ => Ok(false),
         };
         let status = match res {
@@ -1496,6 +1579,11 @@ impl TuiApp {
             Err(err) => ApiKeyTestStatus::Error(err.to_string()),
         };
         self.api_key_statuses[idx] = status.clone();
+        if idx == 4 && !self.api_keys.cloudflare_account_id.trim().is_empty() {
+            self.api_key_statuses[5] = status.clone();
+        } else if idx == 5 {
+            self.api_key_statuses[4] = status.clone();
+        }
         status
     }
 
@@ -1504,7 +1592,9 @@ impl TuiApp {
         let label = API_KEY_LABELS[idx];
         match self.test_api_key_at(idx) {
             ApiKeyTestStatus::Untested => {
-                self.status_message = format!("{} is empty — nothing to test", label);
+                if self.api_keys.value_for(idx).trim().is_empty() {
+                    self.status_message = format!("{} is empty — nothing to test", label);
+                }
             }
             ApiKeyTestStatus::Valid => {
                 self.status_message = format!("{}: VALID", label);
@@ -1528,11 +1618,19 @@ impl TuiApp {
                 self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
                 continue;
             }
-            tested += 1;
             match self.test_api_key_at(idx) {
-                ApiKeyTestStatus::Valid => valid += 1,
-                ApiKeyTestStatus::Invalid => invalid += 1,
-                ApiKeyTestStatus::Error(_) => errors += 1,
+                ApiKeyTestStatus::Valid => {
+                    tested += 1;
+                    valid += 1;
+                }
+                ApiKeyTestStatus::Invalid => {
+                    tested += 1;
+                    invalid += 1;
+                }
+                ApiKeyTestStatus::Error(_) => {
+                    tested += 1;
+                    errors += 1;
+                }
                 ApiKeyTestStatus::Untested => {}
             }
         }
@@ -1573,7 +1671,7 @@ impl TuiApp {
             KeyCode::Char('c') | KeyCode::Delete | KeyCode::Backspace => {
                 let idx = self.api_keys.active_field;
                 self.api_keys.active_value_mut().clear();
-                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                self.reset_api_key_status(idx);
                 self.auto_save_api_keys();
                 if !self.status_message.starts_with("Failed to") {
                     self.status_message = format!("Cleared {} (auto-encrypted)", API_KEY_LABELS[idx]);
@@ -1607,7 +1705,7 @@ impl TuiApp {
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.api_keys.active_value_mut().clear();
-                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                self.reset_api_key_status(idx);
                 self.auto_save_api_keys();
                 if !self.status_message.starts_with("Failed to") {
                     self.status_message = format!("Cleared {} (auto-encrypted)", API_KEY_LABELS[idx]);
@@ -1615,7 +1713,7 @@ impl TuiApp {
             }
             KeyCode::Backspace => {
                 self.api_keys.active_value_mut().pop();
-                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                self.reset_api_key_status(idx);
                 self.auto_save_api_keys();
             }
             KeyCode::Char(c)
@@ -1624,7 +1722,7 @@ impl TuiApp {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.api_keys.active_value_mut().push(c);
-                self.api_key_statuses[idx] = ApiKeyTestStatus::Untested;
+                self.reset_api_key_status(idx);
                 self.auto_save_api_keys();
             }
             _ => {}
@@ -2144,19 +2242,28 @@ impl TuiApp {
         }
     }
 
-    fn record_current_instance_password(
+    fn record_instance_password_for(
         &self,
         instance_id: Option<&str>,
+        hostname: Option<&str>,
         public_ip: Option<&str>,
     ) {
         if let Some(ref path) = self.settings_path {
             let _ = Settings::new(path).record_instance_password(
                 instance_id,
-                Some(&self.access.hostname),
+                hostname,
                 public_ip,
                 &self.access.sudo_password,
             );
         }
+    }
+
+    fn record_current_instance_password(
+        &self,
+        instance_id: Option<&str>,
+        public_ip: Option<&str>,
+    ) {
+        self.record_instance_password_for(instance_id, Some(&self.access.hostname), public_ip);
     }
 
     fn save_access_config(&mut self) {
@@ -2449,127 +2556,6 @@ impl TuiApp {
         self.status_message = msg;
     }
 
-    /// Resolves an already-active provider VM matching `desired_hostname`:
-    /// in Tailscale mode, reuses it if registered on Tailscale or destroys it so a fresh build can proceed.
-    fn resolve_existing_instance_for_build<F>(
-        &mut self,
-        provider: &dyn VpsProvider,
-        ts_client: Option<&TailscaleClient>,
-        existing: ProviderInstance,
-        tailscale_mode: bool,
-        desired_hostname: &str,
-        on_update: &mut F,
-    ) -> ExistingInstanceOutcome
-    where
-        F: FnMut(&Self),
-    {
-        let existing_pub_ip = existing
-            .public_ip
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-
-        let resolved_ip = if tailscale_mode {
-            match ts_client
-                .expect("tailscale client")
-                .find_device_ip(desired_hostname)
-            {
-                Ok(Some(ts_ip)) => {
-                    self.session.tailscale_ip = Some(ts_ip.clone());
-                    ts_ip
-                }
-                Ok(None) => {
-                    self.push_log(format!(
-                        "[PROVISION] Existing {} instance '{}' (id={}) is not on Tailscale; destroying stale instance before creating a fresh one...",
-                        provider_display_label(self.selected_provider),
-                        desired_hostname,
-                        existing.id
-                    ));
-                    self.status_message = format!(
-                        "Destroying stale instance '{}' ({})...",
-                        desired_hostname, existing.id
-                    );
-                    on_update(self);
-
-                    if let Err(err) = provider.destroy_instance(&existing.id) {
-                        let msg = format!(
-                            "Failed to destroy stale {} instance '{}' (id={}): {}",
-                            provider_display_label(self.selected_provider),
-                            desired_hostname,
-                            existing.id,
-                            err
-                        );
-                        self.push_log(format!("[ERROR] {}", msg));
-                        self.status_message = msg;
-                        on_update(self);
-                        return ExistingInstanceOutcome::Abort;
-                    }
-
-                    if self
-                        .session
-                        .vps_instance_id
-                        .as_deref()
-                        .map(str::trim)
-                        == Some(existing.id.trim())
-                    {
-                        self.session.vps_instance_id = None;
-                        self.session.vps_ip = None;
-                        self.session.public_ip = None;
-                        self.session.tailscale_ip = None;
-                        if let Some(ref path) = self.state_path {
-                            let _ = SessionState::new(path).save_session(&self.session);
-                        }
-                    }
-                    return ExistingInstanceOutcome::Recreate;
-                }
-                Err(err) => {
-                    let msg = format!(
-                        "Failed to check Tailscale for existing instance '{}': {}",
-                        desired_hostname, err
-                    );
-                    self.push_log(format!("[ERROR] {}", msg));
-                    self.status_message = msg;
-                    on_update(self);
-                    return ExistingInstanceOutcome::Abort;
-                }
-            }
-        } else if let Some(pub_ip) = existing_pub_ip.clone() {
-            pub_ip
-        } else {
-            let msg = format!(
-                "Existing {} instance '{}' has no public IP",
-                provider_display_label(self.selected_provider),
-                desired_hostname
-            );
-            self.push_log(format!("[ERROR] {}", msg));
-            self.status_message = msg;
-            on_update(self);
-            return ExistingInstanceOutcome::Abort;
-        };
-
-        self.session.vps_instance_id = Some(existing.id.clone());
-        self.session.public_ip = existing_pub_ip.clone();
-        self.session.vps_ip = Some(resolved_ip.clone());
-        if let Some(ref path) = self.state_path {
-            let _ = SessionState::new(path).save_session(&self.session);
-        }
-        self.record_current_instance_password(
-            Some(&existing.id),
-            self.session.public_ip.as_deref(),
-        );
-        self.push_log(format!(
-            "[PROVISION] Reusing existing {} instance '{}' (id={}, public_ip={})",
-            provider_display_label(self.selected_provider),
-            desired_hostname,
-            existing.id,
-            existing_pub_ip.as_deref().unwrap_or("(none)")
-        ));
-        self.status_message = format!("Reusing existing instance '{}'...", desired_hostname);
-        on_update(self);
-        ExistingInstanceOutcome::Reuse(resolved_ip)
-    }
-
     /// Executes the full provision + 6-step setup + optional Cloudflare DNS plan using current options.
     pub fn execute_build(&mut self) {
         self.execute_build_with_ui(|_| {});
@@ -2690,7 +2676,7 @@ impl TuiApp {
             return;
         }
 
-        let target_ip = match self.selected_provider {
+        let (target_ip, build_hostname) = match self.selected_provider {
             ProviderKind::Vultr | ProviderKind::UpCloud | ProviderKind::Linode => {
                 if self.build_dry_run {
                     let sim_ip = self
@@ -2714,7 +2700,7 @@ impl TuiApp {
                         sim_ip
                     ));
                     on_update(self);
-                    sim_ip
+                    (sim_ip, self.access.hostname.clone())
                 } else {
                     let env_name = self
                         .selected_provider
@@ -2772,196 +2758,224 @@ impl TuiApp {
                     };
 
                     let desired_hostname = self.access.hostname.trim().to_string();
-                    let existing_instance = match provider.list_instances() {
-                        Ok(instances) => instances.into_iter().find(|inst| {
-                            let st = inst.status.trim().to_ascii_lowercase();
-                            let active = st.contains("active")
-                                || st.contains("running")
-                                || st.contains("started");
-                            active && inst.name.trim().eq_ignore_ascii_case(&desired_hostname)
-                        }),
+                    let mut taken_names: Vec<String> = Vec::new();
+                    match provider.list_instances() {
+                        Ok(instances) => {
+                            for inst in instances {
+                                let name = inst.name.trim();
+                                if !name.is_empty() {
+                                    taken_names.push(name.to_string());
+                                }
+                            }
+                        }
                         Err(err) => {
                             self.push_log(format!(
-                                "[PROVISION] Warning: failed to list existing {} instances ({}); creating new",
+                                "[PROVISION] Warning: failed to list existing {} instances ({}); continuing",
                                 provider_display_label(self.selected_provider),
                                 err
                             ));
                             on_update(self);
-                            None
                         }
-                    };
-
-                    let reused_target_ip = if let Some(existing) = existing_instance {
-                        match self.resolve_existing_instance_for_build(
-                            provider.as_ref(),
-                            ts_client.as_ref(),
-                            existing,
-                            tailscale_mode,
-                            &desired_hostname,
-                            &mut on_update,
-                        ) {
-                            ExistingInstanceOutcome::Reuse(ip) => Some(ip),
-                            ExistingInstanceOutcome::Recreate => None,
-                            ExistingInstanceOutcome::Abort => return,
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(resolved_ip) = reused_target_ip {
-                        resolved_ip
-                    } else {
-                        let region = self
-                            .selected_region
-                            .clone()
-                            .or_else(|| {
-                                default_regions_for(self.selected_provider)
-                                    .into_iter()
-                                    .next()
-                                    .map(|r| r.id)
-                            })
-                            .unwrap_or_default();
-                        let plan = self
-                            .selected_plan
-                            .clone()
-                            .or_else(|| {
-                                default_plans_for(self.selected_provider)
-                                    .into_iter()
-                                    .next()
-                                    .map(|p| p.id)
-                            })
-                            .unwrap_or_default();
-                        let image_id = self
-                            .selected_image
-                            .clone()
-                            .or_else(|| {
-                                default_images_for(self.selected_provider)
-                                    .into_iter()
-                                    .next()
-                                    .map(|i| i.id)
-                            })
-                            .unwrap_or_default();
-
-                        if tailscale_mode {
-                            if let Some(ref ts) = ts_client {
-                                match ts.delete_matching_offline_devices(&desired_hostname) {
-                                    Ok(removed) if !removed.is_empty() => {
-                                        self.push_log(format!(
-                                            "[TAILSCALE] Removed stale offline device(s) for '{}': {}",
-                                            desired_hostname,
-                                            removed.join(", ")
-                                        ));
-                                        on_update(self);
+                    }
+                    if tailscale_mode {
+                        if let Some(ref ts) = ts_client {
+                            match ts.list_devices() {
+                                Ok(devices) => {
+                                    for dev in devices {
+                                        if !dev.online {
+                                            continue;
+                                        }
+                                        let hostname = dev.hostname.trim();
+                                        if !hostname.is_empty() {
+                                            taken_names.push(hostname.to_string());
+                                        }
+                                        let short_name =
+                                            dev.name.split('.').next().unwrap_or("").trim();
+                                        if !short_name.is_empty() {
+                                            taken_names.push(short_name.to_string());
+                                        }
                                     }
-                                    Ok(_) => {}
-                                    Err(err) => {
-                                        self.push_log(format!(
-                                            "[WARN] Failed to prune offline Tailscale devices for '{}': {}",
-                                            desired_hostname, err
-                                        ));
-                                        on_update(self);
-                                    }
+                                }
+                                Err(err) => {
+                                    self.push_log(format!(
+                                        "[WARN] Failed to list Tailscale devices ({}); continuing",
+                                        err
+                                    ));
+                                    on_update(self);
                                 }
                             }
                         }
+                    }
 
+                    let build_hostname = next_available_hostname(&desired_hostname, &taken_names);
+                    if !build_hostname.eq_ignore_ascii_case(&desired_hostname) {
                         self.push_log(format!(
-                            "[PROVISION] Creating {} instance '{}' (region={}, plan={})...",
-                            provider_display_label(self.selected_provider),
-                            self.access.hostname,
-                            region,
-                            plan
+                            "[PROVISION] Hostname '{}' is already in use; creating new instance '{}'...",
+                            desired_hostname, build_hostname
                         ));
                         self.status_message = format!(
-                            "Provisioning {} instance '{}'...",
-                            provider_display_label(self.selected_provider),
-                            self.access.hostname
+                            "Hostname '{}' in use; provisioning '{}'...",
+                            desired_hostname, build_hostname
                         );
+                        self.access.sudo_password = generate_random_password(SUDO_PASSWORD_LEN);
+                        self.session.sudo_password = Some(self.access.sudo_password.clone());
                         on_update(self);
+                    }
 
-                        let prov_cfg = ProvisionConfig {
-                            provider: self.selected_provider,
-                            region,
-                            plan,
-                            image_id,
-                            hostname: self.access.hostname.clone(),
-                            username: self.access.username.clone(),
-                            role: self.selected_role.to_string(),
-                            tags: vec!["tag:bab".to_string()],
-                            provider_timeout: Duration::from_secs(300),
-                            tailscale_timeout: Duration::from_secs(300),
-                            poll_interval: Duration::from_secs(5),
-                            tailscale_mode,
-                            ssh_pubkey: ssh_cred.as_ref().map(|(_, pk)| pk.clone()),
-                            ssh_key_path: ssh_cred
-                                .as_ref()
-                                .map(|(p, _)| p.to_string_lossy().into_owned()),
-                            sudo_password: Some(self.access.sudo_password.clone()),
-                        };
-                        let prov_state = self.state_path.as_ref().map(SessionState::new);
-                        let prov_res = {
-                            let mut progress_cb = |msg: &str| {
-                                self.push_log(msg.to_string());
-                                self.status_message = msg.to_string();
-                                on_update(self);
-                            };
-                            provision_full_flow_with_progress(
-                                provider.as_ref(),
-                                ts_client.as_ref(),
-                                &prov_cfg,
-                                prov_state.as_ref(),
-                                &mut progress_cb,
-                            )
-                        };
-                        match prov_res {
-                            Ok(res) => {
-                                self.session.vps_instance_id = Some(res.instance_id.clone());
-                                self.session.public_ip = if res.public_ip.is_empty() {
-                                    None
-                                } else {
-                                    Some(res.public_ip.clone())
-                                };
-                                self.session.tailscale_ip = if res.tailscale_ip.is_empty() {
-                                    None
-                                } else {
-                                    Some(res.tailscale_ip.clone())
-                                };
-                                self.session.vps_ip = Some(res.ip.clone());
-                                self.record_current_instance_password(
-                                    Some(&res.instance_id),
-                                    self.session.public_ip.as_deref(),
-                                );
-                                self.push_log(format!(
-                                    "[PROVISION] {} ready: instance={}, ip={}",
-                                    provider_display_label(self.selected_provider),
-                                    res.instance_id,
-                                    res.ip
-                                ));
-                                on_update(self);
-                                res.ip
-                            }
-                            Err(err) => {
-                                if let Some(ref state) = prov_state {
-                                    if let Ok(reloaded) = state.load_session() {
-                                        self.session = reloaded;
-                                    }
+                    let region = self
+                        .selected_region
+                        .clone()
+                        .or_else(|| {
+                            default_regions_for(self.selected_provider)
+                                .into_iter()
+                                .next()
+                                .map(|r| r.id)
+                        })
+                        .unwrap_or_default();
+                    let plan = self
+                        .selected_plan
+                        .clone()
+                        .or_else(|| {
+                            default_plans_for(self.selected_provider)
+                                .into_iter()
+                                .next()
+                                .map(|p| p.id)
+                        })
+                        .unwrap_or_default();
+                    let image_id = self
+                        .selected_image
+                        .clone()
+                        .or_else(|| {
+                            default_images_for(self.selected_provider)
+                                .into_iter()
+                                .next()
+                                .map(|i| i.id)
+                        })
+                        .unwrap_or_default();
+
+                    if tailscale_mode {
+                        if let Some(ref ts) = ts_client {
+                            match ts.delete_matching_offline_devices(&build_hostname) {
+                                Ok(removed) if !removed.is_empty() => {
+                                    self.push_log(format!(
+                                        "[TAILSCALE] Removed stale offline device(s) for '{}': {}",
+                                        build_hostname,
+                                        removed.join(", ")
+                                    ));
+                                    on_update(self);
                                 }
-                                self.record_current_instance_password(
-                                    self.session.vps_instance_id.as_deref(),
-                                    self.session.public_ip.as_deref(),
-                                );
-                                let msg = format!("Provision failed: {}", err);
-                                self.push_log(format!("[ERROR] {}", msg));
-                                self.status_message = msg;
-                                on_update(self);
-                                return;
+                                Ok(_) => {}
+                                Err(err) => {
+                                    self.push_log(format!(
+                                        "[WARN] Failed to prune offline Tailscale devices for '{}': {}",
+                                        build_hostname, err
+                                    ));
+                                    on_update(self);
+                                }
                             }
+                        }
+                    }
+
+                    self.push_log(format!(
+                        "[PROVISION] Creating {} instance '{}' (region={}, plan={})...",
+                        provider_display_label(self.selected_provider),
+                        build_hostname,
+                        region,
+                        plan
+                    ));
+                    self.status_message = format!(
+                        "Provisioning {} instance '{}'...",
+                        provider_display_label(self.selected_provider),
+                        build_hostname
+                    );
+                    on_update(self);
+
+                    let prov_cfg = ProvisionConfig {
+                        provider: self.selected_provider,
+                        region,
+                        plan,
+                        image_id,
+                        hostname: build_hostname.clone(),
+                        username: self.access.username.clone(),
+                        role: self.selected_role.to_string(),
+                        tags: vec!["tag:bab".to_string()],
+                        provider_timeout: Duration::from_secs(300),
+                        tailscale_timeout: Duration::from_secs(300),
+                        poll_interval: Duration::from_secs(5),
+                        tailscale_mode,
+                        ssh_pubkey: ssh_cred.as_ref().map(|(_, pk)| pk.clone()),
+                        ssh_key_path: ssh_cred
+                            .as_ref()
+                            .map(|(p, _)| p.to_string_lossy().into_owned()),
+                        sudo_password: Some(self.access.sudo_password.clone()),
+                    };
+                    let prov_state = self.state_path.as_ref().map(SessionState::new);
+                    let prov_res = {
+                        let mut progress_cb = |msg: &str| {
+                            self.push_log(msg.to_string());
+                            self.status_message = msg.to_string();
+                            on_update(self);
+                        };
+                        provision_full_flow_with_progress(
+                            provider.as_ref(),
+                            ts_client.as_ref(),
+                            &prov_cfg,
+                            prov_state.as_ref(),
+                            &mut progress_cb,
+                        )
+                    };
+                    match prov_res {
+                        Ok(res) => {
+                            self.session.vps_instance_id = Some(res.instance_id.clone());
+                            self.session.public_ip = if res.public_ip.is_empty() {
+                                None
+                            } else {
+                                Some(res.public_ip.clone())
+                            };
+                            self.session.tailscale_ip = if res.tailscale_ip.is_empty() {
+                                None
+                            } else {
+                                Some(res.tailscale_ip.clone())
+                            };
+                            self.session.vps_ip = Some(res.ip.clone());
+                            self.session.tailscale_hostname = Some(build_hostname.clone());
+                            self.session.sudo_password = Some(self.access.sudo_password.clone());
+                            self.record_instance_password_for(
+                                Some(&res.instance_id),
+                                Some(&build_hostname),
+                                self.session.public_ip.as_deref(),
+                            );
+                            self.push_log(format!(
+                                "[PROVISION] {} ready: instance={}, ip={}",
+                                provider_display_label(self.selected_provider),
+                                res.instance_id,
+                                res.ip
+                            ));
+                            on_update(self);
+                            (res.ip, build_hostname)
+                        }
+                        Err(err) => {
+                            if let Some(ref state) = prov_state {
+                                if let Ok(reloaded) = state.load_session() {
+                                    self.session = reloaded;
+                                }
+                            }
+                            self.record_instance_password_for(
+                                self.session.vps_instance_id.as_deref(),
+                                Some(&build_hostname),
+                                self.session.public_ip.as_deref(),
+                            );
+                            let msg = format!("Provision failed: {}", err);
+                            self.push_log(format!("[ERROR] {}", msg));
+                            self.status_message = msg;
+                            on_update(self);
+                            return;
                         }
                     }
                 }
             }
             ProviderKind::ExistingTailscale => {
-                if let Some(ip) = self
+                let ip = if let Some(ip) = self
                     .session
                     .vps_ip
                     .as_deref()
@@ -2988,7 +3002,8 @@ impl TuiApp {
                     self.status_message = msg;
                     on_update(self);
                     return;
-                }
+                };
+                (ip, self.access.hostname.clone())
             }
             ProviderKind::ManualCloudInit => unreachable!("handled above"),
         };
@@ -3048,7 +3063,7 @@ impl TuiApp {
             host: target_ip.clone(),
             ssh_user: "root".to_string(),
             new_username: self.access.username.clone(),
-            hostname: self.access.hostname.clone(),
+            hostname: build_hostname,
             role: self.selected_role,
             provider_name: self.selected_provider.to_string(),
             tailscale_mode,
@@ -3472,13 +3487,15 @@ impl TuiApp {
             .filter(|s| !s.is_empty())
             .unwrap_or(&self.github_deploy.branch);
         let key_ready = format!(
-            "{}/6 configured (TS:{}, V:{}, UC:{}, LN:{}, CF:{}, GH:{})",
+            "{}/{} configured (TS:{}, V:{}, UC:{}, LN:{}, CF:{}, CFA:{}, GH:{})",
             self.api_keys.configured_count(),
+            API_KEY_LABELS.len(),
             yes_no(!self.api_keys.tailscale.is_empty()),
             yes_no(!self.api_keys.vultr.is_empty()),
             yes_no(!self.api_keys.upcloud.is_empty()),
             yes_no(!self.api_keys.linode.is_empty()),
             yes_no(!self.api_keys.cloudflare.is_empty()),
+            yes_no(!self.api_keys.cloudflare_account_id.is_empty()),
             yes_no(!self.api_keys.github.is_empty()),
         );
 
@@ -4073,8 +4090,13 @@ impl TuiApp {
                 )),
             ]),
             Line::from(format!(
-                "CLOUDFLARE_API_TOKEN: {} | Resolved Target IP: {}",
+                "CLOUDFLARE_API_TOKEN: {} | CLOUDFLARE_ACCOUNT_ID: {} | Resolved Target IP: {}",
                 yes_no(has_token),
+                if self.api_keys.cloudflare_account_id.trim().is_empty() {
+                    "(not set)"
+                } else {
+                    self.api_keys.cloudflare_account_id.trim()
+                },
                 resolved_ip.unwrap_or("(none)")
             )),
             preview_line,
@@ -4319,7 +4341,9 @@ impl TuiApp {
             .enumerate()
             .map(|(i, label)| {
                 let raw = self.api_keys.value_for(i);
-                let display_val = if self.show_api_keys && !raw.is_empty() {
+                let display_val = if raw.is_empty() {
+                    "(not set)".to_string()
+                } else if i == 5 || self.show_api_keys {
                     raw.to_string()
                 } else {
                     ApiKeyForm::mask_key(raw)
@@ -5925,13 +5949,14 @@ mod tests {
         let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
         app.screen = Screen::ApiKeys;
 
-        // Verify all 6 labels and encrypted storage disclosure are rendered
+        // Verify all 7 labels and encrypted storage disclosure are rendered
         let initial_rendered = render_to_string(&app);
         assert!(initial_rendered.contains("TAILSCALE_API_KEY"));
         assert!(initial_rendered.contains("VULTR_API_KEY"));
         assert!(initial_rendered.contains("UPCLOUD_API_TOKEN"));
         assert!(initial_rendered.contains("LINODE_API_TOKEN"));
         assert!(initial_rendered.contains("CLOUDFLARE_API_TOKEN"));
+        assert!(initial_rendered.contains("CLOUDFLARE_ACCOUNT_ID"));
         assert!(initial_rendered.contains("GITHUB_TOKEN"));
         assert!(initial_rendered.contains("ChaCha20-Poly1305"));
         assert!(initial_rendered.contains("credentials.enc"));
@@ -5968,9 +5993,23 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Enter));
 
-        // Move to GITHUB_TOKEN (field 5) and edit
+        // Move to CLOUDFLARE_ACCOUNT_ID (field 5) and edit — displayed unmasked even when show_api_keys == false
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.api_keys.active_field, 5);
+        app.handle_key(key(KeyCode::Enter));
+        for c in "acct-0123456789abcdef".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.show_api_keys);
+        let with_acct = render_to_string(&app);
+        assert!(with_acct.contains("CLOUDFLARE_ACCOUNT_ID: acct-0123456789abcdef (21 chars)"));
+        assert!(with_acct.contains("CLOUDFLARE_API_TOKEN: cf-t****5678"));
+        assert!(!with_acct.contains("cf-token-12345678"));
+
+        // Move to GITHUB_TOKEN (field 6) and edit
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.api_keys.active_field, 6);
         app.handle_key(key(KeyCode::Enter));
         for c in "ghp_secret98765432".chars() {
             app.handle_key(key(KeyCode::Char(c)));
@@ -5990,9 +6029,17 @@ mod tests {
             Some("cf-token-12345678".to_string())
         );
         assert_eq!(
+            settings.cloudflare_account_id()?,
+            Some("acct-0123456789abcdef".to_string())
+        );
+        assert_eq!(
             settings.github_token()?,
             Some("ghp_secret98765432".to_string())
         );
+        assert_eq!(app.api_keys.configured_count(), 4);
+
+        let reloaded = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert_eq!(reloaded.api_keys.cloudflare_account_id, "acct-0123456789abcdef");
 
         // 'q' on ApiKeys returns to Home without quitting, then 'q' on Home quits
         app.handle_key(key(KeyCode::Char('q')));
@@ -8136,9 +8183,46 @@ esac"#
         Ok(())
     }
 
+    #[test]
+    fn next_available_hostname_handles_empty_collisions_suffixes_and_clamping() {
+        assert_eq!(next_available_hostname("", &[]), "bab-node");
+        assert_eq!(next_available_hostname("   ", &[]), "bab-node");
+        assert_eq!(next_available_hostname("  live-node ", &[]), "live-node");
+        assert_eq!(
+            next_available_hostname("live-node", &["LIVE-NODE".to_string()]),
+            "live-node-2"
+        );
+        assert_eq!(
+            next_available_hostname(
+                "live-node",
+                &[
+                    "live-node".to_string(),
+                    "LIVE-NODE-2".to_string(),
+                    "live-node-3".to_string(),
+                ],
+            ),
+            "live-node-4"
+        );
+        assert_eq!(
+            next_available_hostname(
+                "live-node-2",
+                &["live-node".to_string(), "live-node-2".to_string()],
+            ),
+            "live-node-3"
+        );
+        assert_eq!(
+            next_available_hostname("live-node-0", &["live-node-0".to_string()]),
+            "live-node-0-2"
+        );
+        let max_len_name = "a".repeat(63);
+        let incremented = next_available_hostname(&max_len_name, std::slice::from_ref(&max_len_name));
+        assert_eq!(incremented.len(), 63);
+        assert_eq!(incremented, format!("{}-2", "a".repeat(61)));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn execute_build_with_ui_destroys_stale_active_vm_absent_from_tailscale_and_creates_fresh_build(
+    fn execute_build_with_ui_creates_second_vm_with_incremented_hostname_and_fresh_password(
     ) -> Result<()> {
         use std::fs::{self, File};
         use std::io::Write;
@@ -8156,199 +8240,76 @@ esac"#
             "BAB_SSH_POLL_MS",
         ]);
 
-        let vultr_events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let vultr_events_bg = Arc::clone(&vultr_events);
-        let deleted_stale = Arc::new(AtomicBool::new(false));
-        let deleted_stale_bg = Arc::clone(&deleted_stale);
-        let created_fresh = Arc::new(AtomicBool::new(false));
-        let created_fresh_bg = Arc::clone(&created_fresh);
+        let deleted_existing = Arc::new(AtomicBool::new(false));
+        let deleted_existing_v = Arc::clone(&deleted_existing);
+        let deleted_existing_t = Arc::clone(&deleted_existing);
+        let created_second = Arc::new(AtomicBool::new(false));
+        let created_second_bg = Arc::clone(&created_second);
+        let pruned_offline_two = Arc::new(AtomicBool::new(false));
+        let pruned_offline_two_bg = Arc::clone(&pruned_offline_two);
         let ts_key_created = Arc::new(AtomicBool::new(false));
         let ts_key_bg = Arc::clone(&ts_key_created);
+        let create_bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let create_bodies_bg = Arc::clone(&create_bodies);
 
-        let vultr_srv = MockHttpServer::spawn(move |method, path, body| {
-            vultr_events_bg
-                .lock()
-                .unwrap()
-                .push(format!("{} {}", method, path));
-            match (method, path) {
-                ("GET", "/v2/instances") => (
-                    "200 OK",
-                    r#"{"instances":[{"id":"vultr-stale-1","label":"stale-node","status":"active","power_status":"running","main_ip":"203.0.113.10","region":"ewr","plan":"vc2-1c-1gb"}],"meta":{"links":{"next":""}}}"#
-                        .to_string(),
-                ),
-                ("DELETE", "/v2/instances/vultr-stale-1") => {
-                    deleted_stale_bg.store(true, Ordering::SeqCst);
-                    ("204 No Content", String::new())
-                }
-                ("POST", "/v2/instances") => {
-                    assert!(
-                        body.contains("user_data"),
-                        "expected cloud-init user_data in POST /v2/instances body"
-                    );
-                    created_fresh_bg.store(true, Ordering::SeqCst);
-                    (
-                        "202 Accepted",
-                        r#"{"instance":{"id":"vultr-fresh-2","label":"stale-node","status":"pending","power_status":"stopped","main_ip":"0.0.0.0"}}"#
-                            .to_string(),
-                    )
-                }
-                ("GET", "/v2/instances/vultr-fresh-2") => (
-                    "200 OK",
-                    r#"{"instance":{"id":"vultr-fresh-2","label":"stale-node","status":"active","power_status":"running","main_ip":"203.0.113.88"}}"#
-                        .to_string(),
-                ),
-                _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
-            }
-        })?;
-
-        let ts_srv = MockHttpServer::spawn(move |method, path, _body| match (method, path) {
-            ("GET", "/tailnet/-/devices") => {
-                if !ts_key_bg.load(Ordering::SeqCst) {
-                    ("200 OK", r#"{"devices":[]}"#.to_string())
-                } else {
-                    (
-                        "200 OK",
-                        r#"{"devices":[{"id":"ts-fresh-2","hostname":"stale-node","name":"stale-node.tailnet.ts.net","addresses":["100.64.22.2"],"online":true}]}"#
-                            .to_string(),
-                    )
-                }
-            }
-            ("POST", "/tailnet/-/keys") => {
-                ts_key_bg.store(true, Ordering::SeqCst);
-                (
-                    "200 OK",
-                    r#"{"id":"key-fresh","key":"tskey-auth-fresh"}"#.to_string(),
-                )
-            }
-            _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
-        })?;
-
-        let dir = tempdir()?;
-        let settings_path = dir.path().join("credentials.enc");
-        let state_path = dir.path().join("state.conf");
-        let mock_ssh = dir.path().join("mock-ssh.sh");
-        {
-            let mut f = File::create(&mock_ssh)?;
-            writeln!(f, "#!/bin/sh\ncat >/dev/null\necho ok\nexit 0")?;
-        }
-        fs::set_permissions(&mock_ssh, fs::Permissions::from_mode(0o755))?;
-
-        std::env::set_var(
-            "VULTR_API_BASE_URL",
-            format!("http://{}/v2", vultr_srv.addr),
-        );
-        std::env::set_var("TAILSCALE_API_BASE", format!("http://{}", ts_srv.addr));
-        std::env::set_var("BAB_SSH_BIN", &mock_ssh);
-        std::env::set_var("BAB_SSH_POLL_MS", "5");
-
-        let settings = Settings::new(&settings_path);
-        settings.set_vultr_api_key("vultr-test-key")?;
-        settings.set_tailscale_api_key("ts-test-key")?;
-
-        let state = SessionState::new(&state_path);
-        state.save_session(&SessionData {
-            vps_provider: Some("vultr".to_string()),
-            vps_instance_id: Some("vultr-stale-1".to_string()),
-            public_ip: Some("203.0.113.10".to_string()),
-            vps_ip: Some("100.64.1.1".to_string()),
-            tailscale_ip: Some("100.64.1.1".to_string()),
-            tailscale_hostname: Some("stale-node".to_string()),
-            transport_mode: Some("tailscale".to_string()),
-            username: Some("deploy".to_string()),
-            sudo_password: Some("FreshPass1".to_string()),
-            ..Default::default()
-        })?;
-
-        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
-        app.build_dry_run = false;
-        app.execute_build_with_ui(|_| {});
-
-        assert!(deleted_stale.load(Ordering::SeqCst));
-        assert!(created_fresh.load(Ordering::SeqCst));
-        let events = vultr_events.lock().unwrap().clone();
-        let delete_pos = events
-            .iter()
-            .position(|e| e == "DELETE /v2/instances/vultr-stale-1")
-            .expect("DELETE /v2/instances/vultr-stale-1 recorded");
-        let create_pos = events
-            .iter()
-            .position(|e| e == "POST /v2/instances")
-            .expect("POST /v2/instances recorded");
-        assert!(delete_pos < create_pos);
-
-        assert!(app.logs.iter().any(|l| {
-            l.contains("[PROVISION] Existing Vultr instance 'stale-node' (id=vultr-stale-1) is not on Tailscale; destroying stale instance before creating a fresh one...")
-        }));
-        assert!(app
-            .logs
-            .iter()
-            .any(|l| l.contains("[PROVISION] Vultr ready: instance=vultr-fresh-2, ip=100.64.22.2")));
-        assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
-
-        assert_eq!(app.session.vps_instance_id.as_deref(), Some("vultr-fresh-2"));
-        assert_eq!(app.session.public_ip.as_deref(), Some("203.0.113.88"));
-        assert_eq!(app.session.tailscale_ip.as_deref(), Some("100.64.22.2"));
-        assert_eq!(app.session.vps_ip.as_deref(), Some("100.64.22.2"));
-
-        let saved = state.load_session()?;
-        assert_eq!(saved.vps_instance_id.as_deref(), Some("vultr-fresh-2"));
-        assert_eq!(saved.public_ip.as_deref(), Some("203.0.113.88"));
-        assert_eq!(saved.tailscale_ip.as_deref(), Some("100.64.22.2"));
-        assert_eq!(saved.vps_ip.as_deref(), Some("100.64.22.2"));
-        assert_eq!(
-            settings
-                .lookup_instance_password(
-                    Some("vultr-fresh-2"),
-                    Some("stale-node"),
-                    Some("203.0.113.88"),
-                )?
-                .as_deref(),
-            Some("FreshPass1")
-        );
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn execute_build_with_ui_reuses_existing_active_vm_present_on_tailscale() -> Result<()> {
-        use std::fs::{self, File};
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc,
-        };
-
-        let _lock = crate::env_lock();
-        let _guard = TestEnvGuard::new(&[
-            "VULTR_API_BASE_URL",
-            "TAILSCALE_API_BASE",
-            "BAB_SSH_BIN",
-            "BAB_SSH_POLL_MS",
-        ]);
-
-        let destroyed_or_created = Arc::new(AtomicBool::new(false));
-        let destroyed_or_created_bg = Arc::clone(&destroyed_or_created);
-
-        let vultr_srv = MockHttpServer::spawn(move |method, path, _body| match (method, path) {
+        let vultr_srv = MockHttpServer::spawn(move |method, path, body| match (method, path) {
             ("GET", "/v2/instances") => (
                 "200 OK",
                 r#"{"instances":[{"id":"vultr-live-1","label":"live-node","status":"active","power_status":"running","main_ip":"203.0.113.55","region":"ewr","plan":"vc2-1c-1gb"}],"meta":{"links":{"next":""}}}"#
                     .to_string(),
             ),
-            ("DELETE", _) | ("POST", "/v2/instances") => {
-                destroyed_or_created_bg.store(true, Ordering::SeqCst);
-                ("500 Internal Server Error", r#"{"error":"unexpected"}"#.to_string())
+            ("DELETE", _) => {
+                deleted_existing_v.store(true, Ordering::SeqCst);
+                ("500 Internal Server Error", r#"{"error":"unexpected delete"}"#.to_string())
             }
+            ("POST", "/v2/instances") => {
+                create_bodies_bg.lock().unwrap().push(body.to_string());
+                created_second_bg.store(true, Ordering::SeqCst);
+                (
+                    "202 Accepted",
+                    r#"{"instance":{"id":"vultr-live-2","label":"live-node-2","status":"pending","power_status":"stopped","main_ip":"0.0.0.0"}}"#
+                        .to_string(),
+                )
+            }
+            ("GET", "/v2/instances/vultr-live-2") => (
+                "200 OK",
+                r#"{"instance":{"id":"vultr-live-2","label":"live-node-2","status":"active","power_status":"running","main_ip":"203.0.113.88"}}"#
+                    .to_string(),
+            ),
             _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
         })?;
 
-        let ts_srv = MockHttpServer::spawn(|method, path, _body| match (method, path) {
-            ("GET", "/tailnet/-/devices") => (
-                "200 OK",
-                r#"{"devices":[{"id":"ts-live-1","hostname":"live-node","name":"live-node.tailnet.ts.net","addresses":["100.64.33.3"],"online":true}]}"#
-                    .to_string(),
-            ),
+        let ts_srv = MockHttpServer::spawn(move |method, path, _body| match (method, path) {
+            ("GET", "/tailnet/-/devices") => {
+                if !ts_key_bg.load(Ordering::SeqCst) {
+                    (
+                        "200 OK",
+                        r#"{"devices":[{"id":"ts-live-1","hostname":"live-node","name":"live-node.tailnet.ts.net","addresses":["100.64.33.3"],"online":true},{"id":"ts-stale-2","hostname":"live-node-2","name":"live-node-2.tailnet.ts.net","addresses":["100.64.33.99"],"online":false}]}"#
+                            .to_string(),
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"devices":[{"id":"ts-live-1","hostname":"live-node","name":"live-node.tailnet.ts.net","addresses":["100.64.33.3"],"online":true},{"id":"ts-live-2","hostname":"live-node-2","name":"live-node-2.tailnet.ts.net","addresses":["100.64.44.4"],"online":true}]}"#
+                            .to_string(),
+                    )
+                }
+            }
+            ("DELETE", "/device/ts-stale-2") => {
+                pruned_offline_two_bg.store(true, Ordering::SeqCst);
+                ("200 OK", "{}".to_string())
+            }
+            ("DELETE", "/device/ts-live-1") => {
+                deleted_existing_t.store(true, Ordering::SeqCst);
+                ("500 Internal Server Error", r#"{"error":"unexpected delete"}"#.to_string())
+            }
+            ("POST", "/tailnet/-/keys") => {
+                ts_key_bg.store(true, Ordering::SeqCst);
+                (
+                    "200 OK",
+                    r#"{"id":"key-second","key":"tskey-auth-second"}"#.to_string(),
+                )
+            }
             _ => ("404 Not Found", r#"{"error":"not found"}"#.to_string()),
         })?;
 
@@ -8380,7 +8341,7 @@ esac"#
             tailscale_hostname: Some("live-node".to_string()),
             transport_mode: Some("tailscale".to_string()),
             username: Some("deploy".to_string()),
-            sudo_password: Some("ReusePass1".to_string()),
+            sudo_password: Some("FirstPass1".to_string()),
             ..Default::default()
         })?;
 
@@ -8388,28 +8349,47 @@ esac"#
         app.build_dry_run = false;
         app.execute_build_with_ui(|_| {});
 
-        assert!(!destroyed_or_created.load(Ordering::SeqCst));
+        assert!(!deleted_existing.load(Ordering::SeqCst));
+        assert!(created_second.load(Ordering::SeqCst));
+        assert!(pruned_offline_two.load(Ordering::SeqCst));
+        let bodies = create_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains(r#""label":"live-node-2""#));
+
         assert!(app.logs.iter().any(|l| {
-            l.contains("[PROVISION] Reusing existing Vultr instance 'live-node' (id=vultr-live-1, public_ip=203.0.113.55)")
+            l.contains("[PROVISION] Hostname 'live-node' is already in use; creating new instance 'live-node-2'...")
         }));
+        assert!(app
+            .logs
+            .iter()
+            .any(|l| l.contains("[PROVISION] Vultr ready: instance=vultr-live-2, ip=100.64.44.4")));
         assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
-        assert_eq!(app.session.vps_instance_id.as_deref(), Some("vultr-live-1"));
-        assert_eq!(app.session.public_ip.as_deref(), Some("203.0.113.55"));
-        assert_eq!(app.session.tailscale_ip.as_deref(), Some("100.64.33.3"));
-        assert_eq!(app.session.vps_ip.as_deref(), Some("100.64.33.3"));
+
+        assert_eq!(app.access.sudo_password.len(), SUDO_PASSWORD_LEN);
+        assert_ne!(app.access.sudo_password, "FirstPass1");
+        assert_eq!(app.session.vps_instance_id.as_deref(), Some("vultr-live-2"));
+        assert_eq!(app.session.tailscale_hostname.as_deref(), Some("live-node-2"));
+        assert_eq!(app.session.public_ip.as_deref(), Some("203.0.113.88"));
+        assert_eq!(app.session.tailscale_ip.as_deref(), Some("100.64.44.4"));
+        assert_eq!(app.session.vps_ip.as_deref(), Some("100.64.44.4"));
 
         let saved = state.load_session()?;
-        assert_eq!(saved.vps_instance_id.as_deref(), Some("vultr-live-1"));
-        assert_eq!(saved.tailscale_ip.as_deref(), Some("100.64.33.3"));
+        assert_eq!(saved.vps_instance_id.as_deref(), Some("vultr-live-2"));
+        assert_eq!(saved.tailscale_hostname.as_deref(), Some("live-node-2"));
+        assert_eq!(saved.tailscale_ip.as_deref(), Some("100.64.44.4"));
+        assert_eq!(
+            saved.sudo_password.as_deref(),
+            Some(app.access.sudo_password.as_str())
+        );
         assert_eq!(
             settings
                 .lookup_instance_password(
-                    Some("vultr-live-1"),
-                    Some("live-node"),
-                    Some("203.0.113.55"),
+                    Some("vultr-live-2"),
+                    Some("live-node-2"),
+                    Some("203.0.113.88"),
                 )?
                 .as_deref(),
-            Some("ReusePass1")
+            Some(app.access.sudo_password.as_str())
         );
         Ok(())
     }
@@ -8740,16 +8720,39 @@ esac"#
         app.handle_key(key(KeyCode::Char('w')));
         assert!(!app.show_api_keys);
 
-        // Clear CLOUDFLARE_API_TOKEN with 'c' while !editing
+        // Clear CLOUDFLARE_API_TOKEN with 'c' while !editing (resets both [4] and [5])
         app.api_key_statuses[4] = ApiKeyTestStatus::Valid;
+        app.api_key_statuses[5] = ApiKeyTestStatus::Valid;
         app.handle_key(key(KeyCode::Char('c')));
         assert!(app.api_keys.cloudflare.is_empty());
         assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Untested);
+        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Untested);
         assert_eq!(settings.cloudflare_api_token()?, None);
 
-        // Move to GITHUB_TOKEN (field 5), enter editing mode, paste with trailing \r\n, then Ctrl+U clears
+        // Move to CLOUDFLARE_ACCOUNT_ID (field 5), paste & verify unmasked display even when show_api_keys == false
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.api_keys.active_field, 5);
+        app.handle_paste("acct-9988776655\r\n");
+        assert_eq!(app.api_keys.cloudflare_account_id, "acct-9988776655");
+        assert_eq!(
+            settings.cloudflare_account_id()?,
+            Some("acct-9988776655".to_string())
+        );
+        let acct_view = render_to_string(&app);
+        assert!(acct_view.contains("CLOUDFLARE_ACCOUNT_ID: acct-9988776655 (15 chars)"));
+
+        // Screen::CloudflareDns displays CLOUDFLARE_ACCOUNT_ID when configured and "(not set)" when empty
+        app.screen = Screen::CloudflareDns;
+        let cf_dns_with_acct = render_to_string(&app);
+        assert!(cf_dns_with_acct.contains("CLOUDFLARE_ACCOUNT_ID: acct-9988776655"));
+        app.api_keys.cloudflare_account_id.clear();
+        let cf_dns_without_acct = render_to_string(&app);
+        assert!(cf_dns_without_acct.contains("CLOUDFLARE_ACCOUNT_ID: (not set)"));
+        app.screen = Screen::ApiKeys;
+
+        // Move to GITHUB_TOKEN (field 6), enter editing mode, paste with trailing \r\n, then Ctrl+U clears
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.api_keys.active_field, 6);
         app.handle_key(key(KeyCode::Enter));
         assert!(app.api_keys.editing);
         app.handle_paste("ghp_part1\r\n");
@@ -8766,7 +8769,7 @@ esac"#
 
         app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         assert!(app.api_keys.github.is_empty());
-        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Untested);
+        assert_eq!(app.api_key_statuses[6], ApiKeyTestStatus::Untested);
         assert_eq!(settings.github_token()?, None);
         app.handle_key(key(KeyCode::Enter));
         assert!(!app.api_keys.editing);
@@ -8825,7 +8828,15 @@ esac"#
             }
             ("GET", "/linode-ok/profile") => ("200 OK", r#"{"username":"demo"}"#.to_string()),
             ("GET", "/cf-ok/user/tokens/verify") => ("200 OK", r#"{"success":true}"#.to_string()),
-            ("GET", "/cf-bad/user/tokens/verify") => ("401 Unauthorized", r#"{"success":false}"#.to_string()),
+            ("GET", "/cf-ok/accounts/acct-valid-42/tokens/verify") => {
+                ("200 OK", r#"{"success":true}"#.to_string())
+            }
+            ("GET", "/cf-bad/user/tokens/verify") => {
+                ("401 Unauthorized", r#"{"success":false}"#.to_string())
+            }
+            ("GET", "/cf-bad/accounts/acct-valid-42/tokens/verify") => {
+                ("401 Unauthorized", r#"{"success":false}"#.to_string())
+            }
             ("GET", "/gh-ok/user") => ("200 OK", r#"{"login":"octocat"}"#.to_string()),
             ("GET", "/gh-err/user") => ("500 Internal Server Error", r#"{"message":"boom"}"#.to_string()),
             _ => ("404 Not Found", "{}".to_string()),
@@ -8847,17 +8858,40 @@ esac"#
         let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
         app.screen = Screen::ApiKeys;
 
+        // Testing CLOUDFLARE_ACCOUNT_ID (field 5) before setting CLOUDFLARE_API_TOKEN keeps [5] Untested
+        app.api_keys.cloudflare_account_id = "acct-valid-42".to_string();
+        app.api_keys.active_field = 5;
+        app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Untested);
+        assert_eq!(
+            app.status_message,
+            "Set CLOUDFLARE_API_TOKEN first to test CLOUDFLARE_ACCOUNT_ID"
+        );
+
         app.api_keys.tailscale = "tskey-valid-1234".to_string();
         app.api_keys.vultr = "vultr-valid-1234".to_string();
         app.api_keys.upcloud = "upcloud-valid-1234".to_string();
         app.api_keys.linode = "linode-valid-1234".to_string();
-        app.api_keys.cloudflare = "cf-valid-1234".to_string();
+        app.api_keys.cloudflare = "cfat_valid_1234".to_string();
         app.api_keys.github = "ghp_valid_1234".to_string();
 
-        // Test single selected key ('t') on CLOUDFLARE_API_TOKEN (field 4)
+        // Test single selected key ('t') on CLOUDFLARE_ACCOUNT_ID (field 5) -> hits /accounts/acct-valid-42/tokens/verify and syncs [4] & [5]
+        app.api_keys.active_field = 5;
+        app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Valid);
+        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Valid);
+        assert!(app.status_message.contains("CLOUDFLARE_ACCOUNT_ID: VALID"));
+
+        // Editing/pasting field 5 resets both [4] and [5] back to Untested
+        app.handle_paste("acct-valid-42\r\n");
+        assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Untested);
+        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Untested);
+
+        // Test single selected key ('t') on CLOUDFLARE_API_TOKEN (field 4) with account ID -> syncs [4] & [5]
         app.api_keys.active_field = 4;
         app.handle_key(key(KeyCode::Char('t')));
         assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Valid);
+        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Valid);
         assert!(app.status_message.contains("CLOUDFLARE_API_TOKEN: VALID"));
 
         // Move selection off field 4 so List highlight_style doesn't override span fg color
@@ -8865,12 +8899,14 @@ esac"#
         let buf = render_to_buffer(&app);
         assert_token_fg_in_row(&buf, "[VALID]", "[VALID]", Color::LightGreen);
 
-        // Editing/pasting resets that slot back to Untested
+        // Editing/pasting field 4 resets both [4] and [5] back to Untested
         app.api_keys.active_field = 4;
         app.handle_paste("cf-new-token-5678\r\n");
         assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Untested);
+        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Untested);
 
-        // Test all ('a') with valid, invalid, and server error responses
+        // Clear account ID so Test All runs 6 keys (or keep account ID and check 7).
+        // Let's keep account ID set so all 7 slots are verified via /accounts/acct-valid-42/tokens/verify!
         app.api_keys.active_field = 0;
         std::env::set_var("CLOUDFLARE_API_BASE", format!("http://{}/cf-bad", srv.addr));
         std::env::set_var("GITHUB_API_BASE", format!("http://{}/gh-err", srv.addr));
@@ -8881,13 +8917,14 @@ esac"#
         assert_eq!(app.api_key_statuses[2], ApiKeyTestStatus::Valid);
         assert_eq!(app.api_key_statuses[3], ApiKeyTestStatus::Valid);
         assert_eq!(app.api_key_statuses[4], ApiKeyTestStatus::Invalid);
+        assert_eq!(app.api_key_statuses[5], ApiKeyTestStatus::Invalid);
         assert!(matches!(
-            app.api_key_statuses[5],
+            app.api_key_statuses[6],
             ApiKeyTestStatus::Error(_)
         ));
         assert!(app
             .status_message
-            .contains("Tested 6 key(s): 4 valid, 1 invalid, 1 error(s)"));
+            .contains("Tested 7 key(s): 4 valid, 2 invalid, 1 error(s)"));
 
         let buf = render_to_buffer(&app);
         assert_token_fg_in_row(

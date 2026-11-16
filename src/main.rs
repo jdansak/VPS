@@ -8,7 +8,10 @@ use bab::config::{
     default_config_dir, generate_random_password, LogStore, SessionData, SessionState, Settings,
     MAX_LOG_FILE_BYTES, SUDO_PASSWORD_LEN,
 };
-use bab::dns::{build_cloudflare_dns_stub_plan, validate_cloudflare_token, CloudflareDnsConfig};
+use bab::dns::{
+    build_cloudflare_dns_stub_plan, validate_cloudflare_account_id,
+    validate_cloudflare_token_for_account, CloudflareDnsConfig,
+};
 use bab::providers::linode::LinodeProvider;
 use bab::providers::upcloud::UpCloudProvider;
 use bab::providers::vultr::VultrProvider;
@@ -297,6 +300,9 @@ struct SettingsArgs {
     /// Set CLOUDFLARE_API_TOKEN
     #[arg(long)]
     cloudflare_token: Option<String>,
+    /// Set CLOUDFLARE_ACCOUNT_ID (for Cloudflare Account API tokens, cfat_*)
+    #[arg(long)]
+    cloudflare_account_id: Option<String>,
     /// Set GITHUB_TOKEN
     #[arg(long)]
     github_token: Option<String>,
@@ -1964,7 +1970,24 @@ enum KeyValidationOutcome {
     Error(String),
 }
 
-fn validate_api_key_by_name(name: &str, value: &str) -> KeyValidationOutcome {
+fn format_setting_display(name: &str, value: &str) -> String {
+    let trimmed = value.trim();
+    if name == "CLOUDFLARE_ACCOUNT_ID" {
+        if trimmed.is_empty() {
+            "(not set)".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        ApiKeyForm::mask_key(trimmed)
+    }
+}
+
+fn validate_api_key_by_name(
+    name: &str,
+    value: &str,
+    cf_account_id: Option<&str>,
+) -> KeyValidationOutcome {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return KeyValidationOutcome::NotSet;
@@ -1980,7 +2003,7 @@ fn validate_api_key_by_name(name: &str, value: &str) -> KeyValidationOutcome {
             .and_then(|provider| provider.validate_key()),
         "LINODE_API_TOKEN" => build_cloud_provider_with_key(ProviderKind::Linode, trimmed, None)
             .and_then(|provider| provider.validate_key()),
-        "CLOUDFLARE_API_TOKEN" => validate_cloudflare_token(trimmed),
+        "CLOUDFLARE_API_TOKEN" => validate_cloudflare_token_for_account(trimmed, cf_account_id),
         "GITHUB_TOKEN" => validate_github_token(trimmed),
         other => Err(anyhow!("Unknown API key '{}'", other)),
     };
@@ -2001,9 +2024,34 @@ fn test_configured_api_keys<W: std::io::Write>(
     let mut error_count = 0usize;
     let mut not_set_count = 0usize;
 
+    let cf_account_id = entries
+        .iter()
+        .find(|(name, _)| *name == "CLOUDFLARE_ACCOUNT_ID")
+        .map(|(_, val)| val.trim())
+        .filter(|val| !val.is_empty());
+
     writeln!(out, "API Key Live Validation:")?;
     for (name, value) in entries {
-        let outcome = validate_api_key_by_name(name, value);
+        if *name == "CLOUDFLARE_ACCOUNT_ID" {
+            let trimmed = value.trim();
+            let status = if trimmed.is_empty() {
+                "[NOT SET]"
+            } else if validate_cloudflare_account_id(trimmed) {
+                "[CONFIGURED]"
+            } else {
+                "[INVALID FORMAT]"
+            };
+            writeln!(
+                out,
+                "  {}: {} {}",
+                name,
+                format_setting_display(name, value),
+                status
+            )?;
+            continue;
+        }
+
+        let outcome = validate_api_key_by_name(name, value, cf_account_id);
         let badge = match &outcome {
             KeyValidationOutcome::Valid => {
                 valid_count += 1;
@@ -2022,8 +2070,8 @@ fn test_configured_api_keys<W: std::io::Write>(
                 format!("[ERROR: {}]", msg)
             }
         };
-        let masked = ApiKeyForm::mask_key(value.trim());
-        writeln!(out, "  {}: {} {}", name, masked, badge)?;
+        let display = format_setting_display(name, value);
+        writeln!(out, "  {}: {} {}", name, display, badge)?;
     }
 
     writeln!(
@@ -2067,6 +2115,10 @@ fn cmd_settings(args: SettingsArgs) -> Result<()> {
         settings.set_cloudflare_api_token(token)?;
         updated = true;
     }
+    if let Some(ref account_id) = args.cloudflare_account_id {
+        settings.set_cloudflare_account_id(account_id)?;
+        updated = true;
+    }
     if let Some(ref token) = args.github_token {
         settings.set_github_token(token)?;
         updated = true;
@@ -2094,6 +2146,10 @@ fn cmd_settings(args: SettingsArgs) -> Result<()> {
             settings.cloudflare_api_token()?.unwrap_or_default(),
         ),
         (
+            "CLOUDFLARE_ACCOUNT_ID",
+            settings.cloudflare_account_id()?.unwrap_or_default(),
+        ),
+        (
             "GITHUB_TOKEN",
             settings.github_token()?.unwrap_or_default(),
         ),
@@ -2113,7 +2169,7 @@ fn cmd_settings(args: SettingsArgs) -> Result<()> {
         let max_log_mb = MAX_LOG_FILE_BYTES / (1024 * 1024);
 
         for (name, value) in &entries {
-            println!("{}: {}", name, ApiKeyForm::mask_key(value));
+            println!("{}: {}", name, format_setting_display(name, value));
         }
         println!("Config Directory: {} (0700)", config_dir.display());
         println!(
@@ -2848,6 +2904,8 @@ mod tests {
             "lin-012",
             "--cloudflare-token",
             "cf-345",
+            "--cloudflare-account-id",
+            "cf-acct-999",
             "--github-token",
             "ghp-678",
         ])
@@ -2860,6 +2918,7 @@ mod tests {
                 assert_eq!(args.upcloud_token.as_deref(), Some("up-789"));
                 assert_eq!(args.linode_token.as_deref(), Some("lin-012"));
                 assert_eq!(args.cloudflare_token.as_deref(), Some("cf-345"));
+                assert_eq!(args.cloudflare_account_id.as_deref(), Some("cf-acct-999"));
                 assert_eq!(args.github_token.as_deref(), Some("ghp-678"));
             }
             other => panic!("unexpected command: {:?}", other),
@@ -4342,6 +4401,12 @@ mod tests {
                         ("GET", "/client/v4/user/tokens/verify") => {
                             (200, "OK", r#"{"success":true}"#.to_string())
                         }
+                        ("GET", p)
+                            if p.starts_with("/client/v4/accounts/")
+                                && p.ends_with("/tokens/verify") =>
+                        {
+                            (200, "OK", r#"{"success":true}"#.to_string())
+                        }
                         ("GET", "/user") => {
                             (200, "OK", r#"{"login":"octocat"}"#.to_string())
                         }
@@ -4463,13 +4528,14 @@ mod tests {
             std::ffi::OsStr::new(&base_root),
         );
 
-        // 1. All 6 keys valid
+        // 1. All 6 keys valid (with CLOUDFLARE_ACCOUNT_ID set and cfat_* account token)
         let all_valid = vec![
             ("TAILSCALE_API_KEY", "tskey-valid-1234".to_string()),
             ("VULTR_API_KEY", "vultr-valid-2345".to_string()),
             ("UPCLOUD_API_TOKEN", "upcloud-valid-3456".to_string()),
             ("LINODE_API_TOKEN", "linode-valid-4567".to_string()),
-            ("CLOUDFLARE_API_TOKEN", "cf-valid-5678".to_string()),
+            ("CLOUDFLARE_API_TOKEN", "cfat_valid-5678".to_string()),
+            ("CLOUDFLARE_ACCOUNT_ID", "cf-acct-5678".to_string()),
             ("GITHUB_TOKEN", "ghp_valid-6789".to_string()),
         ];
         let mut out_ok = Vec::new();
@@ -4479,10 +4545,12 @@ mod tests {
         assert!(ok_str.contains("VULTR_API_KEY: vult****2345 [VALID]"));
         assert!(ok_str.contains("UPCLOUD_API_TOKEN: upcl****3456 [VALID]"));
         assert!(ok_str.contains("LINODE_API_TOKEN: lino****4567 [VALID]"));
-        assert!(ok_str.contains("CLOUDFLARE_API_TOKEN: cf-v****5678 [VALID]"));
+        assert!(ok_str.contains("CLOUDFLARE_API_TOKEN: cfat****5678 [VALID]"));
+        assert!(ok_str.contains("CLOUDFLARE_ACCOUNT_ID: cf-acct-5678 [CONFIGURED]"));
         assert!(ok_str.contains("GITHUB_TOKEN: ghp_****6789 [VALID]"));
         assert!(ok_str.contains("Validation Summary: 6 valid, 0 invalid, 0 error, 0 not set"));
         assert!(!ok_str.contains("tskey-valid-1234"));
+        assert!(!ok_str.contains("cfat_valid-5678"));
         assert!(!ok_str.contains("ghp_valid-6789"));
 
         // 2. Mixed valid, invalid, error, and not set -> returns Err and prints clear badges & summary
@@ -4492,6 +4560,7 @@ mod tests {
             ("UPCLOUD_API_TOKEN", "   ".to_string()),
             ("LINODE_API_TOKEN", String::new()),
             ("CLOUDFLARE_API_TOKEN", "error-cf-token-8888".to_string()),
+            ("CLOUDFLARE_ACCOUNT_ID", String::new()),
             ("GITHUB_TOKEN", "ghp_valid-6789".to_string()),
         ];
         let mut out_mixed = Vec::new();
@@ -4503,6 +4572,7 @@ mod tests {
         assert!(mixed_str.contains("UPCLOUD_API_TOKEN: (not set) [NOT SET]"));
         assert!(mixed_str.contains("LINODE_API_TOKEN: (not set) [NOT SET]"));
         assert!(mixed_str.contains("CLOUDFLARE_API_TOKEN: erro****8888 [ERROR:"));
+        assert!(mixed_str.contains("CLOUDFLARE_ACCOUNT_ID: (not set) [NOT SET]"));
         assert!(mixed_str.contains("GITHUB_TOKEN: ghp_****6789 [VALID]"));
         assert!(mixed_str.contains("Validation Summary: 2 valid, 1 invalid, 1 error, 2 not set"));
         assert!(!mixed_str.contains("invalid-vultr-key-9999"));
@@ -4515,6 +4585,7 @@ mod tests {
             ("UPCLOUD_API_TOKEN", String::new()),
             ("LINODE_API_TOKEN", String::new()),
             ("CLOUDFLARE_API_TOKEN", String::new()),
+            ("CLOUDFLARE_ACCOUNT_ID", String::new()),
             ("GITHUB_TOKEN", String::new()),
         ];
         let mut out_none = Vec::new();
@@ -4537,8 +4608,61 @@ mod tests {
             .any(|(m, p)| m == "GET" && p == "/v4/profile"));
         assert!(recorded
             .iter()
+            .any(|(m, p)| m == "GET" && p == "/client/v4/accounts/cf-acct-5678/tokens/verify"));
+        assert!(recorded
+            .iter()
             .any(|(m, p)| m == "GET" && p == "/client/v4/user/tokens/verify"));
         assert!(recorded.iter().any(|(m, p)| m == "GET" && p == "/user"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_api_keys_cfat_token_requires_and_uses_account_id() -> Result<()> {
+        let _lock = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let server = spawn_key_validation_mock_server();
+        let base_root = format!("http://{}", server.addr);
+        let _g_cf_base = EnvVarGuard::set(
+            "CLOUDFLARE_API_BASE",
+            std::ffi::OsStr::new(&format!("{}/client/v4", base_root)),
+        );
+
+        // cfat_* without CLOUDFLARE_ACCOUNT_ID reports clear error without hitting user endpoint
+        let missing_acct = vec![
+            ("CLOUDFLARE_API_TOKEN", "cfat_missing_acct_1234".to_string()),
+            ("CLOUDFLARE_ACCOUNT_ID", String::new()),
+        ];
+        let mut out_missing = Vec::new();
+        let err = test_configured_api_keys(&missing_acct, &mut out_missing).unwrap_err();
+        assert!(err.to_string().contains("0 invalid, 1 error(s)"));
+        let missing_str = String::from_utf8(out_missing).unwrap();
+        assert!(missing_str.contains("CLOUDFLARE_ACCOUNT_ID: (not set) [NOT SET]"));
+        assert!(missing_str.contains("CLOUDFLARE_API_TOKEN: cfat****1234 [ERROR:"));
+        assert!(missing_str.contains("CLOUDFLARE_ACCOUNT_ID is required"));
+
+        // cfat_* with CLOUDFLARE_ACCOUNT_ID validates via /accounts/<id>/tokens/verify
+        let with_acct = vec![
+            ("CLOUDFLARE_API_TOKEN", "cfat_valid_acct_1234".to_string()),
+            ("CLOUDFLARE_ACCOUNT_ID", "acct_test_99".to_string()),
+        ];
+        let mut out_ok = Vec::new();
+        test_configured_api_keys(&with_acct, &mut out_ok)?;
+        let ok_str = String::from_utf8(out_ok).unwrap();
+        assert!(ok_str.contains("CLOUDFLARE_API_TOKEN: cfat****1234 [VALID]"));
+        assert!(ok_str.contains("CLOUDFLARE_ACCOUNT_ID: acct_test_99 [CONFIGURED]"));
+        assert!(ok_str.contains("Validation Summary: 1 valid, 0 invalid, 0 error, 0 not set"));
+
+        let recorded = server.shutdown();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            (
+                "GET".to_string(),
+                "/client/v4/accounts/acct_test_99/tokens/verify".to_string()
+            )
+        );
         Ok(())
     }
 
@@ -4562,6 +4686,7 @@ mod tests {
         let _g_upcloud_env = EnvVarGuard::remove("UPCLOUD_API_TOKEN");
         let _g_linode_env = EnvVarGuard::remove("LINODE_API_TOKEN");
         let _g_cf_env = EnvVarGuard::remove("CLOUDFLARE_API_TOKEN");
+        let _g_cf_acct_env = EnvVarGuard::remove("CLOUDFLARE_ACCOUNT_ID");
         let _g_gh_env = EnvVarGuard::remove("GITHUB_TOKEN");
 
         let _g_ts = EnvVarGuard::set(
@@ -4601,7 +4726,7 @@ mod tests {
             std::ffi::OsStr::new(&base_root),
         );
 
-        // Save all 6 keys via --show (must stay offline)
+        // Save all 6 keys + CLOUDFLARE_ACCOUNT_ID via --show (must stay offline)
         let save_args = match Cli::try_parse_from([
             "bab",
             "settings",
@@ -4614,7 +4739,9 @@ mod tests {
             "--linode-token",
             "linode-saved-4444",
             "--cloudflare-token",
-            "cf-saved-5555",
+            "cfat_saved-5555",
+            "--cloudflare-account-id",
+            "cf-acct-5555",
             "--github-token",
             "ghp_saved-6666",
             "--show",
@@ -4626,6 +4753,20 @@ mod tests {
         };
         cmd_settings(save_args)?;
 
+        let persisted = Settings::load_default()?;
+        assert_eq!(
+            persisted.cloudflare_account_id()?.as_deref(),
+            Some("cf-acct-5555")
+        );
+        assert_eq!(
+            format_setting_display("CLOUDFLARE_ACCOUNT_ID", "cf-acct-5555"),
+            "cf-acct-5555"
+        );
+        assert_eq!(
+            format_setting_display("CLOUDFLARE_ACCOUNT_ID", ""),
+            "(not set)"
+        );
+
         let show_args = match Cli::try_parse_from(["bab", "settings", "--show"])?.command {
             Some(Commands::Settings(a)) => a,
             other => panic!("unexpected command: {:?}", other),
@@ -4636,13 +4777,19 @@ mod tests {
             "settings --show must remain offline"
         );
 
-        // Passing only --test validates all 6 saved keys
+        // Passing only --test validates all 6 saved keys (with CF using /accounts/<id>/tokens/verify)
         let test_only_args = match Cli::try_parse_from(["bab", "settings", "--test"])?.command {
             Some(Commands::Settings(a)) => a,
             other => panic!("unexpected command: {:?}", other),
         };
         cmd_settings(test_only_args)?;
-        assert_eq!(server.requests.lock().unwrap().len(), 6);
+        {
+            let reqs = server.requests.lock().unwrap();
+            assert_eq!(reqs.len(), 6);
+            assert!(reqs.iter().any(|(m, p)| {
+                m == "GET" && p == "/client/v4/accounts/cf-acct-5555/tokens/verify"
+            }));
+        }
 
         // Updating one key to an invalid value causes --test to fail
         let bad_args = match Cli::try_parse_from([

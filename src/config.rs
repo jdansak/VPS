@@ -55,12 +55,13 @@ fn sanitize_box_key_part(raw: &str) -> Option<String> {
 }
 
 /// Environment variable names for API keys supported by `Settings`.
-pub const API_KEY_ENV_NAMES: [&str; 6] = [
+pub const API_KEY_ENV_NAMES: [&str; 7] = [
     "TAILSCALE_API_KEY",
     "VULTR_API_KEY",
     "UPCLOUD_API_TOKEN",
     "LINODE_API_TOKEN",
     "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
     "GITHUB_TOKEN",
 ];
 
@@ -572,6 +573,12 @@ impl Settings {
     }
     pub fn set_cloudflare_api_token(&self, v: &str) -> Result<()> {
         self.set("CLOUDFLARE_API_TOKEN", v)
+    }
+    pub fn cloudflare_account_id(&self) -> Result<Option<String>> {
+        self.get("CLOUDFLARE_ACCOUNT_ID")
+    }
+    pub fn set_cloudflare_account_id(&self, v: &str) -> Result<()> {
+        self.set("CLOUDFLARE_ACCOUNT_ID", v)
     }
     pub fn github_token(&self) -> Result<Option<String>> {
         self.get("GITHUB_TOKEN")
@@ -1299,11 +1306,13 @@ mod tests {
             "BAB_ENCRYPTION_KEY",
             "BAB_MASTER_KEY_FILE",
             "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_ACCOUNT_ID",
             "GITHUB_TOKEN",
         ]);
         env::remove_var("BAB_ENCRYPTION_KEY");
         env::remove_var("BAB_MASTER_KEY_FILE");
         env::remove_var("CLOUDFLARE_API_TOKEN");
+        env::remove_var("CLOUDFLARE_ACCOUNT_ID");
         env::remove_var("GITHUB_TOKEN");
 
         let dir = tempdir()?;
@@ -1313,13 +1322,16 @@ mod tests {
         assert_eq!(settings.key_file_path(), dir.path().join("master.key"));
 
         settings.set_cloudflare_api_token("cf-secret-token-123")?;
+        settings.set_cloudflare_account_id("cf-acct-999")?;
         settings.set_github_token("ghp_secret_token_456")?;
 
         // Raw file must store enc:v1: ciphertext, never plaintext secrets
         let raw = fs::read_to_string(&creds_path)?;
         assert!(raw.contains("CLOUDFLARE_API_TOKEN=\"enc:v1:"));
+        assert!(raw.contains("CLOUDFLARE_ACCOUNT_ID=\"enc:v1:"));
         assert!(raw.contains("GITHUB_TOKEN=\"enc:v1:"));
         assert!(!raw.contains("cf-secret-token-123"));
+        assert!(!raw.contains("cf-acct-999"));
         assert!(!raw.contains("ghp_secret_token_456"));
 
         // Permissions on credentials.enc and master.key must be 0o600
@@ -1333,6 +1345,10 @@ mod tests {
         assert_eq!(
             settings.cloudflare_api_token()?,
             Some("cf-secret-token-123".to_string())
+        );
+        assert_eq!(
+            settings.cloudflare_account_id()?,
+            Some("cf-acct-999".to_string())
         );
         assert_eq!(
             settings.github_token()?,
@@ -1644,6 +1660,7 @@ mod tests {
         // Set env keys and call Settings::load_default() -> auto-saves encrypted
         env::remove_var("TAILSCALE_API_KEY");
         env::set_var("CLOUDFLARE_API_TOKEN", "cf-auto-123");
+        env::set_var("CLOUDFLARE_ACCOUNT_ID", "cf-acct-auto-789");
         env::set_var("GITHUB_TOKEN", "ghp-auto-456");
 
         let settings = Settings::load_default()?;
@@ -1659,8 +1676,10 @@ mod tests {
 
         let raw_first = fs::read_to_string(&creds_path)?;
         assert!(raw_first.contains("CLOUDFLARE_API_TOKEN=\"enc:v1:"));
+        assert!(raw_first.contains("CLOUDFLARE_ACCOUNT_ID=\"enc:v1:"));
         assert!(raw_first.contains("GITHUB_TOKEN=\"enc:v1:"));
         assert!(!raw_first.contains("cf-auto-123"));
+        assert!(!raw_first.contains("cf-acct-auto-789"));
         assert!(!raw_first.contains("ghp-auto-456"));
 
         // Idempotent: repeated calls do not rewrite or churn nonces
@@ -1670,10 +1689,15 @@ mod tests {
 
         // Survives unsetting the environment variables
         env::remove_var("CLOUDFLARE_API_TOKEN");
+        env::remove_var("CLOUDFLARE_ACCOUNT_ID");
         env::remove_var("GITHUB_TOKEN");
         assert_eq!(
             settings.cloudflare_api_token()?,
             Some("cf-auto-123".to_string())
+        );
+        assert_eq!(
+            settings.cloudflare_account_id()?,
+            Some("cf-acct-auto-789".to_string())
         );
         assert_eq!(settings.github_token()?, Some("ghp-auto-456".to_string()));
 
