@@ -1,8 +1,8 @@
 # bab (Build A Box)
 
-`bab` is a Rust TUI and CLI for spinning up, hardening, and tearing down Linux VPS instances on Vultr, UpCloud, and Akamai/Linode.
+`bab` is a Rust CLI and terminal UI for spinning up, locking down, and tearing down Linux VPS boxes on Vultr, UpCloud, and Akamai/Linode.
 
-Instead of manually clicking through cloud dashboards or maintaining ad-hoc setup scripts, `bab` handles instance creation, cloud-init bootstrapping, user and sudo configuration, SSH/Tailscale lockdown, firewall rules, optional repo deploys, cost estimates, and cleanup from one place.
+Instead of clicking around cloud dashboards or juggling half a dozen bootstrap scripts, `bab` handles creating the VM, setting up your user and firewall, locking down SSH or joining Tailscale, optionally deploying a repo, keeping an eye on what a box is costing you, and cleaning everything up when you're done.
 
 ## Quick start
 
@@ -11,47 +11,35 @@ cargo build --release
 ./target/release/bab
 ```
 
-Run `bab` with no arguments for the interactive terminal UI, or use subcommands (`bab --help`) for scripted runs.
+Run `bab` on its own for the TUI, or pass subcommands (`bab --help`) when you want to script things.
 
-## How it works
+![bab home screen](assets/tui-home.png)
 
-### Providers & access modes
+![bab build box screen](assets/tui-build.png)
 
-`bab` supports **Vultr**, **UpCloud**, and **Linode**, plus configuring an already-running host (`--provider existing`) or printing standalone `cloud-init` output.
+## What it handles
 
-Two transport modes are supported:
+**Clouds & access** — Works with **Vultr**, **UpCloud**, and **Linode**, or against an existing machine (`--provider existing`), or you can just print standalone `cloud-init` scripts. You get two ways in:
 
-- **Tailscale SSH** *(default)* — mints an auth key via the Tailscale API, joins your tailnet on first boot, enables Tailscale SSH, and keeps public TCP port `22` closed.
-- **Standard SSH** — creates or reuses an Ed25519 key (`~/.ssh/bab_ed25519`), locks down `sshd` (no root login or password auth), rate-limits port `22`, and configures Fail2ban.
+- **Tailscale SSH** *(default)* — grabs an auth key from the Tailscale API, joins your tailnet on boot, turns on Tailscale SSH, and leaves public port `22` closed.
+- **Standard SSH** — creates or reuses `~/.ssh/bab_ed25519`, locks down `sshd` (no root login or passwords), rate-limits port `22`, and enables Fail2ban.
 
-The Vultr client prefers IPv4 by default and falls back to dual-stack if needed, so IP-allowlisted API keys don't randomly fail with `401` on dual-stack connections.
+The Vultr client tries IPv4 first and falls back to dual-stack if needed, so IP-allowlisted keys don't randomly bounce with `401` errors on dual-stack machines.
 
-### Server roles
+**Server roles** — Pick what goes on the box:
 
-- `vanilla` — OS security updates, non-root `sudo` user, SSH/Tailscale hardening, `ufw`/`firewalld`, Fail2ban, and unattended upgrades.
-- `caddy` — Docker Engine plus Caddy (`80/tcp`, `443/tcp+udp`) with container-aware firewall rules.
-- `wireguard` — WireGuard VPN (`51820/udp`) with IP forwarding, NAT rules, and generated server/`client1` configs.
-- `rbi` — reserved placeholder for Remote Browser Isolation (stub only).
+- `vanilla` — base updates, non-root `sudo` user, locked-down SSH/Tailscale, `ufw`/`firewalld`, Fail2ban, and unattended security updates.
+- `caddy` — Docker + Caddy (`80/tcp`, `443/tcp+udp`) with container-safe firewall rules.
+- `wireguard` — WireGuard VPN (`51820/udp`) with IP forwarding, NAT, and ready-to-use server and `client1` configs.
+- `rbi` — stub for Remote Browser Isolation (not built yet).
 
-### Building multiple boxes & user credentials
+*Note: Cloudflare DNS is also just a plan/dry-run stub for now.*
 
-Every build creates a fresh instance rather than overwriting an existing box. If your configured hostname is already running on a cloud provider or online in Tailscale, `bab` appends `-2`, `-3`, and so on and generates a new password.
+**Spinning up multiple boxes** — Building again always creates a brand-new server instead of stepping on an existing one. If your hostname is already taken on your cloud account or online in Tailscale, `bab` bumps it to `-2`, `-3`, etc. and rolls a fresh 10-character sudo password. Passwordless sudo (`NOPASSWD:ALL`) is on by default, and you can flip it off anytime.
 
-Each VM gets a non-root admin user (default `deploy`) with a random 10-character sudo password. Passwordless sudo (`NOPASSWD:ALL`) is on by default and can be toggled off per box or in settings. Passwords stay masked in the UI (`w` reveals or hides them, and `r` rolls a new one before launch).
+**Cost tracking & teardown** — You can check live VMs across all your configured providers with hourly/monthly rates and estimated accrued spend. Destroying a box makes you explicitly hit `y` so you don't nuke anything by accident, stops active UpCloud boxes before deleting them, and removes matching nodes from Tailscale automatically when `TAILSCALE_API_KEY` is set.
 
-### Tracking spend & tearing boxes down
-
-From **Running Systems & Destroy** (or `bab instances`), you can list active VMs across providers alongside hourly/monthly rates and estimated accrued cost. Destroying a box requires pressing `y` explicitly, stops active UpCloud servers first before deleting them, and removes matching nodes from your Tailscale tailnet when `TAILSCALE_API_KEY` is configured.
-
-### TUI navigation
-
-The main menu maps `1`–`9` to provider/role/transport settings, Cloudflare DNS (currently a dry-run/plan stub), GitHub repo deploy, API keys, building a box, managing running instances, and viewing logs (`~/.config/bab/bab.log`). Inside submenus, `q`, `Esc`, or `b` takes you back home; `q` on the home screen exits.
-
-A few handy TUI shortcuts:
-
-- **API Key Settings (`6`)** — paste directly into any field (saved automatically as you edit), `w` to show/hide, `c` to clear, `t` to test the selected key live, or `a` to test all keys. For `cfat_*` Cloudflare Account API tokens, fill in `CLOUDFLARE_ACCOUNT_ID` right below the token field so verification hits `/accounts/<id>/tokens/verify`.
-- **Build Box (`7`)** — `d` toggles Cloudflare DNS, `g` toggles GitHub deploy, `p` toggles passwordless sudo, `n` toggles dry-run, `w` toggles password visibility, `r` regenerates the sudo password, and `Enter` starts the build. Bottom panes track the 6 setup steps and show final connection details.
-- **Running Systems (`8`)** — `r` refreshes, `w` shows/hides recorded per-box sudo passwords, and `d` followed by `y` destroys the selected instance.
+**Live key checks** — You can paste API keys straight into the settings screen or save them via CLI, then test them against the live APIs (`bab settings --test`). If you're using a scoped `cfat_*` Cloudflare Account token, add your `CLOUDFLARE_ACCOUNT_ID` too so it verifies against `/accounts/<id>/tokens/verify`.
 
 ## CLI examples
 
@@ -73,7 +61,7 @@ bab settings --test
 bab catalog --provider vultr
 bab catalog --provider linode --live
 
-# View server roles and firewall ports by transport mode
+# See available roles and which ports they open
 bab roles
 bab roles --transport ssh
 
@@ -104,36 +92,36 @@ bab setup \
   --cf-record app \
   --cf-proxied
 
-# Override saved DNS, GitHub deploy, or passwordless sudo settings for one run
+# Flip saved DNS, GitHub deploy, or passwordless sudo off for a single run
 bab setup --provider existing --no-cf-dns --no-github-deploy --no-sudo-nopasswd --dry-run
 
 # Deploy/update a repo or plan a Cloudflare A-record on the active box
 bab deploy --repo owner/app --branch main --path /home/deploy/apps/app --cmd "docker compose up -d --build"
 bab dns --zone example.com --record app --proxied
 
-# List running boxes (aliases: ps, list) or destroy one (aliases: rm, delete)
+# List running boxes (aliases: ps, list) or tear one down (aliases: rm, delete)
 bab instances
 bab ps --provider vultr --all
 bab destroy --id vultr-inst-1 --provider vultr --dry-run
 bab destroy --id vultr-inst-1 --yes
 bab instances --destroy upcloud-uuid-1 -y
 
-# Emit standalone cloud-init scripts or run a status check on the active box
+# Print standalone cloud-init scripts or check on the active box
 bab cloud-init --hostname my-box --user myadmin
 bab cloud-init --transport ssh --generate-ssh-key --hostname my-box --user myadmin
 bab status
 ```
 
-## Config, encryption & logs
+## Where stuff lives
 
-State and credentials live in `~/.config/bab/` (`0700`, override with `BAB_CONFIG_DIR`):
+Everything is stored under `~/.config/bab/` (`0700`, override with `BAB_CONFIG_DIR`):
 
-- `credentials.enc` (`0600`) — `ChaCha20-Poly1305` encrypted API keys and per-box sudo passwords (override with `BAB_SETTINGS_FILE`). Any provider/service env vars in your shell are automatically encrypted into this file on startup.
-- `master.key` (`0600`) — auto-generated 256-bit key for `credentials.enc` (override with `BAB_MASTER_KEY_FILE`, or set `BAB_ENCRYPTION_KEY` to derive a key from a passphrase instead).
-- `state.conf` (`0600`) — current box metadata, IPs, transport, role, and toggle flags (override with `BAB_STATE_FILE`).
-- `bab.log` (`0600`) — persistent timestamped log shared by the TUI and CLI, capped at 10 MB (override with `BAB_LOG_FILE`).
+- `credentials.enc` (`0600`) — `ChaCha20-Poly1305` encrypted API keys and per-box sudo passwords (`BAB_SETTINGS_FILE` overrides this). Any matching env vars in your shell get auto-saved here encrypted on startup.
+- `master.key` (`0600`) — auto-generated 256-bit key for `credentials.enc` (override with `BAB_MASTER_KEY_FILE`, or set `BAB_ENCRYPTION_KEY` to derive from a passphrase instead).
+- `state.conf` (`0600`) — active box IPs, provider settings, user/transport picks, and toggle flags (`BAB_STATE_FILE`).
+- `bab.log` (`0600`) — timestamped log shared by the TUI and CLI, capped at 10 MB (`BAB_LOG_FILE`).
 
-`BAB_SSH_BIN`, `BAB_SCP_BIN`, and `BAB_SSH_KEYGEN_BIN` can override the system SSH tooling if needed.
+If you want to swap in custom SSH binaries or mocks for testing, set `BAB_SSH_BIN`, `BAB_SCP_BIN`, or `BAB_SSH_KEYGEN_BIN`.
 
 ## Tests
 
