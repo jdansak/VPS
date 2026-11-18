@@ -68,7 +68,7 @@ impl ServerRole {
                 "Plain hardened base OS with updates, sudo user, firewall, Fail2ban, and unattended security upgrades"
             }
             ServerRole::ReverseProxyCaddy => {
-                "Docker Engine with log rotation, Caddy reverse proxy (HTTP/HTTPS/HTTP3), and UFW/firewalld container isolation."
+                "Docker Engine with log rotation, caddy-docker-proxy label-driven reverse proxy, and firewall isolation via UFW/docker networking."
             }
             ServerRole::VpnWireguard => {
                 "WireGuard VPN server (10.66.66.0/24 on UDP 51820) with IPv4/IPv6 forwarding, NAT masquerading, and client1 profile."
@@ -268,26 +268,26 @@ DOCKER_LOG_EOF
     systemctl restart docker 2>/dev/null || true
 fi
 
-# --- Install Caddy via official repository ---
-if ! command -v caddy >/dev/null 2>&1; then
-    case "${{DISTRO_FAMILY}}" in
-        debian)
-            apt-get update
-            apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl gpg
-            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-            curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list >/dev/null
-            apt-get update
-            apt-get install -y caddy
-            ;;
-        rhel)
-            dnf install -y 'dnf-command(copr)'
-            dnf copr enable -y @caddy/caddy
-            dnf install -y caddy
-            ;;
-    esac
-fi
+# --- Ensure shared Docker network for Caddy ---
+    docker network inspect caddy >/dev/null 2>&1 || docker network create caddy
 
-systemctl enable --now caddy
+    # --- Start caddy-docker-proxy container if not already running ---
+    if ! docker ps -a --format '{{.Names}}' | grep -q '^caddy$'; then
+        docker run -d --name caddy \
+            --restart unless-stopped \
+            -p 0.0.0.0:80:80 \
+            -p 0.0.0.0:443:443 \
+            -p 0.0.0.0:443:443/udp \
+            --network caddy \
+            -e CADDY_INGRESS_NETWORKS=caddy \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v caddy_data:/data \
+            -v caddy_config:/config \
+            lucaslorentz/caddy-docker-proxy:latest
+    else
+        docker start caddy >/dev/null 2>&1 || true
+    fi
+
 
 # --- Configure Firewall (UFW + ufw-docker or firewalld + docker-forwarding REJECT) ---
 case "${{DISTRO_FAMILY}}" in
@@ -300,6 +300,9 @@ case "${{DISTRO_FAMILY}}" in
         ufw allow 80/tcp
         ufw allow 443/tcp
         ufw allow 443/udp
+        ufw route allow proto tcp from any to any port 80
+        ufw route allow proto tcp from any to any port 443
+        ufw route allow proto udp from any to any port 443
         if ! grep -q "BEGIN UFW AND DOCKER" /etc/ufw/after.rules 2>/dev/null; then
             cat >> /etc/ufw/after.rules << 'UFW_DOCKER_EOF'
 
@@ -815,7 +818,8 @@ mod tests {
         assert!(ts_script.contains("/etc/docker/daemon.json"));
         assert!(ts_script.contains("\"max-size\": \"10m\""));
         assert!(ts_script.contains("\"max-file\": \"3\""));
-        assert!(ts_script.contains("systemctl enable --now caddy"));
+        assert!(ts_script.contains("lucaslorentz/caddy-docker-proxy:latest"));
+        assert!(ts_script.contains("ufw route allow proto tcp from any to any port 80"));
         assert!(ts_script.contains("BEGIN UFW AND DOCKER"));
         assert!(ts_script.contains("docker-forwarding --set-target REJECT"));
         assert!(ts_script.contains("80/tcp"));

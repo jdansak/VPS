@@ -1267,7 +1267,7 @@ fn setup_runner_all_roles_over_tailscale_transport_via_with_bins() -> Result<()>
             ServerRole::ReverseProxyCaddy => {
                 assert!(role_script.contains("get.docker.com"));
                 assert!(role_script.contains("/etc/docker/daemon.json"));
-                assert!(role_script.contains("systemctl enable --now caddy"));
+                assert!(role_script.contains("lucaslorentz/caddy-docker-proxy:latest"));
                 assert!(role_script.contains("BEGIN UFW AND DOCKER"));
                 assert!(role_script.contains("80/tcp"));
                 assert!(role_script.contains("443/tcp"));
@@ -1586,6 +1586,7 @@ fn provision_records_dual_ips_and_setup_runner_deploy_github_executes_via_mock_s
         deploy_cmd: Some("docker compose up -d --build".to_string()),
         github_token: Some("ghp_secret_deploy_token".to_string()),
         username: "deploy".to_string(),
+        ..Default::default()
     };
 
     let out = runner.deploy_github("deploy", &res.tailscale_ip, &gh_cfg, false)?;

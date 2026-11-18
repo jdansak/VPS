@@ -823,6 +823,36 @@ impl SessionState {
     pub fn set_github_enabled(&self, v: &str) -> Result<()> {
         self.set_var("GITHUB_ENABLED", v)
     }
+    pub fn github_caddy_labels_enabled(&self) -> Result<Option<String>> {
+        self.get_var("GITHUB_CADDY_LABELS_ENABLED")
+    }
+    pub fn set_github_caddy_labels_enabled(&self, v: &str) -> Result<()> {
+        self.set_var("GITHUB_CADDY_LABELS_ENABLED", v)
+    }
+    pub fn github_caddy_domain(&self) -> Result<Option<String>> {
+        self.get_var("GITHUB_CADDY_DOMAIN")
+    }
+    pub fn set_github_caddy_domain(&self, v: &str) -> Result<()> {
+        self.set_var("GITHUB_CADDY_DOMAIN", v)
+    }
+    pub fn github_caddy_service(&self) -> Result<Option<String>> {
+        self.get_var("GITHUB_CADDY_SERVICE")
+    }
+    pub fn set_github_caddy_service(&self, v: &str) -> Result<()> {
+        self.set_var("GITHUB_CADDY_SERVICE", v)
+    }
+    pub fn github_caddy_port(&self) -> Result<Option<String>> {
+        self.get_var("GITHUB_CADDY_PORT")
+    }
+    pub fn set_github_caddy_port(&self, v: &str) -> Result<()> {
+        self.set_var("GITHUB_CADDY_PORT", v)
+    }
+    pub fn github_caddy_extra_labels(&self) -> Result<Option<String>> {
+        self.get_var("GITHUB_CADDY_EXTRA_LABELS")
+    }
+    pub fn set_github_caddy_extra_labels(&self, v: &str) -> Result<()> {
+        self.set_var("GITHUB_CADDY_EXTRA_LABELS", v)
+    }
     pub fn sudo_nopasswd(&self) -> Result<Option<String>> {
         self.get_var("SUDO_NOPASSWD")
     }
@@ -870,6 +900,11 @@ impl SessionState {
         set_opt!("GITHUB_DEPLOY_PATH", data.github_deploy_path);
         set_opt!("GITHUB_DEPLOY_CMD", data.github_deploy_cmd);
         set_opt!("GITHUB_ENABLED", data.github_enabled);
+        set_opt!("GITHUB_CADDY_LABELS_ENABLED", data.github_caddy_labels_enabled);
+        set_opt!("GITHUB_CADDY_DOMAIN", data.github_caddy_domain);
+        set_opt!("GITHUB_CADDY_SERVICE", data.github_caddy_service);
+        set_opt!("GITHUB_CADDY_PORT", data.github_caddy_port);
+        set_opt!("GITHUB_CADDY_EXTRA_LABELS", data.github_caddy_extra_labels);
         match data.sudo_nopasswd.as_deref() {
             Some(v) if !v.trim().is_empty() => self.set_var("SUDO_NOPASSWD", v)?,
             _ => self.remove_var("SUDO_NOPASSWD")?,
@@ -906,6 +941,11 @@ impl SessionState {
             github_deploy_path: self.github_deploy_path()?,
             github_deploy_cmd: self.github_deploy_cmd()?,
             github_enabled: self.github_enabled()?,
+            github_caddy_labels_enabled: self.github_caddy_labels_enabled()?,
+            github_caddy_domain: self.github_caddy_domain()?,
+            github_caddy_service: self.github_caddy_service()?,
+            github_caddy_port: self.github_caddy_port()?,
+            github_caddy_extra_labels: self.github_caddy_extra_labels()?,
             sudo_nopasswd: self.sudo_nopasswd()?,
             sudo_password: self.sudo_password()?,
         })
@@ -937,6 +977,11 @@ pub struct SessionData {
     pub github_deploy_path: Option<String>,
     pub github_deploy_cmd: Option<String>,
     pub github_enabled: Option<String>,
+    pub github_caddy_labels_enabled: Option<String>,
+    pub github_caddy_domain: Option<String>,
+    pub github_caddy_service: Option<String>,
+    pub github_caddy_port: Option<String>,
+    pub github_caddy_extra_labels: Option<String>,
     pub sudo_nopasswd: Option<String>,
     pub sudo_password: Option<String>,
 }
@@ -1462,6 +1507,11 @@ mod tests {
             github_deploy_path: Some("/home/deploy/apps/repo".to_string()),
             github_deploy_cmd: Some("docker compose up -d".to_string()),
             github_enabled: Some("true".to_string()),
+            github_caddy_labels_enabled: Some("true".to_string()),
+            github_caddy_domain: Some("app.example.com".to_string()),
+            github_caddy_service: Some("web".to_string()),
+            github_caddy_port: Some("8080".to_string()),
+            github_caddy_extra_labels: Some("caddy.encode=gzip".to_string()),
             sudo_nopasswd: Some("true".to_string()),
             sudo_password: Some("Abc123Xyz9".to_string()),
         };
@@ -1484,6 +1534,11 @@ mod tests {
             cf_enabled: None,
             github_deploy_cmd: None,
             github_enabled: None,
+            github_caddy_labels_enabled: None,
+            github_caddy_domain: None,
+            github_caddy_service: None,
+            github_caddy_port: None,
+            github_caddy_extra_labels: None,
             sudo_nopasswd: None,
             sudo_password: None,
             ..data

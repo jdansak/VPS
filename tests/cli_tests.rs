@@ -114,7 +114,7 @@ fn cli_setup_dry_run_all_roles() {
 
     for (role, marker) in [
         ("vanilla", "ufw default deny incoming"),
-        ("caddy", "systemctl enable --now caddy"),
+        ("caddy", "lucaslorentz/caddy-docker-proxy:latest"),
         ("wireguard", "systemctl enable --now wg-quick@wg0"),
         ("rbi", "RBI_STUB_READY"),
     ] {

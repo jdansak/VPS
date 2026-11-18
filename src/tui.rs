@@ -92,12 +92,17 @@ const CF_DNS_FIELD_LABELS: [&str; 5] = [
     "DNS Enabled",
 ];
 
-const GITHUB_FIELD_LABELS: [&str; 5] = [
+const GITHUB_FIELD_LABELS: [&str; 10] = [
     "Repository",
     "Branch",
     "Deploy Path",
     "Deploy Command",
     "Deploy Enabled",
+    "Inject Caddy Labels",
+    "Caddy Domain",
+    "Compose Service",
+    "Upstream Port",
+    "Extra Caddy Labels",
 ];
 
 fn toggle_style(enabled: bool) -> Style {
@@ -436,6 +441,11 @@ pub struct GithubDeployForm {
     pub deploy_path: String,
     pub deploy_cmd: String,
     pub enabled: bool,
+    pub caddy_labels: bool,
+    pub caddy_domain: String,
+    pub caddy_service: String,
+    pub caddy_port: String,
+    pub caddy_extra_labels: String,
     pub active_field: usize,
     pub editing: bool,
 }
@@ -448,6 +458,11 @@ impl Default for GithubDeployForm {
             deploy_path: String::new(),
             deploy_cmd: String::new(),
             enabled: false,
+            caddy_labels: false,
+            caddy_domain: String::new(),
+            caddy_service: String::new(),
+            caddy_port: String::new(),
+            caddy_extra_labels: String::new(),
             active_field: 0,
             editing: false,
         }
@@ -490,6 +505,39 @@ impl GithubDeployForm {
             },
             None => !repo.is_empty(),
         };
+        let caddy_labels = matches!(
+            session
+                .github_caddy_labels_enabled
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("true" | "1" | "yes" | "on")
+        );
+        let caddy_domain = session
+            .github_caddy_domain
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let caddy_service = session
+            .github_caddy_service
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let caddy_port = session
+            .github_caddy_port
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
+        let caddy_extra_labels = session
+            .github_caddy_extra_labels
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_string();
 
         Self {
             repo,
@@ -497,6 +545,11 @@ impl GithubDeployForm {
             deploy_path,
             deploy_cmd,
             enabled,
+            caddy_labels,
+            caddy_domain,
+            caddy_service,
+            caddy_port,
+            caddy_extra_labels,
             active_field: 0,
             editing: false,
         }
@@ -508,6 +561,10 @@ impl GithubDeployForm {
             1 => Some(&mut self.branch),
             2 => Some(&mut self.deploy_path),
             3 => Some(&mut self.deploy_cmd),
+            6 => Some(&mut self.caddy_domain),
+            7 => Some(&mut self.caddy_service),
+            8 => Some(&mut self.caddy_port),
+            9 => Some(&mut self.caddy_extra_labels),
             _ => None,
         }
     }
@@ -1257,25 +1314,14 @@ impl TuiApp {
                 self.access.active_field =
                     next_index(self.access.active_field, ACCESS_FIELD_LABELS.len());
             }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                if self.access.active_field == 0 =>
-            {
+            KeyCode::Char(' ') if self.access.active_field == 0 => {
                 self.access.toggle_transport();
                 self.status_message = format!(
                     "Transport mode set to {} (press 's' to save)",
                     self.access.transport_mode_str()
                 );
             }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                if self.access.active_field == 4 =>
-            {
-                self.access.toggle_sudo_nopasswd();
-                self.status_message = format!(
-                    "Passwordless sudo set to {} (press 's' to save)",
-                    self.access.sudo_nopasswd_label()
-                );
-            }
-            KeyCode::Char('p') => {
+            KeyCode::Char(' ') if self.access.active_field == 4 => {
                 self.access.toggle_sudo_nopasswd();
                 self.status_message = format!(
                     "Passwordless sudo set to {} (press 's' to save)",
@@ -1285,29 +1331,7 @@ impl TuiApp {
             KeyCode::Char('w') => {
                 self.toggle_show_password();
             }
-            KeyCode::Enter => match self.access.active_field {
-                0 => {
-                    self.access.toggle_transport();
-                    self.status_message = format!(
-                        "Transport mode set to {} (press 's' to save)",
-                        self.access.transport_mode_str()
-                    );
-                }
-                4 => {
-                    self.access.toggle_sudo_nopasswd();
-                    self.status_message = format!(
-                        "Passwordless sudo set to {} (press 's' to save)",
-                        self.access.sudo_nopasswd_label()
-                    );
-                }
-                idx if matches!(idx, 1..=3) => {
-                    self.access.editing = true;
-                    let label = ACCESS_FIELD_LABELS[idx];
-                    self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
-                }
-                _ => {}
-            },
-            KeyCode::Char('e') if matches!(self.access.active_field, 1..=3) => {
+            KeyCode::Enter if matches!(self.access.active_field, 1..=3) => {
                 self.access.editing = true;
                 let label = ACCESS_FIELD_LABELS[self.access.active_field];
                 self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
@@ -1357,60 +1381,25 @@ impl TuiApp {
                 self.cf_dns.active_field =
                     next_index(self.cf_dns.active_field, CF_DNS_FIELD_LABELS.len());
             }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                if self.cf_dns.active_field == 2 =>
-            {
+            KeyCode::Char(' ') if self.cf_dns.active_field == 2 => {
                 self.cf_dns.toggle_target_mode();
                 self.status_message = format!(
                     "Cloudflare target set to {} (press 's' to save)",
                     self.cf_dns.target_mode
                 );
             }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                if self.cf_dns.active_field == 3 =>
-            {
+            KeyCode::Char(' ') if self.cf_dns.active_field == 3 => {
                 self.cf_dns.proxied = !self.cf_dns.proxied;
                 self.status_message = format!(
                     "Cloudflare proxied set to {} (press 's' to save)",
                     self.cf_dns.proxied
                 );
             }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                if self.cf_dns.active_field == 4 =>
-            {
+            KeyCode::Char(' ') if self.cf_dns.active_field == 4 => {
                 self.cf_dns.enabled = !self.cf_dns.enabled;
                 self.save_cf_dns();
             }
-            KeyCode::Char('t') => {
-                self.cf_dns.enabled = !self.cf_dns.enabled;
-                self.save_cf_dns();
-            }
-            KeyCode::Enter => match self.cf_dns.active_field {
-                2 => {
-                    self.cf_dns.toggle_target_mode();
-                    self.status_message = format!(
-                        "Cloudflare target set to {} (press 's' to save)",
-                        self.cf_dns.target_mode
-                    );
-                }
-                3 => {
-                    self.cf_dns.proxied = !self.cf_dns.proxied;
-                    self.status_message = format!(
-                        "Cloudflare proxied set to {} (press 's' to save)",
-                        self.cf_dns.proxied
-                    );
-                }
-                4 => {
-                    self.cf_dns.enabled = !self.cf_dns.enabled;
-                    self.save_cf_dns();
-                }
-                idx => {
-                    self.cf_dns.editing = true;
-                    let label = CF_DNS_FIELD_LABELS[idx];
-                    self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
-                }
-            },
-            KeyCode::Char('e') if self.cf_dns.active_field < 2 => {
+            KeyCode::Enter if self.cf_dns.active_field < 2 => {
                 self.cf_dns.editing = true;
                 let label = CF_DNS_FIELD_LABELS[self.cf_dns.active_field];
                 self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
@@ -1466,27 +1455,17 @@ impl TuiApp {
                 self.github_deploy.active_field =
                     next_index(self.github_deploy.active_field, GITHUB_FIELD_LABELS.len());
             }
-            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
-                if self.github_deploy.active_field == 4 =>
+            KeyCode::Char(' ') if self.github_deploy.active_field == 4 => {
+                self.github_deploy.enabled = !self.github_deploy.enabled;
+                self.save_github_deploy();
+            }
+            KeyCode::Char(' ') if self.github_deploy.active_field == 5 => {
+                self.github_deploy.caddy_labels = !self.github_deploy.caddy_labels;
+                self.save_github_deploy();
+            }
+            KeyCode::Enter
+                if !matches!(self.github_deploy.active_field, 4 | 5) =>
             {
-                self.github_deploy.enabled = !self.github_deploy.enabled;
-                self.save_github_deploy();
-            }
-            KeyCode::Char('t') => {
-                self.github_deploy.enabled = !self.github_deploy.enabled;
-                self.save_github_deploy();
-            }
-            KeyCode::Enter => {
-                if self.github_deploy.active_field == 4 {
-                    self.github_deploy.enabled = !self.github_deploy.enabled;
-                    self.save_github_deploy();
-                } else {
-                    self.github_deploy.editing = true;
-                    let label = GITHUB_FIELD_LABELS[self.github_deploy.active_field];
-                    self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
-                }
-            }
-            KeyCode::Char('e') if self.github_deploy.active_field < 4 => {
                 self.github_deploy.editing = true;
                 let label = GITHUB_FIELD_LABELS[self.github_deploy.active_field];
                 self.status_message = format!("Editing {} (Enter/Esc to finish)", label);
@@ -1654,7 +1633,7 @@ impl TuiApp {
                 self.api_keys.active_field =
                     next_index(self.api_keys.active_field, API_KEY_LABELS.len());
             }
-            KeyCode::Enter | KeyCode::Char('e') => {
+            KeyCode::Enter => {
                 self.api_keys.editing = true;
                 let label = API_KEY_LABELS[self.api_keys.active_field];
                 self.status_message =
@@ -1668,7 +1647,7 @@ impl TuiApp {
                     "API keys masked".to_string()
                 };
             }
-            KeyCode::Char('c') | KeyCode::Delete | KeyCode::Backspace => {
+            KeyCode::Char('c') => {
                 let idx = self.api_keys.active_field;
                 self.api_keys.active_value_mut().clear();
                 self.reset_api_key_status(idx);
@@ -1734,7 +1713,7 @@ impl TuiApp {
         F: FnMut(&Self),
     {
         match key.code {
-            KeyCode::Char('d') | KeyCode::Char(' ') => {
+            KeyCode::Char('d') => {
                 self.cf_dns.enabled = !self.cf_dns.enabled;
                 self.save_cf_dns();
                 self.status_message = format!(
@@ -1783,7 +1762,7 @@ impl TuiApp {
                     }
                 );
             }
-            KeyCode::Enter | KeyCode::Char('x') => {
+            KeyCode::Enter => {
                 self.execute_build_with_ui(on_update);
             }
             KeyCode::Esc | KeyCode::Char('b') => {
@@ -1935,13 +1914,13 @@ impl TuiApp {
                     self.running_confirm_destroy = false;
                     self.destroy_selected_instance();
                 }
-                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('b') | KeyCode::Char('q') => {
+                KeyCode::Char('n') => {
                     self.running_confirm_destroy = false;
                     self.status_message = "Destroy cancelled".to_string();
                 }
                 _ => {
                     self.status_message =
-                        "Press 'y' to confirm destroy, or 'n'/Esc to cancel".to_string();
+                        "Press 'y' to confirm destroy, or 'n' to cancel".to_string();
                 }
             }
             return;
@@ -1960,7 +1939,7 @@ impl TuiApp {
             KeyCode::Char('w') => {
                 self.toggle_show_password();
             }
-            KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => {
+            KeyCode::Char('d') => {
                 if let Some(inst) = self.running_instances.get(self.running_index) {
                     self.running_confirm_destroy = true;
                     self.status_message = format!(
@@ -2420,6 +2399,19 @@ impl TuiApp {
         } else {
             "false".to_string()
         };
+        let caddy_labels = if self.github_deploy.caddy_labels {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        };
+        let caddy_domain = self.github_deploy.caddy_domain.trim().to_string();
+        self.github_deploy.caddy_domain = caddy_domain.clone();
+        let caddy_service = self.github_deploy.caddy_service.trim().to_string();
+        self.github_deploy.caddy_service = caddy_service.clone();
+        let caddy_port = self.github_deploy.caddy_port.trim().to_string();
+        self.github_deploy.caddy_port = caddy_port.clone();
+        let caddy_extra_labels = self.github_deploy.caddy_extra_labels.trim().to_string();
+        self.github_deploy.caddy_extra_labels = caddy_extra_labels.clone();
 
         self.session.github_repo = if repo.is_empty() {
             None
@@ -2438,6 +2430,27 @@ impl TuiApp {
             Some(deploy_cmd.clone())
         };
         self.session.github_enabled = Some(enabled);
+        self.session.github_caddy_labels_enabled = Some(caddy_labels);
+        self.session.github_caddy_domain = if caddy_domain.is_empty() {
+            None
+        } else {
+            Some(caddy_domain)
+        };
+        self.session.github_caddy_service = if caddy_service.is_empty() {
+            None
+        } else {
+            Some(caddy_service)
+        };
+        self.session.github_caddy_port = if caddy_port.is_empty() {
+            None
+        } else {
+            Some(caddy_port)
+        };
+        self.session.github_caddy_extra_labels = if caddy_extra_labels.is_empty() {
+            None
+        } else {
+            Some(caddy_extra_labels)
+        };
 
         if let Some(ref path) = self.state_path {
             let state = SessionState::new(path);
@@ -3045,6 +3058,33 @@ impl TuiApp {
                     "[GITHUB] Deploying '{}' (branch: {})",
                     repo, branch
                 ));
+                let trim_opt = |s: &str| {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t.to_string())
+                    }
+                };
+                let mut caddy_domain = trim_opt(&self.github_deploy.caddy_domain);
+                if self.github_deploy.caddy_labels && caddy_domain.is_none() {
+                    let zone = self.cf_dns.zone.trim();
+                    let rec = self.cf_dns.record_name.trim();
+                    if !zone.is_empty() {
+                        caddy_domain = Some(if rec.is_empty() || rec == "@" {
+                            zone.to_string()
+                        } else if rec.eq_ignore_ascii_case(zone)
+                            || rec.ends_with(&format!(".{zone}"))
+                        {
+                            rec.to_string()
+                        } else {
+                            format!("{rec}.{zone}")
+                        });
+                    }
+                }
+                let caddy_service = trim_opt(&self.github_deploy.caddy_service);
+                let caddy_port = trim_opt(&self.github_deploy.caddy_port);
+                let caddy_extra_labels = trim_opt(&self.github_deploy.caddy_extra_labels);
                 Some(GithubDeployConfig {
                     repo,
                     branch,
@@ -3052,6 +3092,11 @@ impl TuiApp {
                     deploy_cmd,
                     github_token,
                     username: self.access.username.clone(),
+                    caddy_labels: self.github_deploy.caddy_labels,
+                    caddy_domain,
+                    caddy_service,
+                    caddy_port,
+                    caddy_extra_labels,
                 })
             }
         } else {
@@ -3330,34 +3375,34 @@ impl TuiApp {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::AccessConfig => {
-                "Up/Down/j/k: Field | Space/Enter: Toggle/Edit | p: Sudo | w: Pass | s: Save | Esc/b/q: Back"
+                "Up/Down/j/k: Field | Space: Toggle | Enter: Edit | w: Pass | s: Save | Esc/b/q: Back"
             }
             Screen::CloudflareDns if self.cf_dns.editing => {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::CloudflareDns => {
-                "Up/Down or j/k: Field | Space/Enter/Left/Right/t: Toggle/Edit | s: Save | Esc/b/q: Back"
+                "Up/Down/j/k: Field | Space: Toggle | Enter: Edit | s: Save | Esc/b/q: Back"
             }
             Screen::GithubDeploy if self.github_deploy.editing => {
                 "Type characters | Backspace: Delete | Enter/Esc: Finish Editing"
             }
             Screen::GithubDeploy => {
-                "Up/Down or j/k: Field | Space/Enter/Left/Right/t: Toggle/Edit | s: Save | Esc/b/q: Back"
+                "Up/Down/j/k: Field | Space: Toggle | Enter: Edit | s: Save | Esc/b/q: Back"
             }
             Screen::ApiKeys if self.api_keys.editing => {
                 "Type/Paste | Ctrl+U: Clear | Backspace: Del | Enter/Esc: Done (Auto-Saved)"
             }
             Screen::ApiKeys => {
-                "j/k: Nav | Enter/e: Edit | w: Show | c: Clear | t/a: Test | Esc/b/q: Back"
+                "j/k: Nav | Enter: Edit | w: Show | c: Clear | t: Test | a: Test All | Esc/b/q: Back"
             }
             Screen::BuildBox => {
-                "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | w: Pass | r: New Pass | n: Dry | Esc/b/q: Back"
+                "Enter: Build | d: DNS | g: GitHub | p: Sudo | w: Pass | r: New Pass | n: Dry | Esc/b/q: Back"
             }
             Screen::RunningInstances if self.running_confirm_destroy => {
-                "y: Confirm Destroy | n/Esc/b/q: Cancel"
+                "y: Confirm Destroy | n: Cancel"
             }
             Screen::RunningInstances => {
-                "Up/Down/j/k: Select | r: Refresh | w: Show/Hide Pass | d/x/Del: Destroy | Esc/b/q: Back"
+                "Up/Down/j/k: Select | r: Refresh | w: Show/Hide Pass | d: Destroy | Esc/b/q: Back"
             }
             Screen::ViewLog => {
                 "Up/Down/j/k/PgUp/PgDn/g/G: Scroll | r: Reload | c: Clear Log | Esc/b/q: Back"
@@ -3885,7 +3930,7 @@ impl TuiApp {
                     self.access.sudo_nopasswd_label(),
                     toggle_style(self.access.sudo_nopasswd),
                 ),
-                Span::raw(" (Space/Enter/Left/Right or 'p' to toggle)"),
+                Span::raw(" (Space to toggle)"),
             ])),
         ];
 
@@ -4015,7 +4060,7 @@ impl TuiApp {
                     if self.cf_dns.enabled { "ON" } else { "OFF" },
                     toggle_style(self.cf_dns.enabled),
                 ),
-                Span::raw(" — Space/Enter/Left/Right or 't' to toggle"),
+                Span::raw(" — Space to toggle"),
             ])),
         ];
 
@@ -4186,8 +4231,63 @@ impl TuiApp {
                     },
                     toggle_style(self.github_deploy.enabled),
                 ),
-                Span::raw(" — Space/Enter/Left/Right or 't' to toggle"),
+                Span::raw(" — Space to toggle"),
             ])),
+            ListItem::new(Line::from(vec![
+                Span::raw(format!(
+                    "{} (GITHUB_CADDY_LABELS_ENABLED): ",
+                    GITHUB_FIELD_LABELS[5]
+                )),
+                Span::styled(
+                    if self.github_deploy.caddy_labels {
+                        "ON"
+                    } else {
+                        "OFF"
+                    },
+                    toggle_style(self.github_deploy.caddy_labels),
+                ),
+                Span::raw(" — Space to toggle"),
+            ])),
+            ListItem::new(format!(
+                "{} (GITHUB_CADDY_DOMAIN): {}{}",
+                GITHUB_FIELD_LABELS[6],
+                if self.github_deploy.caddy_domain.is_empty() {
+                    "(auto from Cloudflare DNS)"
+                } else {
+                    self.github_deploy.caddy_domain.as_str()
+                },
+                edit_tag(6)
+            )),
+            ListItem::new(format!(
+                "{} (GITHUB_CADDY_SERVICE): {}{}",
+                GITHUB_FIELD_LABELS[7],
+                if self.github_deploy.caddy_service.is_empty() {
+                    "(auto if single service)"
+                } else {
+                    self.github_deploy.caddy_service.as_str()
+                },
+                edit_tag(7)
+            )),
+            ListItem::new(format!(
+                "{} (GITHUB_CADDY_PORT): {}{}",
+                GITHUB_FIELD_LABELS[8],
+                if self.github_deploy.caddy_port.is_empty() {
+                    "(default: 8080)"
+                } else {
+                    self.github_deploy.caddy_port.as_str()
+                },
+                edit_tag(8)
+            )),
+            ListItem::new(format!(
+                "{} (GITHUB_CADDY_EXTRA_LABELS): {}{}",
+                GITHUB_FIELD_LABELS[9],
+                if self.github_deploy.caddy_extra_labels.is_empty() {
+                    "(optional key=value, ...)"
+                } else {
+                    self.github_deploy.caddy_extra_labels.as_str()
+                },
+                edit_tag(9)
+            )),
         ];
 
         let list = List::new(items)
@@ -4214,7 +4314,7 @@ impl TuiApp {
         };
         let repo_preview = if self.github_deploy.repo.trim().is_empty() {
             Line::from(Span::styled(
-                "Repository not configured yet (press Enter/e to edit, 's' to save).",
+                "Repository not configured yet (press Enter to edit, 's' to save).",
                 Style::default().fg(Color::Yellow),
             ))
         } else {
@@ -4556,7 +4656,7 @@ impl TuiApp {
                 Span::raw("Cloudflare DNS: "),
                 Span::styled(dns_state, toggle_style(self.cf_dns.enabled)),
                 Span::raw(format!(
-                    " ({} / {}, target={}, proxied={})  ['d' or Space: Toggle DNS ON/OFF]",
+                    " ({} / {}, target={}, proxied={})  ['d': Toggle DNS ON/OFF]",
                     dns_zone,
                     self.cf_dns.record_name,
                     self.cf_dns.target_mode,
@@ -4601,7 +4701,7 @@ impl TuiApp {
                 .clamp(1, 8) as usize;
             let activity_lines: Vec<Line> = if self.logs.is_empty() {
                 vec![Line::from(Span::styled(
-                    "(waiting to start — press Enter or 'x' to build)",
+                    "(waiting to start — press Enter to build)",
                     Style::default().fg(Color::DarkGray),
                 ))]
             } else {
@@ -4621,7 +4721,7 @@ impl TuiApp {
         };
 
         let actions = Paragraph::new(Line::from(Span::styled(
-            "Enter/x: Build | d: DNS | g: GitHub | p: Sudo | w: Show/Hide Password | r: New Password | n: Dry-Run | Esc/b/q: Back",
+            "Enter: Build | d: DNS | g: GitHub | p: Sudo | w: Show/Hide Password | r: New Password | n: Dry-Run | Esc/b/q: Back",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )))
         .block(Block::default().borders(Borders::ALL))
@@ -5683,17 +5783,14 @@ mod tests {
         assert!(initial_view.contains("wheel"));
         assert!(initial_view.contains("tailscale"));
 
-        // Toggle transport via Space, Left, Right, Enter
+        // Toggle transport via Space only (Left/Right/Enter must not toggle)
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(!app.access.tailscale_mode);
         app.handle_key(key(KeyCode::Left));
-        assert!(app.access.tailscale_mode);
+        assert!(!app.access.tailscale_mode);
         app.handle_key(key(KeyCode::Right));
         assert!(!app.access.tailscale_mode);
         app.handle_key(key(KeyCode::Enter));
-        assert!(app.access.tailscale_mode);
-        // Set back to ssh mode via Space
-        app.handle_key(key(KeyCode::Char(' ')));
         assert!(!app.access.tailscale_mode);
 
         // Move to Field 1 (Sudo Username) and edit it
@@ -5837,9 +5934,11 @@ mod tests {
         app.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(app.cf_dns.target_mode, "tailscale");
 
-        // Toggle Proxied (field 3) -> true
+        // Toggle Proxied (field 3) -> true via Space (Enter must not toggle)
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
+        assert!(!app.cf_dns.proxied);
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.cf_dns.proxied);
 
         let ts_view = render_to_string(&app);
@@ -6257,7 +6356,7 @@ mod tests {
         // Finishing zone edit when cf_enabled is None enables DNS automatically
         assert!(app.cf_dns.enabled);
 
-        // Navigate to field 4 (DNS Enabled) and toggle OFF then ON with Space and 't'
+        // Navigate to field 4 (DNS Enabled) and toggle OFF then ON with Space only ('t' must not toggle)
         for _ in 0..4 {
             app.handle_key(key(KeyCode::Down));
         }
@@ -6265,6 +6364,8 @@ mod tests {
         app.handle_key(key(KeyCode::Char(' ')));
         assert!(!app.cf_dns.enabled);
         app.handle_key(key(KeyCode::Char('t')));
+        assert!(!app.cf_dns.enabled);
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.cf_dns.enabled);
         app.handle_key(key(KeyCode::Char('s')));
 
@@ -6299,10 +6400,12 @@ mod tests {
         // Dry-run must not persist fake VPS_IP into state.conf
         assert_eq!(state.vps_ip()?, None);
 
-        // Toggle DNS back ON with Space and run again with 'x'
+        // Toggle DNS back ON with 'd' (Space must not toggle) and run again with Enter ('x' must not run)
         app.handle_key(key(KeyCode::Char(' ')));
+        assert!(!app.cf_dns.enabled);
+        app.handle_key(key(KeyCode::Char('d')));
         assert!(app.cf_dns.enabled);
-        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.logs.iter().any(|l| {
             l.contains("[DNS] [STUB] Cloudflare DNS: would upsert A record '@' -> '100.64.0.1' in zone 'example.com'")
         }));
@@ -6489,10 +6592,10 @@ mod tests {
         assert_eq!(app.running_instances.len(), 1);
         assert!(!destroyed.load(Ordering::SeqCst));
 
-        // d -> q cancels confirmation without leaving screen or quitting
+        // d -> 'q' leaves screen without cancelling via 'q'; 'n' cancels confirmation
         app.handle_key(key(KeyCode::Char('d')));
         assert!(app.running_confirm_destroy);
-        app.handle_key(key(KeyCode::Char('q')));
+        app.handle_key(key(KeyCode::Char('n')));
         assert!(!app.running_confirm_destroy);
         assert_eq!(app.screen, Screen::RunningInstances);
         assert!(!app.should_quit);
@@ -6554,7 +6657,7 @@ mod tests {
         assert!(!app.cf_dns.enabled);
         assert!(!app.github_deploy.enabled);
 
-        // 1. Toggle CF DNS in CloudflareDns (field 4 Space, then 't' from field 0) -> immediate sync
+        // 1. Toggle CF DNS in CloudflareDns (field 4 Space only; 't' on field 0 must not toggle) -> immediate sync
         app.handle_key(key(KeyCode::Char('4')));
         assert_eq!(app.screen, Screen::CloudflareDns);
         for _ in 0..4 {
@@ -6566,14 +6669,12 @@ mod tests {
         assert_eq!(app.session.cf_enabled.as_deref(), Some("true"));
         assert_eq!(state.cf_enabled()?, Some("true".to_string()));
 
-        app.handle_key(key(KeyCode::Down)); // wraps to field 0
-        assert_eq!(app.cf_dns.active_field, 0);
-        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(!app.cf_dns.enabled);
         assert_eq!(app.session.cf_enabled.as_deref(), Some("false"));
         assert_eq!(state.cf_enabled()?, Some("false".to_string()));
 
-        // 2. Toggle GitHub Deploy in GithubDeploy (field 4 guards 'e', toggles on Space/Enter/Left/Right, and 't' anywhere)
+        // 2. Toggle GitHub Deploy in GithubDeploy (field 4 toggles ONLY on Space)
         app.handle_key(key(KeyCode::Char('b')));
         app.handle_key(key(KeyCode::Char('5')));
         assert_eq!(app.screen, Screen::GithubDeploy);
@@ -6589,21 +6690,19 @@ mod tests {
         assert_eq!(app.session.github_enabled.as_deref(), Some("true"));
         assert_eq!(state.github_enabled()?, Some("true".to_string()));
 
+        // Left/Right/Enter/'t' must not toggle field 4
         app.handle_key(key(KeyCode::Right));
-        assert!(!app.github_deploy.enabled);
-        assert_eq!(state.github_enabled()?, Some("false".to_string()));
-
+        assert!(app.github_deploy.enabled);
         app.handle_key(key(KeyCode::Left));
         assert!(app.github_deploy.enabled);
-        assert_eq!(state.github_enabled()?, Some("true".to_string()));
-
         app.handle_key(key(KeyCode::Enter));
+        assert!(app.github_deploy.enabled);
+
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(!app.github_deploy.enabled);
         assert_eq!(state.github_enabled()?, Some("false".to_string()));
 
-        app.handle_key(key(KeyCode::Down)); // wraps to field 0
-        assert_eq!(app.github_deploy.active_field, 0);
-        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char(' ')));
         assert!(app.github_deploy.enabled);
         assert_eq!(state.github_enabled()?, Some("true".to_string()));
 
@@ -6785,6 +6884,7 @@ mod tests {
                     deploy_cmd: None,
                     github_token: None,
                     username: app.access.username.clone(),
+                    ..Default::default()
                 }),
             },
         );
@@ -7160,10 +7260,9 @@ esac"#
         app.handle_key(key(KeyCode::Char('e')));
         assert!(!app.access.editing);
 
-        // 'p' from field 0 toggles sudo_nopasswd OFF and updates status_message
+        // 'p' from field 0 must NOT toggle sudo_nopasswd
         app.handle_key(key(KeyCode::Char('p')));
-        assert!(!app.access.sudo_nopasswd);
-        assert!(app.status_message.contains("OFF (password required)"));
+        assert!(app.access.sudo_nopasswd);
 
         // Navigate to field 4 (Passwordless Sudo)
         for _ in 0..4 {
@@ -7175,19 +7274,16 @@ esac"#
         app.handle_key(key(KeyCode::Char('e')));
         assert!(!app.access.editing);
 
-        // Toggle via Space, Enter, Left, Right on field 4
+        // Toggle ONLY via Space on field 4 (Enter/Left/Right must not toggle)
         app.handle_key(key(KeyCode::Char(' ')));
-        assert!(app.access.sudo_nopasswd);
-        assert!(app.status_message.contains("ON (NOPASSWD:ALL)"));
+        assert!(!app.access.sudo_nopasswd);
+        assert!(app.status_message.contains("OFF (password required)"));
         assert!(!app.access.editing);
 
         app.handle_key(key(KeyCode::Enter));
         assert!(!app.access.sudo_nopasswd);
-        assert!(!app.access.editing);
-
         app.handle_key(key(KeyCode::Left));
-        assert!(app.access.sudo_nopasswd);
-
+        assert!(!app.access.sudo_nopasswd);
         app.handle_key(key(KeyCode::Right));
         assert!(!app.access.sudo_nopasswd);
 
@@ -7206,9 +7302,10 @@ esac"#
         let mut reloaded = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
         assert!(!reloaded.access.sudo_nopasswd);
 
-        // Toggle back ON via 'p' and save -> persists SUDO_NOPASSWD="true"
+        // Toggle back ON via Space on field 4 and save -> persists SUDO_NOPASSWD="true"
         reloaded.screen = Screen::AccessConfig;
-        reloaded.handle_key(key(KeyCode::Char('p')));
+        reloaded.access.active_field = 4;
+        reloaded.handle_key(key(KeyCode::Char(' ')));
         assert!(reloaded.access.sudo_nopasswd);
         reloaded.handle_key(key(KeyCode::Char('s')));
         assert_eq!(state.sudo_nopasswd()?, Some("true".to_string()));
@@ -8774,10 +8871,12 @@ esac"#
         app.handle_key(key(KeyCode::Enter));
         assert!(!app.api_keys.editing);
 
-        // Delete / Backspace when !editing also clear the active field
+        // 'c' when !editing clears the active field (Delete does not)
         app.handle_paste("ghp_delete_me_12345\r\n");
         assert_eq!(app.api_keys.github, "ghp_delete_me_12345");
         app.handle_key(key(KeyCode::Delete));
+        assert_eq!(app.api_keys.github, "ghp_delete_me_12345");
+        app.handle_key(key(KeyCode::Char('c')));
         assert!(app.api_keys.github.is_empty());
         assert_eq!(settings.github_token()?, None);
 
@@ -8986,7 +9085,7 @@ esac"#
         assert_eq!(app.running_instances.len(), 1);
         assert_eq!(
             app.status_message,
-            "Press 'y' to confirm destroy, or 'n'/Esc to cancel"
+            "Press 'y' to confirm destroy, or 'n' to cancel"
         );
 
         // Pressing 'y' destroys the instance
@@ -9050,5 +9149,78 @@ esac"#
         assert!(saw_active_step);
         assert_eq!(app.active_step, None);
         assert!(app.progress_steps.iter().all(|(_, s)| *s == Some(true)));
+    }
+
+    #[test]
+    fn github_deploy_caddy_labels_toggle_edit_and_persist() -> Result<()> {
+        let _lock = crate::env_lock();
+        let dir = tempdir()?;
+        let settings_path = dir.path().join("credentials.enc");
+        let state_path = dir.path().join("state.conf");
+
+        let mut app = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        app.handle_key(key(KeyCode::Char('5')));
+        assert_eq!(app.screen, Screen::GithubDeploy);
+        assert!(!app.github_deploy.caddy_labels);
+
+        // Move to field 5 (Inject Caddy Labels), verify 'e' and Enter do not enter edit mode, Space toggles
+        for _ in 0..5 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(app.github_deploy.active_field, 5);
+        app.handle_key(key(KeyCode::Char('e')));
+        assert!(!app.github_deploy.editing);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.github_deploy.editing);
+        assert!(!app.github_deploy.caddy_labels);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert!(app.github_deploy.caddy_labels);
+
+        // Field 6: Caddy Domain
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.github_deploy.active_field, 6);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.github_deploy.editing);
+        app.handle_paste("app.example.com\r\n");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.github_deploy.editing);
+
+        // Field 7: Compose Service
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_paste("web\r\n");
+        app.handle_key(key(KeyCode::Enter));
+
+        // Field 8: Upstream Port
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_paste("3000\r\n");
+        app.handle_key(key(KeyCode::Enter));
+
+        // Field 9: Extra Caddy Labels
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_paste("caddy.encode=gzip\r\n");
+        app.handle_key(key(KeyCode::Enter));
+
+        app.handle_key(key(KeyCode::Char('s')));
+
+        let state = SessionState::new(&state_path);
+        assert_eq!(state.github_caddy_labels_enabled()?, Some("true".to_string()));
+        assert_eq!(state.github_caddy_domain()?, Some("app.example.com".to_string()));
+        assert_eq!(state.github_caddy_service()?, Some("web".to_string()));
+        assert_eq!(state.github_caddy_port()?, Some("3000".to_string()));
+        assert_eq!(
+            state.github_caddy_extra_labels()?,
+            Some("caddy.encode=gzip".to_string())
+        );
+
+        let reloaded = TuiApp::from_paths(Some(&settings_path), Some(&state_path))?;
+        assert!(reloaded.github_deploy.caddy_labels);
+        assert_eq!(reloaded.github_deploy.caddy_domain, "app.example.com");
+        assert_eq!(reloaded.github_deploy.caddy_service, "web");
+        assert_eq!(reloaded.github_deploy.caddy_port, "3000");
+        assert_eq!(reloaded.github_deploy.caddy_extra_labels, "caddy.encode=gzip");
+        Ok(())
     }
 }

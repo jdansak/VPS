@@ -144,6 +144,21 @@ struct DeployArgs {
     /// Post-clone deploy command (defaults to docker compose up -d --build when compose file exists)
     #[arg(long, value_name = "CMD")]
     cmd: Option<String>,
+    /// Inject Caddy Docker labels via a temporary Compose override file
+    #[arg(long = "caddy-labels", visible_alias = "github-caddy-labels")]
+    caddy_labels: bool,
+    /// Domain/host for injected Caddy label (defaults to saved CF_RECORD.CF_ZONE)
+    #[arg(long = "caddy-domain", visible_alias = "github-caddy-domain", value_name = "DOMAIN")]
+    caddy_domain: Option<String>,
+    /// Compose service name for injected Caddy label (auto-detected if single service)
+    #[arg(long = "caddy-service", visible_alias = "github-caddy-service", value_name = "SERVICE")]
+    caddy_service: Option<String>,
+    /// Upstream container port for injected Caddy label (defaults to 8080)
+    #[arg(long = "caddy-port", visible_alias = "github-caddy-port", value_name = "PORT")]
+    caddy_port: Option<String>,
+    /// Extra Caddy labels (comma/semicolon-separated key=value pairs)
+    #[arg(long = "caddy-extra-labels", visible_alias = "github-caddy-extra-labels", value_name = "LABELS")]
+    caddy_extra_labels: Option<String>,
     /// Target IP address or MagicDNS hostname (defaults to saved VPS_IP)
     #[arg(long, value_name = "TARGET")]
     ip: Option<String>,
@@ -247,6 +262,24 @@ struct SetupArgs {
     /// Custom post-clone deploy command for GitHub deployment
     #[arg(long, value_name = "CMD")]
     github_cmd: Option<String>,
+    /// Inject Caddy Docker labels via a temporary Compose override file
+    #[arg(long, conflicts_with = "no_github_caddy_labels")]
+    github_caddy_labels: bool,
+    /// Disable Caddy Docker label injection even if saved in session state
+    #[arg(long)]
+    no_github_caddy_labels: bool,
+    /// Domain/host for injected Caddy label (defaults to saved CF_RECORD.CF_ZONE)
+    #[arg(long, value_name = "DOMAIN")]
+    github_caddy_domain: Option<String>,
+    /// Compose service name for injected Caddy label (auto-detected if single service)
+    #[arg(long, value_name = "SERVICE")]
+    github_caddy_service: Option<String>,
+    /// Upstream container port for injected Caddy label (defaults to 8080)
+    #[arg(long, value_name = "PORT")]
+    github_caddy_port: Option<String>,
+    /// Extra Caddy labels (comma/semicolon-separated key=value pairs)
+    #[arg(long, value_name = "LABELS")]
+    github_caddy_extra_labels: Option<String>,
     /// Preview setup scripts without executing remote commands
     #[arg(long)]
     dry_run: bool,
@@ -851,12 +884,40 @@ fn persist_setup_session(session: &SessionState, update: &SetupSessionUpdate<'_>
     session.save_session(&data)
 }
 
+fn derive_caddy_domain_from_cf(session: &SessionState) -> Result<Option<String>> {
+    let zone = session
+        .cf_zone()?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let record = session
+        .cf_record()?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    match (zone, record) {
+        (Some(z), Some(r)) if r == "@" => Ok(Some(z)),
+        (Some(z), Some(r)) => {
+            if r.eq_ignore_ascii_case(&z) || r.ends_with(&format!(".{z}")) {
+                Ok(Some(r))
+            } else {
+                Ok(Some(format!("{r}.{z}")))
+            }
+        }
+        (Some(z), None) => Ok(Some(z)),
+        _ => Ok(None),
+    }
+}
+
 fn persist_github_session(session: &SessionState, gh: &GithubDeployConfig) -> Result<()> {
     session.set_github_repo(&gh.repo)?;
     session.set_github_branch(&gh.branch)?;
     session.set_github_deploy_path(gh.deploy_path.as_deref().unwrap_or(""))?;
     session.set_github_deploy_cmd(gh.deploy_cmd.as_deref().unwrap_or(""))?;
     session.set_github_enabled("true")?;
+    session.set_github_caddy_labels_enabled(if gh.caddy_labels { "true" } else { "false" })?;
+    session.set_github_caddy_domain(gh.caddy_domain.as_deref().unwrap_or(""))?;
+    session.set_github_caddy_service(gh.caddy_service.as_deref().unwrap_or(""))?;
+    session.set_github_caddy_port(gh.caddy_port.as_deref().unwrap_or(""))?;
+    session.set_github_caddy_extra_labels(gh.caddy_extra_labels.as_deref().unwrap_or(""))?;
     Ok(())
 }
 
@@ -907,12 +968,79 @@ fn resolve_github_deploy_config(
             .to_string())
     };
 
+    struct CaddyLabelFields {
+        labels: bool,
+        domain: Option<String>,
+        service: Option<String>,
+        port: Option<String>,
+        extra_labels: Option<String>,
+    }
+
+    let resolve_caddy_fields = || -> Result<CaddyLabelFields> {
+        let caddy_labels = if args.no_github_caddy_labels {
+            false
+        } else if args.github_caddy_labels {
+            true
+        } else {
+            parse_truthy(session.github_caddy_labels_enabled()?.as_deref())
+        };
+        let trim_opt = |opt: &Option<String>| {
+            opt.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        };
+        let mut caddy_domain = trim_opt(&args.github_caddy_domain).or_else(|| {
+            session
+                .github_caddy_domain()
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        if caddy_labels && caddy_domain.is_none() {
+            caddy_domain = derive_caddy_domain_from_cf(session)?;
+        }
+        let caddy_service = trim_opt(&args.github_caddy_service).or_else(|| {
+            session
+                .github_caddy_service()
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        let caddy_port = trim_opt(&args.github_caddy_port).or_else(|| {
+            session
+                .github_caddy_port()
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        let caddy_extra_labels = trim_opt(&args.github_caddy_extra_labels).or_else(|| {
+            session
+                .github_caddy_extra_labels()
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        Ok(CaddyLabelFields {
+            labels: caddy_labels,
+            domain: caddy_domain,
+            service: caddy_service,
+            port: caddy_port,
+            extra_labels: caddy_extra_labels,
+        })
+    };
+
     if let Some(repo) = explicit_repo {
         let branch = resolve_branch(explicit_branch)?;
         let github_token = settings
             .github_token()?
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
+        let caddy = resolve_caddy_fields()?;
         return Ok(Some(GithubDeployConfig {
             repo,
             branch,
@@ -920,6 +1048,11 @@ fn resolve_github_deploy_config(
             deploy_cmd: explicit_cmd,
             github_token,
             username: args.user.clone(),
+            caddy_labels: caddy.labels,
+            caddy_domain: caddy.domain,
+            caddy_service: caddy.service,
+            caddy_port: caddy.port,
+            caddy_extra_labels: caddy.extra_labels,
         }));
     }
 
@@ -955,6 +1088,7 @@ fn resolve_github_deploy_config(
                     .github_token()?
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty());
+                let caddy = resolve_caddy_fields()?;
                 Ok(Some(GithubDeployConfig {
                     repo,
                     branch,
@@ -962,6 +1096,11 @@ fn resolve_github_deploy_config(
                     deploy_cmd,
                     github_token,
                     username: args.user.clone(),
+                    caddy_labels: caddy.labels,
+                    caddy_domain: caddy.domain,
+                    caddy_service: caddy.service,
+                    caddy_port: caddy.port,
+                    caddy_extra_labels: caddy.extra_labels,
                 }))
             }
             None if args.github_deploy => Err(anyhow!(
@@ -1843,6 +1982,63 @@ fn cmd_deploy(args: DeployArgs) -> Result<()> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let caddy_labels = if args.caddy_labels {
+        true
+    } else {
+        parse_truthy(session.github_caddy_labels_enabled()?.as_deref())
+    };
+    let mut caddy_domain = args
+        .caddy_domain
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            session
+                .github_caddy_domain()
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    if caddy_labels && caddy_domain.is_none() {
+        caddy_domain = derive_caddy_domain_from_cf(&session)?;
+    }
+    let caddy_service = args
+        .caddy_service
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            session
+                .github_caddy_service()
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let caddy_port = args
+        .caddy_port
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            session
+                .github_caddy_port()
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let caddy_extra_labels = args
+        .caddy_extra_labels
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            session
+                .github_caddy_extra_labels()
+                .ok()
+                .flatten()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+
     let gh_cfg = GithubDeployConfig {
         repo: args.repo.trim().to_string(),
         branch: args.branch.trim().to_string(),
@@ -1856,6 +2052,11 @@ fn cmd_deploy(args: DeployArgs) -> Result<()> {
             .filter(|s| !s.is_empty()),
         github_token,
         username: deploy_user,
+        caddy_labels,
+        caddy_domain,
+        caddy_service,
+        caddy_port,
+        caddy_extra_labels,
     };
 
     let transport = SshTransport::from_env(mode);

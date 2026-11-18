@@ -9,7 +9,7 @@ use crate::roles::ServerRole;
 use crate::transport::SshTransport;
 
 /// Configuration for cloning/updating and deploying a GitHub repository.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GithubDeployConfig {
     pub repo: String,
     pub branch: String,
@@ -17,6 +17,11 @@ pub struct GithubDeployConfig {
     pub deploy_cmd: Option<String>,
     pub github_token: Option<String>,
     pub username: String,
+    pub caddy_labels: bool,
+    pub caddy_domain: Option<String>,
+    pub caddy_service: Option<String>,
+    pub caddy_port: Option<String>,
+    pub caddy_extra_labels: Option<String>,
 }
 
 /// Configuration for executing the 6-step remote VPS setup pipeline.
@@ -221,6 +226,181 @@ pub fn normalize_github_repo(input: &str) -> Result<(String, String)> {
     ))
 }
 
+fn validate_caddy_domain(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "Caddy domain cannot be empty when Caddy label injection is enabled"
+        ));
+    }
+    if trimmed.len() > 253
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ',' | ' '))
+    {
+        return Err(anyhow!(
+            "Invalid Caddy domain '{}': allowed characters are letters, digits, '.', '-', and ','",
+            trimmed
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_caddy_service(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return Err(anyhow!(
+            "Invalid Compose service name '{}': allowed characters are letters, digits, '_', '-', and '.'",
+            trimmed
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_caddy_port(raw: &str) -> Result<u16> {
+    let trimmed = raw.trim();
+    let port: u16 = trimmed
+        .parse()
+        .map_err(|_| anyhow!("Invalid Caddy upstream port '{}': expected 1..=65535", trimmed))?;
+    if port == 0 {
+        return Err(anyhow!("Invalid Caddy upstream port '0': expected 1..=65535"));
+    }
+    Ok(port)
+}
+
+fn parse_caddy_extra_labels(raw: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for entry in raw.split([',', ';', '\n']) {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once('=') else {
+            return Err(anyhow!(
+                "Invalid Caddy extra label '{}': expected key=value",
+                trimmed
+            ));
+        };
+        let key = k.trim();
+        let val = v.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(anyhow!("Invalid Caddy label key '{}'", key));
+        }
+        if val.is_empty()
+            || val
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\'' | '\n' | '\r'))
+        {
+            return Err(anyhow!(
+                "Invalid value for Caddy label '{}': control characters and single quotes are not allowed",
+                key
+            ));
+        }
+        out.push((key.to_string(), val.to_string()));
+    }
+    Ok(out)
+}
+
+fn build_caddy_compose_deploy_section(cfg: &GithubDeployConfig) -> Result<String> {
+    if !cfg.caddy_labels {
+        return Ok(r#"if command -v docker >/dev/null 2>&1 && ( [ -f "${DEPLOY_PATH}/docker-compose.yml" ] || [ -f "${DEPLOY_PATH}/docker-compose.yaml" ] || [ -f "${DEPLOY_PATH}/compose.yml" ] || [ -f "${DEPLOY_PATH}/compose.yaml" ] ); then
+    run_as_deploy_user 'cd "${DEPLOY_PATH}" && docker compose up -d --build'
+fi"#
+        .to_string());
+    }
+
+    let domain = validate_caddy_domain(cfg.caddy_domain.as_deref().unwrap_or(""))?;
+    let service_opt = cfg
+        .caddy_service
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(validate_caddy_service)
+        .transpose()?;
+    let port = match cfg
+        .caddy_port
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(p) => validate_caddy_port(p)?,
+        None => 8080,
+    };
+    let extra_labels = match cfg
+        .caddy_extra_labels
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => parse_caddy_extra_labels(raw)?,
+        None => Vec::new(),
+    };
+
+    let service_resolution = if let Some(svc) = service_opt {
+        format!("CADDY_SERVICE={}", shell_quote(&svc))
+    } else {
+        r#"SERVICES_OUT=$(run_as_deploy_user 'cd "${DEPLOY_PATH}" && docker compose -f "${COMPOSE_FILE}" config --services')
+    SVC_COUNT=$(printf '%s\n' "${SERVICES_OUT}" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+    if [ "${SVC_COUNT}" -eq 1 ]; then
+        CADDY_SERVICE=$(printf '%s\n' "${SERVICES_OUT}" | sed '/^[[:space:]]*$/d' | head -n 1)
+    elif [ "${SVC_COUNT}" -eq 0 ]; then
+        echo "No Compose services found in ${COMPOSE_FILE}" >&2
+        exit 1
+    else
+        echo "Multiple Compose services found in ${COMPOSE_FILE}; specify Compose Service (GITHUB_CADDY_SERVICE)" >&2
+        exit 1
+    fi"#
+        .to_string()
+    };
+
+    let mut extra_yaml = String::new();
+    for (k, v) in extra_labels {
+        extra_yaml.push_str(&format!("\n      {}: '{}'", k, v));
+    }
+
+    Ok(format!(
+        r#"if command -v docker >/dev/null 2>&1; then
+    COMPOSE_FILE=""
+    for candidate in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+        if [ -f "${{DEPLOY_PATH}}/${{candidate}}" ]; then
+            COMPOSE_FILE="${{candidate}}"
+            break
+        fi
+    done
+    if [ -n "${{COMPOSE_FILE}}" ]; then
+        export COMPOSE_FILE
+        docker network inspect caddy >/dev/null 2>&1 || docker network create caddy
+        {service_resolution}
+        CADDY_OVERRIDE_FILE=$(mktemp /tmp/bab-caddy-override.XXXXXX)
+        cat > "${{CADDY_OVERRIDE_FILE}}" << BAB_CADDY_EOF
+services:
+  ${{CADDY_SERVICE}}:
+    networks:
+      - caddy
+    labels:
+      caddy: '{domain}'
+      caddy.reverse_proxy: '{{{{upstreams {port}}}}}'{extra_yaml}
+networks:
+  caddy:
+    external: true
+BAB_CADDY_EOF
+        chmod 0644 "${{CADDY_OVERRIDE_FILE}}"
+        export CADDY_OVERRIDE_FILE
+        run_as_deploy_user 'cd "${{DEPLOY_PATH}}" && docker compose -f "${{COMPOSE_FILE}}" -f "${{CADDY_OVERRIDE_FILE}}" up -d --build'
+        rm -f "${{CADDY_OVERRIDE_FILE}}"
+    fi
+fi"#
+    ))
+}
+
 fn build_github_deploy_body(cfg: &GithubDeployConfig) -> Result<String> {
     let (repo_url, repo_name) = normalize_github_repo(&cfg.repo)?;
     let deploy_user = cfg.username.trim();
@@ -301,10 +481,7 @@ export DEPLOY_CMD
 run_as_deploy_user 'cd "${{DEPLOY_PATH}}" && bash -lc "${{DEPLOY_CMD}}"'"#
         )
     } else {
-        r#"if command -v docker >/dev/null 2>&1 && ( [ -f "${DEPLOY_PATH}/docker-compose.yml" ] || [ -f "${DEPLOY_PATH}/docker-compose.yaml" ] || [ -f "${DEPLOY_PATH}/compose.yml" ] || [ -f "${DEPLOY_PATH}/compose.yaml" ] ); then
-    run_as_deploy_user 'cd "${DEPLOY_PATH}" && docker compose up -d --build'
-fi"#
-        .to_string()
+        build_caddy_compose_deploy_section(cfg)?
     };
 
     let mut preserve_vars = vec![
@@ -319,6 +496,9 @@ fi"#
     }
     if deploy_cmd.is_some() {
         preserve_vars.push("DEPLOY_CMD");
+    } else if cfg.caddy_labels {
+        preserve_vars.push("COMPOSE_FILE");
+        preserve_vars.push("CADDY_OVERRIDE_FILE");
     }
     let preserve_env = preserve_vars.join(",");
 
@@ -1342,6 +1522,7 @@ mod tests {
             deploy_cmd: None,
             github_token: Some("ghp_secretToken123".to_string()),
             username: "deploy".to_string(),
+            ..Default::default()
         };
 
         let script = build_github_deploy_script(&cfg)?;
@@ -1373,6 +1554,7 @@ mod tests {
             deploy_cmd: Some("make build && systemctl restart api".to_string()),
             github_token: None,
             username: "deploy".to_string(),
+            ..Default::default()
         };
 
         let script = build_github_deploy_script(&cfg)?;
@@ -1396,6 +1578,7 @@ mod tests {
             deploy_cmd: None,
             github_token: Some("ghp_tok".to_string()),
             username: "deploy".to_string(),
+            ..Default::default()
         };
 
         let mut root_cfg = sample_config(ServerRole::ReverseProxyCaddy, "root", false);
@@ -1430,6 +1613,7 @@ mod tests {
             deploy_cmd: Some("echo deployed".to_string()),
             github_token: None,
             username: "deploy".to_string(),
+            ..Default::default()
         };
 
         let dry_sudo = runner.deploy_github("ubuntu", "100.64.0.50", &gh, true)?;
@@ -1572,6 +1756,7 @@ mod tests {
                 deploy_cmd: Some("echo deployed".to_string()),
                 github_token: None,
                 username: " deploy ".to_string(),
+                ..Default::default()
             };
 
             let out = runner.deploy_github("root", "100.64.0.50", &gh, false)?;
@@ -1924,5 +2109,56 @@ mod tests {
             reqs[0].accept.as_deref(),
             Some("application/vnd.github+json")
         );
+    }
+
+    #[test]
+    fn build_github_deploy_script_injects_caddy_labels_override() -> Result<()> {
+        let cfg = GithubDeployConfig {
+            repo: "acme/web-app".to_string(),
+            branch: "main".to_string(),
+            deploy_path: None,
+            deploy_cmd: None,
+            github_token: None,
+            username: "deploy".to_string(),
+            caddy_labels: true,
+            caddy_domain: Some("app.example.com".to_string()),
+            caddy_service: Some("web".to_string()),
+            caddy_port: Some("3000".to_string()),
+            caddy_extra_labels: Some("caddy.encode=gzip; caddy.tls=internal".to_string()),
+        };
+
+        let script = build_github_deploy_script(&cfg)?;
+        assert_bash_syntax_ok(&script, "github-deploy-caddy-labels");
+        assert!(script.contains("docker network create caddy"));
+        assert!(script.contains("CADDY_SERVICE='web'"));
+        assert!(script.contains("caddy: 'app.example.com'"));
+        assert!(script.contains("caddy.reverse_proxy: '{{upstreams 3000}}'"));
+        assert!(script.contains("caddy.encode: 'gzip'"));
+        assert!(script.contains("caddy.tls: 'internal'"));
+        assert!(script.contains("docker compose -f \"${COMPOSE_FILE}\" -f \"${CADDY_OVERRIDE_FILE}\" up -d --build"));
+
+        let auto_svc_cfg = GithubDeployConfig {
+            caddy_service: None,
+            caddy_port: None,
+            caddy_extra_labels: None,
+            ..cfg.clone()
+        };
+        let auto_script = build_github_deploy_script(&auto_svc_cfg)?;
+        assert_bash_syntax_ok(&auto_script, "github-deploy-caddy-labels-auto-svc");
+        assert!(auto_script.contains("config --services"));
+        assert!(auto_script.contains("caddy.reverse_proxy: '{{upstreams 8080}}'"));
+
+        let missing_domain = GithubDeployConfig {
+            caddy_domain: None,
+            ..cfg.clone()
+        };
+        assert!(build_github_deploy_script(&missing_domain).is_err());
+
+        let bad_port = GithubDeployConfig {
+            caddy_port: Some("99999".to_string()),
+            ..cfg
+        };
+        assert!(build_github_deploy_script(&bad_port).is_err());
+        Ok(())
     }
 }
